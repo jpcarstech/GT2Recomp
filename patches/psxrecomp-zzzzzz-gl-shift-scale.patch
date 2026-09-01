@@ -1,0 +1,62 @@
+From d92ac908d4c5018ddb612f394c4e880abc0057f1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 04:20:32 +0000
+Subject: [PATCH] gl: scale the sample-grid tie bias with the internal scale
+
+The alignment shift is half a HIRES pixel (0.5/S in native units), and it is
+what makes GL's pixel-center sampling agree with the PS1 DDA's integer grid.
+The 1/64 backoff that keeps edges off exact sample centers was written as a
+constant in NATIVE pixels, so it did not shrink with the shift it corrects:
+at S=4 it consumed 12.5% of the shift, at S=16 fully 50%, and at S>=32 it
+drove the shift negative.
+
+With the alignment half-destroyed, two polygons sharing an edge rasterize it
+on opposite sides of the sample grid and neither covers the boundary column -
+a hairline of whatever is behind, at every seam in the mesh. On GT2 that is
+the blue/black lines through the track surface and skybox, and it got much
+worse when supersampling was raised from 4x to 16x.
+
+The tie being avoided is a hires sample-center tie, so the bias belongs in
+hires units too. Bit-identical at S=1; restores ~97% of the ideal shift at
+every scale instead of decaying to 50% at 16x.
+---
+ runtime/src/gpu_gl_renderer.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 1fe18f6e..5b117cd4 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3425,14 +3425,27 @@ static int init_gpu_raster(void) {
+     p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
+ 
+     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
+-     * for the lifetime of the pipeline). Backed off by 1/64 native px so
++     * for the lifetime of the pipeline). Backed off by 1/64 of an HR pixel so
+      * primitive edges never land EXACTLY on sample centers — that float tie
+      * dropped 1px columns at quad seams (e.g. the 256px texture-page seam in
+-     * Tomba's title background). The 1/64 bias keeps floor(uv) on the exact
+-     * PS1 texel for |uv slope| < 64; mirrored (negative-slope) mappings can
+-     * be off by one texel at exact-integer uv — accepted. */
++     * Tomba's title background). The bias keeps floor(uv) on the exact PS1
++     * texel for |uv slope| < 64; mirrored (negative-slope) mappings can be off
++     * by one texel at exact-integer uv — accepted.
++     *
++     * BOTH terms must scale with S. The tie this backs off from is a HIRES
++     * sample-center tie, so the bias is a fraction of an HR pixel, not of a
++     * native one. Written as a constant 1/64 NATIVE px it stayed fixed while
++     * the shift it corrects shrank as 0.5/S: at S=4 it ate 12% of the shift,
++     * at S=16 fully 50%, and at S>=32 it flipped the shift negative. A
++     * half-destroyed alignment is exactly the failure the shift exists to
++     * prevent — GL samples at pixel centers, the PS1 DDA at integer coords —
++     * so adjacent polygons rasterized their shared edge on opposite sides of
++     * the sample grid and left a hairline of background at every seam
++     * (reported on GT2 as blue/black lines through track and skybox, and it
++     * got visibly worse the moment supersampling was raised from 4x to 16x).
++     * At S=1 this is bit-identical to the old expression. */
+     {
+-        float shift = 0.5f / (float)s_scale - 1.0f / 64.0f;
++        float shift = (0.5f - 1.0f / 64.0f) / (float)s_scale;
+         p_glUseProgram(s_geo_prog);
+         p_glUniform1f(p_glGetUniformLocation(s_geo_prog, "u_shift"), shift);
+         /* Native-wide projection defaults: x translation 0, clip half-extent

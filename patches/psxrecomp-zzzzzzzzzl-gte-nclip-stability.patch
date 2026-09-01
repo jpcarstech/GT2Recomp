@@ -1,0 +1,160 @@
+From 336ee90939d3399b249c54930fc2531ae5ea2776 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 16:35:41 +0000
+Subject: [PATCH] gte: stabilize PGXP culling correction - far-sliver shimmer
+ ("z-fighting" at distance)
+
+The precise NCLIP cross varies continuously with the sub-pixel fractions, so
+for slivers whose true area is near zero its sign flips frame to frame as
+the camera drifts - far polygons pop in and out every frame ('z-fighting'
+shimmer on distant billboards, trees and guardrails, gone up close where
+areas are decisive). The console's integer winding only changes when a
+vertex crosses a whole pixel, so its visibility decision is stable; measured
+at the Tahiti grid idle, ~20k precise-vs-integer sign disagreements logged
+in seconds, almost all horizon slivers with integer area exactly 0 and
+|precise cross| 1..5 px^2. Per-frame appear/vanish churn of far triangles:
+~230 (old precise path) -> ~110 (this rule) vs ~70 with culling correction
+off entirely.
+
+Three DuckStation-parity/stability changes:
+- precise culling now requires depth-validated shadows on all three SXY regs
+  (DS GTE_HasPreciseVertices: game-CONSTRUCTED positions carry no Z and must
+  take the faithful integer NCLIP);
+- DS's small-magnitude guard: |cross| in (0.1,1.0) is bumped away from zero
+  before the integer conversion, and the conversion truncates (was llround,
+  which sent 0.1..0.49 to zero and CULLED polygons DS keeps);
+- sign arbitration: when precise and integer windings agree, the faithful
+  integer result is used (console-identical visibility); when they disagree,
+  the precise sign wins only if the area is decisive (above the worst-case
+  integer rounding noise, ~half the coordinate spread) - the genuine
+  edge-on-polygon rescue culling correction exists for. Ambiguous slivers
+  keep the console decision and stop flickering.
+
+Also carries the diagnostic that found it: every hooked store stamps the
+shadow slot with the present counter (wr_frame), the tri ring records each
+corner's slot age and last writer pc, and the pgxp_tris CSV gains
+age0..2/wrpc0..2 columns - a resolved corner whose slot was last hooked
+frames ago names an unhooked writer (none were found: all ages 1-2).
+---
+ runtime/include/pgxp.h |  4 ++++
+ runtime/src/pgxp.cpp   | 42 ++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/include/pgxp.h b/runtime/include/pgxp.h
+index 42c42dc6..f8d67349 100644
+--- a/runtime/include/pgxp.h
++++ b/runtime/include/pgxp.h
+@@ -67,6 +67,10 @@ int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16);
+  * form so stale FIFO shadows fail closed to native integer behavior. */
+ int pgxp_get_gte_sxy_checked(uint32_t index, uint32_t expect, int check,
+                              int32_t *x16, int32_t *y16);
++/* As above, but additionally requires a validated projection DEPTH (VZ) and
++ * always checks the value - the culling-correction gate (DS parity). */
++int pgxp_get_gte_sxyz_checked(uint32_t index, uint32_t expect,
++                              int32_t *x16, int32_t *y16);
+ 
+ /* Guest write to a GTE data register outside gte_execute (MTC2/CTC2 handled
+  * by psx_pgxp_cop2; this is for direct gte_write_data paths): reg 15 performs
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 41b5bde1..87a1004e 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -66,7 +66,9 @@ struct PGXPValue {
+      * finds flagless name its own last writer with no timing race. */
+     uint32_t wr_instr;
+     uint32_t wr_pc;
++    uint32_t wr_frame;   /* present counter when the last hook wrote this slot */
+ };
++extern "C" uint64_t s_frame_count;   /* debug_server.c present counter */
+ 
+ #define PGXP_RAM_WORDS     (PSX_MAIN_RAM_BYTES >> 2)   /* 2 MB RAM                     */
+ #define PGXP_SCRATCH_WORDS (0x400u >> 2)      /* 1 KB scratchpad              */
+@@ -413,7 +415,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+     uint32_t rt = f_rt(instr);
+     PGXPValue *src = (rt != 0) ? &s_gpr[rt] : nullptr;
+     { extern uint32_t g_debug_last_store_pc;
+-      dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; }
++      dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; dst->wr_frame = (uint32_t)s_frame_count; }
+ 
+     switch (f_op(instr)) {
+     case 0x2B: {                               /* SW                          */
+@@ -422,7 +424,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+             pv_validate(src, value);
+             *dst = *src;
+             { extern uint32_t g_debug_last_store_pc;     /* struct copy clobbered it */
+-              dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; }
++              dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; dst->wr_frame = (uint32_t)s_frame_count; }
+         } else {
+             pv_reset(dst, value);
+         }
+@@ -552,7 +554,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+             pv_reset(dst, value);
+         }
+         { extern uint32_t g_debug_last_store_pc;
+-          dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; }
++          dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; dst->wr_frame = (uint32_t)s_frame_count; }
+         return;
+     }
+     case 0x12: {                               /* COP2 register transfers     */
+@@ -1002,6 +1004,24 @@ extern "C" int pgxp_get_gte_sxy_checked(uint32_t index, uint32_t expect,
+     return 1;
+ }
+ 
++/* Culling-correction gate (DuckStation GTE_HasPreciseVertices parity): the
++ * precise winding is only trusted when the shadow carries a validated
++ * projection DEPTH as well - a game-CONSTRUCTED screen position (2D UI,
++ * CPU-packed vertices) has no Z and must take the faithful integer NCLIP. */
++extern "C" int pgxp_get_gte_sxyz_checked(uint32_t index, uint32_t expect,
++                                         int32_t *x16, int32_t *y16) {
++    if (index >= 4) return 0;
++    const PGXPValue *pv = &s_gte[12 + index];
++    if (!pv_live(pv) ||
++        (pv->flags & (PGXP_F_VXY | PGXP_F_VZ)) != (PGXP_F_VXY | PGXP_F_VZ))
++        return 0;
++    if (pv->value != expect)
++        return 0;
++    if (x16) *x16 = pv->x16;
++    if (y16) *y16 = pv->y16;
++    return 1;
++}
++
+ extern "C" void pgxp_gte_reg_written(int reg, uint32_t value) {
+     /* Invalidation-class bookkeeping: runs even with the engine disarmed so
+      * seeded/leftover shadows can never outlive a guest register write. Only
+@@ -1059,6 +1079,16 @@ extern "C" int pgxp_complete_mixed_vertex(uint32_t packet_word,
+ static uint8_t s_last_resolve_state = 0;  /* 0 no-pv/noaddr 1 stale 2 live-flagless
+                                              3 mismatch 4 tracked 5 fallback */
+ extern "C" uint8_t pgxp_last_resolve_state(void) { return s_last_resolve_state; }
++static uint32_t s_last_wr_frame = 0, s_last_wr_pc = 0;
++/* Age (in presents) of the slot the last DATAFLOW resolve read, and its last
++ * hooked writer. A resolved corner whose slot was last written by a hook
++ * frames ago was refreshed by an unhooked writer (DMA/memcpy/uninstrumented
++ * store) that left a same-integer, stale-fraction shadow behind. */
++extern "C" uint32_t pgxp_last_wr_age(void) {
++    uint32_t now = (uint32_t)s_frame_count;
++    return (s_last_wr_frame == 0) ? 0xFFFFFFFFu : now - s_last_wr_frame;
++}
++extern "C" uint32_t pgxp_last_wr_pc(void) { return s_last_wr_pc; }
+ 
+ /* Census of WHY a vertex failed to resolve. 6.2% of vertices fall back to the
+  * rounded integer position, and every seam is two copies of one corner where
+@@ -1157,6 +1187,8 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                 pz = (pv->flags & PGXP_F_VZ) ? pv->z : 0;
+                 have = PGXP_SRC_DATAFLOW;
+                 s_last_resolve_state = 4;
++                s_last_wr_frame = pv->wr_frame;
++                s_last_wr_pc = pv->wr_pc;
+             } else {
+                 s_stats.value_mismatch++;
+                 s_last_resolve_state = 3;
+@@ -1232,7 +1264,9 @@ extern "C" void pgxp_store_gte_reg(uint32_t addr, uint8_t reg) {
+     const PGXPValue *src = &s_gte[reg & 31u];
+     if (!gen_live(src->gen)) return;
+     s_stats.swc2_stores++;
+-    *dst = *src;
++    { uint32_t wi = dst->wr_instr, wp = dst->wr_pc, wf = dst->wr_frame;   /* keep the hook's stamps */
++      *dst = *src;
++      dst->wr_instr = wi; dst->wr_pc = wp; dst->wr_frame = wf; }
+ }
+ 
+ /* ------------------------------------------------------------------------- */

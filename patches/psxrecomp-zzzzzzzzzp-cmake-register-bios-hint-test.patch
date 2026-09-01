@@ -1,0 +1,30 @@
+From d759a317c1f16812e3e6471b8b115f67dfbd194b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 04:29:24 +0000
+Subject: [PATCH] cmake: register test_setup_package_bios_hint.py (orphan test
+ broke configure)
+
+Upstream afe9ab29 added runtime/tests/test_setup_package_bios_hint.py without
+an add_test() entry. recompiler/CMakeLists.txt runs the test-registration
+completeness guard unconditionally, so a standalone configure of the
+recompiler tool - the first thing a game build does - fails with
+"Test file(s) present on disk but registered nowhere". Register it beside
+the other Python tests (it passes).
+---
+ runtime/CMakeLists.txt | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 6666ca74..ad0e7820 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -517,6 +517,9 @@ if(BUILD_TESTING)
+         add_test(NAME present_skip_cadence_guard_test
+                  COMMAND ${Python3_EXECUTABLE}
+                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_present_skip_cadence_guard.py)
++        add_test(NAME setup_package_bios_hint_test
++                 COMMAND ${Python3_EXECUTABLE}
++                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_setup_package_bios_hint.py)
+         add_test(NAME mod_bezel_test
+                  COMMAND ${Python3_EXECUTABLE}
+                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mod_bezel.py)

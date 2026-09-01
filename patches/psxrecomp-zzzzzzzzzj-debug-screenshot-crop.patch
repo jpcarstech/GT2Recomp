@@ -1,0 +1,57 @@
+From 211150a8bc48d6620fb7a0be938598408cf60fa6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 14:11:51 +0000
+Subject: [PATCH] debug: screenshot_hires takes an optional native-pixel crop
+ and reports the frame number
+
+A 5120x3840 PNG takes longer to encode than a game frame lasts, so a burst
+of full-frame captures cannot catch consecutive frames. cx/cy/cw/ch (native
+display pixels) crop the region under study before encoding; the reply now
+carries the present counter so the client can tell captures of the same
+frame apart. Diagnostic only.
+---
+ runtime/src/debug_server.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 6eeed017..4bc80df3 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -9262,6 +9262,27 @@ static void handle_screenshot_hires(int id, const char *json)
+         }
+     }
+ 
++    /* Optional crop in NATIVE display pixels ("cx","cy","cw","ch"): a
++     * 5120x3840 PNG takes ~300 ms to encode, which is longer than a game
++     * frame, so a burst of full frames cannot catch consecutive frames. A
++     * crop of the region under study encodes in a few ms. */
++    {
++        int cx = json_get_int(json, "cx", -1), cy = json_get_int(json, "cy", -1);
++        int cw = json_get_int(json, "cw", -1), ch = json_get_int(json, "ch", -1);
++        if (cx >= 0 && cy >= 0 && cw > 0 && ch > 0) {
++            uint32_t x0 = (uint32_t)cx * (uint32_t)scale, y0 = (uint32_t)cy * (uint32_t)scale;
++            uint32_t nw = (uint32_t)cw * (uint32_t)scale, nh = (uint32_t)ch * (uint32_t)scale;
++            if (x0 >= ow) x0 = ow - 1;
++            if (y0 >= oh) y0 = oh - 1;
++            if (x0 + nw > ow) nw = ow - x0;
++            if (y0 + nh > oh) nh = oh - y0;
++            for (uint32_t y = 0; y < nh; y++)
++                memmove(argb + (size_t)y * nw, argb + (size_t)(y0 + y) * ow + x0,
++                        (size_t)nw * sizeof(*argb));
++            ow = nw; oh = nh;
++        }
++    }
++
+     uint8_t *rgb = (uint8_t *)malloc((size_t)ow * oh * 3);
+     if (!rgb) { free(argb); send_err(id, "alloc failed"); return; }
+     for (size_t i = 0; i < (size_t)ow * oh; i++) {
+@@ -9280,7 +9301,8 @@ static void handle_screenshot_hires(int id, const char *json)
+     if (!ok) { send_err(id, "png encode failed"); return; }
+ 
+     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,"
+-             "\"height\":%u,\"scale\":%d}", id, path, ow, oh, scale);
++             "\"height\":%u,\"scale\":%d,\"frame\":%u}", id, path, ow, oh, scale,
++             (unsigned)s_frame_count);
+ }
+ 
+ /* present_shot — PNG of the COMPOSED renderer output: the frame after SDL fits

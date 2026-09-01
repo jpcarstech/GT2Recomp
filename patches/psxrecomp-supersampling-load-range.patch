@@ -1,0 +1,46 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index c4378d93..99f516e1 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -586,9 +586,14 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         const toml::value& video = toml::find(cfg, "video");
+         if (video.contains("supersampling")) {
+             const auto n = toml::find<int64_t>(video, "supersampling");
+-            if (n < 1 || n > 4) {
++            /* Range matches PSX_GL_MAX_INTERNAL_SCALE (16). The load range
++             * MUST cover everything the launcher can save: a stored value
++             * above the load clamp silently fails the parse and the setting
++             * "forgets itself" on the next run (observed with 9x SSAA when
++             * this still said 4). */
++            if (n < 1 || n > 16) {
+                 throw std::runtime_error(fmt::format(
+-                    "[video] supersampling out of range (1..4): {}", n));
++                    "[video] supersampling out of range (1..16): {}", n));
+             }
+             rt.video_supersampling = static_cast<int>(n);
+         }
+@@ -2285,7 +2290,10 @@ UserSettings load_user_settings(const fs::path& path) {
+         });
+         if (v.contains("supersampling")) try_get([&]{
+             const auto n = toml::find<int64_t>(v, "supersampling");
+-            if (n >= 1 && n <= 4) { s.supersampling = (int)n; s.has_supersampling = true; }
++            /* 1..16 = PSX_GL_MAX_INTERNAL_SCALE. Must accept every value the
++             * launcher offers and save_user_settings writes, or the saved
++             * factor is dropped on load and resets each run. */
++            if (n >= 1 && n <= 16) { s.supersampling = (int)n; s.has_supersampling = true; }
+         });
+         if (v.contains("window_width")) try_get([&]{
+             const auto n = toml::find<int64_t>(v, "window_width");
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 3ebde655..ab80c818 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1196,7 +1196,7 @@ struct UserSettings {
+ 
+     // [video]
+     bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // 0=software,1=opengl,2=vulkan
+-    bool has_supersampling  = false; int  supersampling  = 1; // 1..4
++    bool has_supersampling  = false; int  supersampling  = 1; // 1..16 (PSX_GL_MAX_INTERNAL_SCALE)
+     // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
+     // both the launcher and the emulator window so they boot at the same size.
+     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960

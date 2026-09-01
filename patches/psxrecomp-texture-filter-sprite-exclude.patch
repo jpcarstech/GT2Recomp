@@ -1,0 +1,190 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 99f516e1..d573dbdc 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2306,6 +2306,12 @@ UserSettings load_user_settings(const fs::path& path) {
+             const auto m = toml::find<std::string>(v, "texture_filtering");
+             if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
+             else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
++            else if (m == "3point") { s.texture_filter = 2; s.has_texture_filter = true; }
++            else if (m == "trilinear") { s.texture_filter = 3; s.has_texture_filter = true; }
++        });
++        if (v.contains("texture_filtering_2d")) try_get([&]{
++            s.texture_filter_2d = toml::find<bool>(v, "texture_filtering_2d");
++            s.has_texture_filter_2d = true;
+         });
+         if (v.contains("fmv_filter")) try_get([&]{
+             const auto m = toml::find<std::string>(v, "fmv_filter");
+@@ -2636,8 +2642,17 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+         f << "window_width      = " << s.window_width << "\n";
+     if (s.has_antialiasing)
+         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
+-    if (s.has_texture_filter)
+-        f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
++    if (s.has_texture_filter) {
++        /* Persist every mode: the earlier bool-shaped serializer silently
++         * downgraded 3-Point (N64) to "bilinear" across restarts. */
++        static const char* k_tf_names[4] =
++            { "nearest", "bilinear", "3point", "trilinear" };
++        const int tf = (s.texture_filter >= 0 && s.texture_filter <= 3)
++                           ? s.texture_filter : (s.texture_filter ? 1 : 0);
++        f << "texture_filtering = \"" << k_tf_names[tf] << "\"\n";
++    }
++    if (s.has_texture_filter_2d)
++        f << "texture_filtering_2d = " << (s.texture_filter_2d ? "true" : "false") << "\n";
+     if (s.has_fmv_filter)
+         f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
+     if (s.has_geometry_correction)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index ab80c818..95902895 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1201,7 +1201,8 @@ struct UserSettings {
+     // both the launcher and the emulator window so they boot at the same size.
+     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
+     bool has_antialiasing   = false; bool antialiasing   = true;
+-    bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
++    bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear
++    bool has_texture_filter_2d = false; bool texture_filter_2d = true; // filter 2D sprites/UI too
+     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+     // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+     bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 9f64b4ab..bb4440d0 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -94,6 +94,9 @@ void gl_renderer_set_cpu_auth_dual(int on);
+  * config enum VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic).
+  * Only consulted while video antialiasing is on; AA off is always nearest. */
+ void gl_renderer_set_fmv_filter(int cfg_value);
++/* Apply the texture filter to 2D elements (sprites + 1:1 screen-aligned
++ * polys). 1 = filter everything (legacy); 0 = 2D stays nearest. */
++void gl_renderer_set_texture_filter_2d(int on);
+ int  gl_renderer_cpu_auth_dual(void);
+ 
+ /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 1131a7c3..2be1059b 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -477,6 +477,13 @@ static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
+ static int s_mask_set = 0, s_mask_check = 0;
+ static int s_tw_mask_x = 0, s_tw_mask_y = 0, s_tw_off_x = 0, s_tw_off_y = 0;
+ static int s_tex_filter = 0;
++/* Apply the texture filter to 2D elements (sprites/rects and screen-aligned
++ * 1:1 texel-mapped polys - HUDs, fonts, menu art). 1 = legacy behavior
++ * (filter everything); 0 = 2D elements stay nearest so pixel art does not
++ * smear while 3D world textures keep the chosen filter (DuckStation's
++ * "exclude 2D polygons" parity). */
++static int s_tex_filter_2d = 1;
++void gl_renderer_set_texture_filter_2d(int on) { s_tex_filter_2d = on ? 1 : 0; }
+ /* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
+  * duplicate stencil copy current is deferred until mask checking is requested. */
+ static int s_stencil_valid = 1;
+@@ -2025,6 +2032,24 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+                                   int semi, const int *lim) {
+     int lim_buf[4];
+     int uv_buf[6];
++    /* 2D classification for the filter exclusion, on the ORIGINAL uvs
++     * (before the mirror bump below perturbs them): rect/sprite prims come
++     * from gpu_textured_rect with a precomputed lim; a poly is 2D when every
++     * edge maps texels 1:1 to pixels on both axes (screen-space UI drawn as
++     * triangles - filtering such prims only smears, never helps). */
++    int prim_2d = (lim != NULL);
++    if (!prim_2d && !s_tex_filter_2d && s_tex_filter != 0) {
++        prim_2d = 1;
++        for (int e = 0; e < 3 && prim_2d; e++) {
++            int j = (e + 1) % 3;
++            int dx = xs[j] - xs[e], dy = ys[j] - ys[e];
++            int du = us[j] - us[e], dv = vs[j] - vs[e];
++            if ((dx != du && dx != -du) || (dy != dv && dy != -dv))
++                prim_2d = 0;
++        }
++    }
++    const int eff_filter =
++        (prim_2d && !s_tex_filter_2d) ? 0 : s_tex_filter;
+     if (!lim) {
+         /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
+          * center-sampling mirror compensation (rect prims arrive with their
+@@ -2081,7 +2106,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+             if (isolate) reason = 0;
+             else if (batch_semi != s_tb_semi) reason = 1;
+             else if (s_mask_set != s_tb_mask) reason = 2;
+-            else if (s_tex_filter != s_tb_filter) reason = 3;
++            else if (eff_filter != s_tb_filter) reason = 3;
+             else if (gate != s_tb_gate) reason = 4;
+             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
+                      tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
+@@ -2092,7 +2117,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+         }
+         if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
+         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
+-            s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
++            s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = eff_filter; s_tb_gate = gate;
+             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+         }
+         float *vp = &s_tb[s_tb_n * TEXV];
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index bc514467..56eade71 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1197,7 +1197,8 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+     return cfg_value + 1;
+ }
+-static int           g_video_texfilter = 0; /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */
++static int           g_video_texfilter = 0;
++static int           g_video_texfilter_2d = 1;  /* filter 2D sprites/UI too (legacy on) */ /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */
+ /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
+  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
+  * SXY readback are untouched. Default off = the faithful floor. */
+@@ -12255,6 +12256,7 @@ int main(int argc, char** argv) {
+         if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
+         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
++        if (us.has_texture_filter_2d) g_video_texfilter_2d = us.texture_filter_2d ? 1 : 0;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+         if (us.has_geometry_correction)
+             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
+@@ -12755,6 +12757,7 @@ int main(int argc, char** argv) {
+             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
+             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
+             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
++            seed.texture_filter_2d = (g_video_texfilter_2d != 0); seed.has_texture_filter_2d = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
+             /* Seeded (and marked present) so a launcher save round-trips the
+              * player's hand-edited value instead of dropping the key. */
+@@ -12944,6 +12947,7 @@ int main(int argc, char** argv) {
+             ls.supersampling      = seed.supersampling;
+             ls.antialiasing       = seed.antialiasing ? 1 : 0;
+             ls.texture_filter     = seed.texture_filter;
++            ls.texture_filter_2d  = seed.texture_filter_2d ? 1 : 0;
+             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
+             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
+             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
+@@ -13177,6 +13181,8 @@ int main(int argc, char** argv) {
+                     (ls.texture_filter >= 0 && ls.texture_filter <= 3)
+                         ? ls.texture_filter : (ls.texture_filter ? 1 : 0);
+                 seed.has_texture_filter = true;
++                seed.texture_filter_2d = ls.texture_filter_2d != 0;
++                seed.has_texture_filter_2d = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 seed.has_fmv_filter = true;
+                 {
+@@ -13783,6 +13789,7 @@ session_reboot:
+     const int requested_scale = g_video_scale;
+     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+     gr_set_texture_filter(g_video_texfilter);
++    gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
+     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
+      * with both off every setter below leaves the tracking caches disabled and
+      * the draw path is the faithful integer one, unchanged. */
+@@ -15210,6 +15217,8 @@ soft_return_lobby:
+                 us.has_antialiasing = true;
+                 us.texture_filter = ls.texture_filter;
+                 us.has_texture_filter = true;
++                us.texture_filter_2d = ls.texture_filter_2d != 0;
++                us.has_texture_filter_2d = true;
+                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 us.has_fmv_filter = true;
+                 us.geometry_correction = ls.geometry_correction != 0;

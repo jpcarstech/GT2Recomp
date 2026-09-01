@@ -1,0 +1,130 @@
+format_version = 5
+id = "gt2.silent-enhancements"
+version = "1.0.0"
+name = "Silent's Enhancements"
+author = "Silent (CookiePLMonster), asasega — packaged for GT2Recomp"
+description = "Quality-of-life and performance enhancements for Gran Turismo 2, converted from Silent's GameShark code pack (github.com/CookiePLMonster/Console-Cheat-Codes) into guarded runtime patches. Verified against the GT2 Combined Disc (NTSC-U 1.1 base)."
+license = "See upstream repository"
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SCUS-94488"
+
+[[feature]]
+id = "overclock"
+name = "CPU Overclock"
+description = "Runs the emulated PS1 CPU faster than stock hardware, everywhere past the BIOS boot — races and menus alike (GT2's menus are sluggish at stock speed). FMV playback (intro and in-game movies) is left fully authentic: the overclock disengages during movies and re-engages afterward. Required by the 60 FPS feature to actually reach 60."
+group = "Performance"
+default_enabled = false
+
+[[option]]
+feature = "overclock"
+id = "percent"
+label = "CPU overclock %"
+description = "How much faster than a real PS1 CPU to run. GT2's race engine cannot fill 60 frames per second at stock speed (100) — that is why the game shipped at 30 fps — so with 60 FPS enabled, values below ~150 will run in slow motion. 200 is a good default; raise it if heavy scenes still dip."
+type = "integer"
+min = 100
+max = 400
+step = 25
+default = 200
+
+[[plugin]]
+feature = "overclock"
+id = "gt2.overclock"
+
+[[feature]]
+id = "60fps"
+name = "60 FPS"
+description = "Runs the game at 60 frames per second instead of 30, and restores the tire smoke and rear-view-mirror effects to full rate at the higher frame rate. Applies in Simulation-mode gameplay; takes effect when a race (re)loads. Requires the CPU Overclock feature (above) to actually reach 60 — at stock speed the engine cannot fill 60 fps and races run in slow motion. FMV playback is left fully authentic: the frame-rate patches disengage during movies and re-engage afterward. Known upstream caveats: existing replays and Rally-mode AI ghosts are not compatible with 60 FPS."
+group = "Performance"
+default_enabled = false
+
+[[plugin]]
+feature = "60fps"
+id = "gt2.silent60fps"
+
+[[feature]]
+id = "aspect"
+name = "Aspect Ratio"
+description = "Widescreen presentation using the framework's renderer-level support (GTE projection adjustment with per-primitive proportion correction — HUD and sprites are not stretched), combined with the cull-bound widening from Silent's 16:9 Widescreen patch so geometry no longer pops in at the revealed screen edges. The bounds scale with the chosen ratio (16:10 and 21:9 get correctly proportioned values). Select the display aspect below; 4:3 is the original presentation. Applies from the next launch."
+group = "Visual"
+default_enabled = false
+
+[[option]]
+feature = "aspect"
+id = "ratio"
+label = "Display aspect"
+type = "choice"
+default = "16:9"
+
+[[option.choice]]
+value = "16:9"
+label = "16:9 (Widescreen)"
+
+[[option.choice]]
+value = "16:10"
+label = "16:10"
+
+[[option.choice]]
+value = "21:9"
+label = "21:9 (Ultrawide)"
+
+[[plugin]]
+feature = "aspect"
+id = "gt2.display-aspect"
+
+[[feature]]
+id = "draw_distance"
+name = "Higher Draw Distance"
+description = "Slightly higher draw distance in races: the game normally reserves its longest draw distance for replays — this uses the replay distance while driving too, so track geometry fades in later. The game's draw distance is bounded by the track data itself, so the gain is modest by design. Applies in Simulation-mode races; FMV playback stays authentic."
+group = "Visual"
+default_enabled = false
+
+[[plugin]]
+feature = "draw_distance"
+id = "gt2.drawdistance"
+
+[[feature]]
+id = "ram8_buffers"
+name = "8MB RAM Polygon Buffers"
+description = "Moves the renderer's polygon buffers into the expanded 8MB console RAM (which every build of this port ships with) and doubles their size, so heavy scenes stop running out of polygon budget. Part of the port: always on, not shown in the launcher."
+group = "Visual"
+hidden = true
+
+[[plugin]]
+feature = "ram8_buffers"
+id = "gt2.ram8buffers"
+
+[[feature]]
+id = "full_lod_ai"
+name = "Full Detail AI Cars"
+description = "Forces every car in the race to its highest level-of-detail model — AI cars no longer switch to the simplified low-poly meshes at distance, which looks far better at high internal resolutions. REQUIRES '8MB RAM Polygon Buffers' (above) to be enabled: six full-detail cars overflow the stock polygon buffer, so this feature stays dormant until the bigger buffers are active. Takes effect when a race (re)loads."
+group = "Visual"
+default_enabled = false
+
+[[plugin]]
+feature = "full_lod_ai"
+id = "gt2.fulllod"
+
+[[feature]]
+id = "arcade_all_tracks"
+name = "Arcade: Unlock All Tracks"
+description = "Unlocks every arcade-mode track in all menus (1P, 2P, rally, time trial). The Combined Disc rebuilds arcade mode, so the classic GameShark codes do not apply - this patches the game's own unlock check (reverse-engineered from this disc) so every course passes it. Menus are rebuilt when you enter Arcade mode, so enter (or re-enter) Arcade mode after enabling."
+group = "Cheats"
+default_enabled = false
+
+[[plugin]]
+feature = "arcade_all_tracks"
+id = "gt2.arcadetracks"
+
+[[feature]]
+id = "arcade_all_cars"
+name = "Arcade: Unlock All Cars"
+description = "Unlocks the extra arcade cars: patches the unlock-flag test in the menu code (reverse-engineered from the Combined Disc - the classic GameShark completion codes do not apply to this rebuilt arcade mode). Enter (or re-enter) Arcade mode after enabling."
+group = "Cheats"
+default_enabled = false
+
+[[plugin]]
+feature = "arcade_all_cars"
+id = "gt2.arcadecars"

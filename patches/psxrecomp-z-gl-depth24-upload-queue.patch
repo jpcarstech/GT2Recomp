@@ -1,0 +1,14 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 63eb8e1a..9089ac80 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -2638,8 +2638,8 @@ static void depth24_upload_policy(void) {
+          * top/bottom bars and flicker between double-buffered movie frames.
+          * Cost is one full-VRAM readback per 24-bit entry, not per frame, and
+          * ensure_cpu is a no-op when the FBO is already clean. */
++        flush_cpu_upload();   /* realise queued texture uploads before syncing */
+         ensure_cpu();
+-        s_up_nrects = 0;
+         rect_clear(&s_d24_skip_fb);
+     } else if (!d24 && s_depth24_skip_up) {
+         /* Small texture uploads are still queued while depth24 scanout uses

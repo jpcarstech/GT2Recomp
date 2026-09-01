@@ -1,0 +1,1265 @@
+diff --git a/runtime/include/dirty_ram_interp.h b/runtime/include/dirty_ram_interp.h
+index 515a9695..b52830aa 100644
+--- a/runtime/include/dirty_ram_interp.h
++++ b/runtime/include/dirty_ram_interp.h
+@@ -15,6 +15,7 @@
+ #ifndef PSXRECOMP_DIRTY_RAM_INTERP_H
+ #define PSXRECOMP_DIRTY_RAM_INTERP_H
+ 
++#include "psx_memory.h"
+ #include <stdint.h>
+ #include "cpu_state.h"
+ 
+@@ -231,13 +232,13 @@ extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+  * bitmap instead of probing a large hash table for every retired instruction.
+  * This covers all 524,288 RAM words (the old 262K-entry hash could saturate)
+  * and is also the execution-verified seed source used by overlay_capture. */
+-#define DIRTY_RAM_EXEC_WORD_COUNT   ((2u * 1024u * 1024u) / 4u)
++#define DIRTY_RAM_EXEC_WORD_COUNT   (PSX_MAIN_RAM_BYTES / 4u)
+ #define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
+ extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+ /* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
+  * guard; they clear that page's capture bits rather than serializing from the
+  * universal store hot path. */
+-#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS 16u
++#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS (((PSX_MAIN_RAM_BYTES >> 12) + 31u) / 32u)
+ extern uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
+ /* Presence-only companion for interpreted block/dispatch entries. The richer
+  * counter table remains for telemetry, while capture can snapshot/reset this
+diff --git a/runtime/include/mod_memory.h b/runtime/include/mod_memory.h
+index 7406c39a..190da239 100644
+--- a/runtime/include/mod_memory.h
++++ b/runtime/include/mod_memory.h
+@@ -2,6 +2,7 @@
+ #define PSXRECOMP_MOD_MEMORY_H
+ 
+ #include <stdint.h>
++#include "psx_memory.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -29,8 +30,15 @@ static inline int psx_mod_gpu_dma_aperture_offset_for(
+ }
+ 
+ /*
+- * Preserve the retail DMAC's 2 MiB folding unless the address is inside the
++ * Preserve the DMAC's main-RAM folding unless the address is inside the
+  * portion of the enhancement aperture that has actually been allocated.
++ * The fold uses the build's RAM geometry (psx_memory.h): retail folds to
++ * 2 MiB; an expanded 8 MiB build keeps all 23 tag bits, so display lists
++ * built above 0x200000 (e.g. GT2's 8MB polygon buffers) resolve to the
++ * expanded bank instead of aliasing kernel RAM. (The hardcoded 2 MiB fold
++ * here was the one survivor of the expanded-RAM sweep: with 8 MiB enabled
++ * the GPU chain walker read folded garbage and the game spun forever
++ * waiting on a frame that never drew.)
+  */
+ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
+     uint32_t address, uint32_t used) {
+@@ -38,7 +46,7 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
+     if (psx_mod_gpu_dma_aperture_offset_for(
+             canonical, 4u, used, (uint32_t *)0))
+         return canonical;
+-    return canonical & 0x001FFFFCu;
++    return canonical & PSX_MAIN_RAM_WORD_MASK;
+ }
+ 
+ uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);
+diff --git a/runtime/include/overlay_api.h b/runtime/include/overlay_api.h
+index 2ceda151..e553d029 100644
+--- a/runtime/include/overlay_api.h
++++ b/runtime/include/overlay_api.h
+@@ -125,6 +125,12 @@
+  *   2 — PGXP precision shadowing (-DPSX_PGXP=1 objects; pgxp_hooks.h) */
+ #define PSX_OVERLAY_FLAVOR_WIDESCREEN 1
+ #define PSX_OVERLAY_FLAVOR_PGXP       2
++/* Bit 4 — expanded 8 MiB main RAM (-DPSX_MAIN_RAM_BYTES=0x00800000u
++ * objects; psx_memory.h geometry). The RAM fold mask is inlined into
++ * overlay code through psx_cyc.h, so a 2 MiB shard run in an 8 MiB host
++ * (or vice versa) would fold guest addresses differently — the flavor
++ * gate must keep those caches apart. */
++#define PSX_OVERLAY_FLAVOR_RAM8       4
+ 
+ /* Combined tag exported by overlay_abi() and checked by the loader. */
+ #define PSX_OVERLAY_ABI_TAG \
+diff --git a/runtime/include/psx_cyc.h b/runtime/include/psx_cyc.h
+index 4239c123..d44940e2 100644
+--- a/runtime/include/psx_cyc.h
++++ b/runtime/include/psx_cyc.h
+@@ -28,6 +28,7 @@
+ #define PSX_CYC_H
+ 
+ #include <stdint.h>
++#include "psx_memory.h"
+ #include <string.h>
+ #if defined(_MSC_VER)
+ #include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
+@@ -250,7 +251,7 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
+             cpu->ld_which_t = (uint8_t)rt;
+         }
+         uint32_t value;
+-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
++        memcpy(&value, g_psx_ram + (phys & PSX_MAIN_RAM_MASK), sizeof(value));
+         return value;
+     }
+     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
+@@ -280,7 +281,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
+             cpu->ld_which_t = (uint8_t)rt;
+         }
+         uint16_t value;
+-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
++        memcpy(&value, g_psx_ram + (phys & PSX_MAIN_RAM_MASK), sizeof(value));
+         return value;
+     }
+     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 149a3fdc..f73084f7 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -1031,6 +1031,10 @@ function(psxrecomp_add_runtime_target target)
+     if(PSXRT_ORACLE)
+         set(_psxrt_exe_name "${_psxrt_exe_name}_oracle")
+     endif()
++    # Overlay codegen flavor (overlay_api.h): compose the bits this target's
++    # objects are built with; the flavor folds into the overlay ABI tag so
++    # the loader keeps caches from differently-flavored builds apart.
++    set(_psxrt_flavor 0)
+     if(PSXRT_PGXP)
+         # The _pgxp suffix exists only to keep the auto-cloned A/B sibling
+         # distinct from the base binary it sits beside (PSX_PGXP_VARIANT); the
+@@ -1048,9 +1052,27 @@ function(psxrecomp_add_runtime_target target)
+         if(PSXRT_PGXP_CLONE)
+             set(_psxrt_exe_name "${_psxrt_exe_name}_pgxp")
+         endif()
++        math(EXPR _psxrt_flavor "${_psxrt_flavor} + 2")  # PSX_OVERLAY_FLAVOR_PGXP
++        target_compile_definitions(${target} PRIVATE PSX_PGXP=1)
++    endif()
++    # Main-RAM geometry (psx_memory.h): retail 2 MiB mirroring by default;
++    # -DPSX_EXPANDED_RAM=ON selects the dev-console 8 MiB unique decode
++    # (DuckStation "8MB RAM" parity — needed by game patches that place data
++    # above 0x00200000, e.g. GT2's 8MB polygon buffers; retail mirror tricks
++    # like Kula World's crt0 $sp need this OFF). The RAM mask is inlined into
++    # generated/overlay code via psx_cyc.h, so the geometry is codegen-
++    # relevant: it contributes flavor bit 4 (PSX_OVERLAY_FLAVOR_RAM8) and the
++    # ABI gate + namespace keep 2 MiB and 8 MiB shard caches strictly apart.
++    option(PSX_EXPANDED_RAM
++        "Build runtime targets with 8 MiB expanded main RAM (no retail mirrors)" OFF)
++    if(PSX_EXPANDED_RAM)
++        math(EXPR _psxrt_flavor "${_psxrt_flavor} + 4")  # PSX_OVERLAY_FLAVOR_RAM8
+         target_compile_definitions(${target} PRIVATE
+-            PSX_PGXP=1
+-            PSX_OVERLAY_FLAVOR=2)   # PSX_OVERLAY_FLAVOR_PGXP (overlay_api.h)
++            PSX_MAIN_RAM_BYTES=0x00800000u)
++    endif()
++    if(_psxrt_flavor GREATER 0)
++        target_compile_definitions(${target} PRIVATE
++            PSX_OVERLAY_FLAVOR=${_psxrt_flavor})
+     endif()
+     set_target_properties(${target} PROPERTIES OUTPUT_NAME "${_psxrt_exe_name}")
+ 
+diff --git a/runtime/src/beetle_debug_server.c b/runtime/src/beetle_debug_server.c
+index 9cd7045b..c3d3a71a 100644
+--- a/runtime/src/beetle_debug_server.c
++++ b/runtime/src/beetle_debug_server.c
+@@ -9,6 +9,7 @@
+  * JSON-over-newline protocol, same as recomp side.
+  */
+ 
++#include "psx_memory.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -314,7 +315,7 @@ static void h_read_ram(int id, const char *json) {
+     int len = json_get_int(json, "len", 16);
+     if (len < 1) len = 1;
+     /* Match the native server: whole 2 MB RAM in one response if asked. */
+-    if (len > 0x200000) len = 0x200000;
++    if (len > PSX_MAIN_RAM_BYTES) len = PSX_MAIN_RAM_BYTES;
+ 
+     uint8_t *buf = (uint8_t*)malloc(len);
+     if (!buf) { send_err(id, "alloc"); return; }
+diff --git a/runtime/src/beetle_libretro.cpp b/runtime/src/beetle_libretro.cpp
+index cb654032..1ebfbc64 100644
+--- a/runtime/src/beetle_libretro.cpp
++++ b/runtime/src/beetle_libretro.cpp
+@@ -11,6 +11,7 @@
+  *   - fntrace ring buffer (beetle_fntrace_arm/disarm/reset/get/total/...)
+  */
+ 
++#include "psx_memory.h"
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -637,7 +638,7 @@ extern "C" int beetle_get_registers(uint32_t *out /* >= 38 words */) {
+ 
+ extern "C" uint8_t beetle_read_byte(uint32_t phys) {
+     if (phys < 0x00800000u) {
+-        uint32_t offset = phys & 0x1FFFFF;
++        uint32_t offset = phys & PSX_MAIN_RAM_MASK;
+         if (MainRAM) return MainRAM->data8[offset];
+     }
+     if (phys >= 0x1F800000u && phys < 0x1F800400u) {
+@@ -651,8 +652,8 @@ extern "C" uint8_t beetle_read_byte(uint32_t phys) {
+ 
+ extern "C" uint32_t beetle_read_word(uint32_t phys) {
+     if (phys < 0x00800000u) {
+-        uint32_t offset = phys & 0x1FFFFF;
+-        if (MainRAM && offset + 3 < 0x200000) {
++        uint32_t offset = phys & PSX_MAIN_RAM_MASK;
++        if (MainRAM && offset + 3 < PSX_MAIN_RAM_BYTES) {
+             uint32_t val; memcpy(&val, MainRAM->data8 + offset, 4); return val;
+         }
+     }
+@@ -1226,9 +1227,9 @@ extern "C" void beetle_history_record_frame(void) {
+     for (int i = 0; i < BEETLE_RAM_SNAPSHOT_REGIONS; i++) {
+         r->snapshot_addr[i] = s_beetle_snap_addrs[i];
+         if (s_beetle_snap_active[i] && s_beetle_snap_addrs[i] != 0 && MainRAM) {
+-            uint32_t base = s_beetle_snap_addrs[i] & 0x1FFFFFu;
++            uint32_t base = s_beetle_snap_addrs[i] & PSX_MAIN_RAM_MASK;
+             for (int j = 0; j < BEETLE_RAM_SNAPSHOT_SIZE; j++) {
+-                uint32_t off = (base + (uint32_t)j) & 0x1FFFFFu;
++                uint32_t off = (base + (uint32_t)j) & PSX_MAIN_RAM_MASK;
+                 r->snapshot_data[i][j] = MainRAM->data8[off];
+             }
+         } else {
+diff --git a/runtime/src/bios_hle.c b/runtime/src/bios_hle.c
+index 11a875f4..6c92a12f 100644
+--- a/runtime/src/bios_hle.c
++++ b/runtime/src/bios_hle.c
+@@ -32,6 +32,7 @@
+  * limitation of the opt-in tier. LLE remains the timing oracle.
+  */
+ 
++#include "psx_memory.h"
+ #include "bios_hle.h"
+ 
+ #include "cpu_state.h"
+@@ -100,7 +101,7 @@ static void hle_record(uint32_t vector, uint32_t fn, const CPUState* cpu,
+      * load-bearing for event-consumption races (MMX6 card check). */
+     uint32_t pcb = cpu->read_word(0xA0000108u);
+     uint32_t pcb_phys = pcb & 0x1FFFFFFFu;
+-    uint32_t tcb = (pcb != 0u && pcb_phys < 0x200000u)
++    uint32_t tcb = (pcb != 0u && pcb_phys < PSX_MAIN_RAM_BYTES)
+                        ? cpu->read_word(0xA0000000u | pcb_phys) : 0u;
+     extern int psx_get_in_exception(void);
+     uint8_t in_exc = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+diff --git a/runtime/src/boot_state.c b/runtime/src/boot_state.c
+index f0284eaf..bb6b2164 100644
+--- a/runtime/src/boot_state.c
++++ b/runtime/src/boot_state.c
+@@ -1,3 +1,4 @@
++#include "psx_memory.h"
+ #include "boot_state.h"
+ #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
+ #include "dirty_ram_interp.h"
+@@ -38,7 +39,7 @@ static double boot_state_mono_ms(void) {
+ /* Compress payloads at/above this size (RAM/VRAM/SPU/dirty dominate I/O). */
+ #define BOOT_STATE_ZLIB_MIN 256u
+ 
+-#define RAM_SIZE   (2u * 1024u * 1024u)
++#define RAM_SIZE   PSX_MAIN_RAM_BYTES
+ #define SPAD_SIZE  (1024u)
+ #define VRAM_W     1024
+ #define VRAM_H     512
+diff --git a/runtime/src/cosim_state.c b/runtime/src/cosim_state.c
+index ea792673..6b1527b8 100644
+--- a/runtime/src/cosim_state.c
++++ b/runtime/src/cosim_state.c
+@@ -12,6 +12,7 @@
+  * cycles), which is included. This exclusion list is refined by the injected-divergence
+  * and compiled-vs-compiled gates.
+  */
++#include "psx_memory.h"
+ #include "cosim_state.h"
+ #include <stdlib.h>
+ #include <string.h>
+@@ -50,7 +51,7 @@ extern uint64_t interrupts_cosim_hash(uint64_t seed);
+ /* renderer-agnostic VRAM readback (sw renderer = cheap memcpy). */
+ extern void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *dst);
+ 
+-#define RAM_SIZE   (2u * 1024u * 1024u)
++#define RAM_SIZE   PSX_MAIN_RAM_BYTES
+ #define SPAD_SIZE  (1024u)
+ #define PAGE       4096u
+ #define RAM_PAGES  (RAM_SIZE / PAGE)      /* 512 */
+diff --git a/runtime/src/crash_trace.c b/runtime/src/crash_trace.c
+index 0fe0d272..34bcc4db 100644
+--- a/runtime/src/crash_trace.c
++++ b/runtime/src/crash_trace.c
+@@ -26,6 +26,7 @@
+ #ifndef NOMINMAX
+ #define NOMINMAX
+ #endif
++#include "psx_memory.h"
+ #include <windows.h>
+ #include <intrin.h>     /* __readgsqword — fiber TEB stack bounds for native_stack walk */
+ #endif
+@@ -166,8 +167,8 @@ static int crash_peek_guest(uint32_t vaddr, uint8_t *dst, int len) {
+         return len;
+     }
+     if (phys < 0x00800000u && g_psx_ram) {
+-        uint32_t folded = phys & 0x1FFFFFu;
+-        if (folded + (uint32_t)len > 0x200000u) len = (int)(0x200000u - folded);
++        uint32_t folded = phys & PSX_MAIN_RAM_MASK;
++        if (folded + (uint32_t)len > PSX_MAIN_RAM_BYTES) len = (int)(PSX_MAIN_RAM_BYTES - folded);
+         if (len <= 0) return 0;
+         memcpy(dst, g_psx_ram + folded, (size_t)len);
+         return len;
+diff --git a/runtime/src/data_shards.c b/runtime/src/data_shards.c
+index 6c3be641..3651832d 100644
+--- a/runtime/src/data_shards.c
++++ b/runtime/src/data_shards.c
+@@ -29,6 +29,7 @@
+  *  - GTE/COP0 state changes by the function are not captured (target
+  *    functions are data transforms; a GTE-using function must not be listed).
+  */
++#include "psx_memory.h"
+ #include "data_shards.h"
+ #include "psx_cycles.h"
+ #include "interrupts.h"
+@@ -47,7 +48,7 @@ extern void psx_write_word(uint32_t addr, uint32_t val);
+ extern void psx_write_byte(uint32_t addr, uint8_t val);
+ extern void dirty_ram_mark_executable_range(uint32_t addr, uint32_t len);
+ 
+-#define DS_RAM_BYTES   (2u * 1024u * 1024u)
++#define DS_RAM_BYTES   PSX_MAIN_RAM_BYTES
+ #define DS_SP_BYTES    1024u
+ #define DS_SPACE       (DS_RAM_BYTES + DS_SP_BYTES)   /* unified index space */
+ #define DS_PAGE_SHIFT  12
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 645f055e..922e76bc 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -14,6 +14,7 @@
+ #elif !defined(_POSIX_C_SOURCE)
+ #  define _POSIX_C_SOURCE 200809L
+ #endif
++#include "psx_memory.h"
+ #include <time.h>
+ #include "debug_server.h"
+ #include "psx_bss.h"
+@@ -161,7 +162,7 @@ uint64_t s_frame_count = 0;
+  * frame, found in O(1) instead of O(n) function guesses. wr_hash vs pc_hash
+  * classifies the fork: pc differs but wr matches => same writes via a different
+  * control path; wr differs => actual state divergence. Reusable for any title.
+- * Hashed over main RAM (phys < 0x200000) only — game state lives there; MMIO/
++ * Hashed over main RAM (phys < PSX_MAIN_RAM_BYTES) only — game state lives there; MMIO/
+  * scratchpad churn (device polling) would add benign cross-backend noise. */
+ uint64_t g_fp_wr_hash    = 1469598103934665603ULL;  /* FNV-1a-style seed (main RAM) */
+ uint64_t g_fp_pc_hash    = 1469598103934665603ULL;  /* store-PC path sig (main RAM)  */
+@@ -178,7 +179,7 @@ static PSX_BSS FpEntry  s_fp_ring[FP_RING_CAP];
+ static uint32_t s_fp_head  = 0;
+ static uint64_t s_fp_total = 0;
+ 
+-/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<0x200000)
++/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<PSX_MAIN_RAM_BYTES)
+  * feeds the proven wr/pc hashes. Scratchpad (0x1F800000..0x1F8003FF) feeds a
+  * SEPARATE sp_hash — it was previously dropped entirely (the blind spot that
+  * hid a possible pre-1823 scratchpad-state fork), but folding it into wr_hash
+@@ -195,7 +196,7 @@ static inline void fp_record_write(uint32_t phys, uint32_t val, uint32_t pc)
+         g_fp_sp_count++;
+         return;
+     }
+-    if (phys >= 0x200000u) return;                  /* main RAM only */
++    if (phys >= PSX_MAIN_RAM_BYTES) return;                  /* main RAM only */
+     uint64_t h = g_fp_wr_hash;
+     h = (h ^ (uint64_t)phys) * 1099511628211ULL;
+     h = (h ^ (uint64_t)val)  * 1099511628211ULL;
+@@ -746,7 +747,7 @@ static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
+ {
+     (void)cpu;
+     uint32_t phys = addr & 0x1FFFFFFFu;
+-    if (phys > 0x001FFFFCu &&
++    if (phys > PSX_MAIN_RAM_WORD_MASK &&
+         (phys < 0x1F800000u || phys > 0x1F8003FCu)) {
+         return 0;
+     }
+@@ -1366,7 +1367,7 @@ static void evcb_snapshot_capture(EvCBTag tag, uint64_t fn_entry_seq) {
+ 
+     /* Convert RAM base ptr to RAM offset (kernel uses cached + uncached
+      * mirrors; mask off region bits). */
+-    uint32_t base_ram = base_ptr & 0x001FFFFFu;
++    uint32_t base_ram = base_ptr & PSX_MAIN_RAM_MASK;
+ 
+     EvCBSnapshot *e = &s_evcb_ring[s_evcb_ring_seq % EVCB_RING_CAP];
+     e->seq              = s_evcb_ring_seq;
+@@ -5164,7 +5165,7 @@ static void handle_read_ram(int id, const char *json)
+     if (len < 1) len = 1;
+     /* Effectively the entire 2 MB RAM in one shot.  Response uses a heap-
+      * sized envelope so we don't truncate. */
+-    if (len > 0x200000) len = 0x200000;
++    if (len > PSX_MAIN_RAM_BYTES) len = PSX_MAIN_RAM_BYTES;
+ 
+     /* Heap buffer for hex chars + JSON envelope.  Each byte = 2 hex chars. */
+     size_t env = 256;
+@@ -7220,7 +7221,7 @@ static void handle_evcb_snapshot(int id, const char *json)
+     snap.flag_755A       = (uint32_t)psx_read_byte(0x0000755A);
+     snap.flag_75C0       = evcb_read_u32_ram(0x000075C0);
+     snap.frame           = (uint32_t)s_frame_count;
+-    uint32_t base_ram    = base_ptr & 0x001FFFFFu;
++    uint32_t base_ram    = base_ptr & PSX_MAIN_RAM_MASK;
+     uint32_t n_entries   = (total_bytes / EVCB_ENTRY_SIZE);
+     if (n_entries > EVCB_MAX_ENTRIES) n_entries = EVCB_MAX_ENTRIES;
+     snap.entry_count     = n_entries;
+@@ -9497,7 +9498,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+     fp_record_write(phys, new_val, g_debug_last_store_pc);
+     {
+         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+-        if (phys < 0x200000u)
++        if (phys < PSX_MAIN_RAM_BYTES)
+             rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
+         else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
+             rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);
+diff --git a/runtime/src/dirty_ram_interp.c b/runtime/src/dirty_ram_interp.c
+index 1fd738b2..1bedaa68 100644
+--- a/runtime/src/dirty_ram_interp.c
++++ b/runtime/src/dirty_ram_interp.c
+@@ -23,6 +23,7 @@
+  * meaningful fraction of total runtime work.
+  */
+ 
++#include "psx_memory.h"
+ #include "dirty_ram_interp.h"
+ #include "cpu_state.h"
+ #include "debug_server.h"
+@@ -256,7 +257,7 @@ static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
+  * cache-unfriendly open-addressed lookup on every guest instruction. */
+ static inline void exec_pc_table_record(uint32_t pc) {
+     uint32_t phys = pc & 0x1FFFFFFFu;
+-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
++    if (phys < PSX_MAIN_RAM_BYTES && (phys & 3u) == 0u) {
+         uint32_t word = phys >> 2;
+         uint32_t mask = 1u << (word & 31u);
+         uint32_t *slot = &g_dirty_ram_exec_pc_bitmap[word >> 5];
+@@ -403,7 +404,7 @@ uint32_t g_ra_load_snap_gpr[32] = {0};
+  * the tripwire names the callee that came back smeared; this ring names the
+  * RETURN PATH that let it come back. Zero-cost when disarmed. */
+ /* Armed iff the window is NON-EMPTY (hi > lo). It used to be `lo != 0`, which
+- * made lo=0 a silent off switch: `callret_watch lo=0 hi=0x200000` looked like
++ * made lo=0 a silent off switch: `callret_watch lo=0 hi=PSX_MAIN_RAM_BYTES` looked like
+  * "record the whole address space", replied ok, and then recorded nothing —
+  * so an empty ring read as "these events never happened" rather than "the
+  * ring was never on". A window is a window; 0 is a legal floor. Default 0/0
+@@ -551,7 +552,7 @@ static int ws_cull_site(uint32_t pc) {
+         return cache[slot].flag;
+     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+     uint32_t hi = phys + (uint32_t)(WIN * 4);
+-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
++    if (hi > PSX_MAIN_RAM_BYTES) hi = PSX_MAIN_RAM_BYTES;       /* 2 MB main RAM */
+     static uint32_t words[2 * WIN + 1];
+     int n = 0;
+     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
+@@ -577,7 +578,7 @@ static int ws_cull_bltz_site(uint32_t pc) {
+         return cache[slot].flag;
+     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+     uint32_t hi = phys + (uint32_t)(WIN * 4);
+-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
++    if (hi > PSX_MAIN_RAM_BYTES) hi = PSX_MAIN_RAM_BYTES;       /* 2 MB main RAM */
+     static uint32_t words[2 * WIN + 1];
+     int n = 0;
+     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
+@@ -614,7 +615,7 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
+     }
+     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+     uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
+-    if (hi > 0x200000u) hi = 0x200000u;          /* 2 MB main RAM */
++    if (hi > PSX_MAIN_RAM_BYTES) hi = PSX_MAIN_RAM_BYTES;          /* 2 MB main RAM */
+     static uint32_t words[2 * WIN + 2];
+     int n = 0;
+     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 2); a += 4u)
+@@ -2874,7 +2875,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
+          * a JALR into a CD-DMA'd overlay page then fell through to
+          * psx_unknown_dispatch and fail-fast exit(1). Data and invalid targets
+          * still fail closed via the decodability check. */
+-        if (phys < (2u * 1024u * 1024u) &&
++        if (phys < PSX_MAIN_RAM_BYTES &&
+             phys_is_overlay_region(phys) &&
+             dirty_ram_word_looks_decodable(fetch_word(phys))) {
+             dirty_ram_mark_executable_range(phys, 4u);
+@@ -3893,7 +3894,7 @@ void ls_at_leader(uint32_t leader_phys, CPUState *cpu) {
+      *    (per-instruction, for the cycle ruler); skip those — they're already
+      *    interpreted (clean game text dispatched FROM the dirty path still runs
+      *    compiled, so we can't use g_dirty_interp_active here).
+-     *  - [0x10000, 0x200000): game EXE text in main RAM (above the low-RAM
++     *  - [0x10000, PSX_MAIN_RAM_BYTES): game EXE text in main RAM (above the low-RAM
+      *    kernel/relocated-BIOS area, which isn't the regression locus). */
+     if (!g_ls_dirty_observe && leader_phys >= 0x00010000u && leader_phys < 0x00200000u) {
+         s_ls_R0 = *cpu;
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index 7d9ce988..3b83cd63 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -12,6 +12,7 @@
+  * Reference: nocash PSX specs, DuckStation src/core/dma.cpp
+  */
+ 
++#include "psx_memory.h"
+ #include "dma.h"
+ #include "cdrom.h"
+ #include "crash_trace.h"
+@@ -240,7 +241,7 @@ static void start_cdrom_dma_capture(uint32_t requested_words) {
+     memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
+     cdrom_dma_active_entry.seq = cdrom_dma_history_seq++;
+     cdrom_dma_active_entry.frame_start = (uint32_t)s_frame_count;
+-    cdrom_dma_active_entry.start_addr = channels[3].madr & 0x1FFFFCu;
++    cdrom_dma_active_entry.start_addr = channels[3].madr & PSX_MAIN_RAM_WORD_MASK;
+     cdrom_dma_active_entry.final_addr = cdrom_dma_active_entry.start_addr;
+     cdrom_dma_active_entry.requested_words = requested_words;
+     cdrom_dma_active_entry.bcr = channels[3].bcr;
+@@ -287,7 +288,7 @@ static void finish_cdrom_dma_capture(uint32_t final_addr, uint8_t completed) {
+     cdrom_debug_snapshot(&s);
+ 
+     cdrom_dma_active_entry.frame_end = (uint32_t)s_frame_count;
+-    cdrom_dma_active_entry.final_addr = final_addr & 0x1FFFFCu;
++    cdrom_dma_active_entry.final_addr = final_addr & PSX_MAIN_RAM_WORD_MASK;
+     cdrom_dma_active_entry.dicr_end = dicr_read_value(dicr);
+     cdrom_dma_active_entry.i_stat_end = i_stat;
+     cdrom_dma_active_entry.sector_read_pos_end = s.sector_read_pos;
+@@ -384,7 +385,7 @@ static void cancel_async_transfer(int ch) {
+         mdec_async[ch].cycles_accum = 0;
+     }
+     if (ch == 3) {
+-        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 0);
++        finish_cdrom_dma_capture(channels[3].madr & PSX_MAIN_RAM_WORD_MASK, 0);
+         cdrom_async.active = 0;
+         cdrom_async.debug_started = 0;
+         cdrom_async.total_words = 0;
+@@ -443,9 +444,9 @@ static void start_async_mdec_transfer(int ch) {
+     a->cycles_accum = 0;
+ 
+     if (ch == 0) {
+-        mdec_debug_dma_in_start(channels[0].madr & 0x1FFFFCu, a->remaining_words);
++        mdec_debug_dma_in_start(channels[0].madr & PSX_MAIN_RAM_WORD_MASK, a->remaining_words);
+     } else {
+-        mdec_debug_dma_out_start(channels[1].madr & 0x1FFFFCu, a->remaining_words);
++        mdec_debug_dma_out_start(channels[1].madr & PSX_MAIN_RAM_WORD_MASK, a->remaining_words);
+     }
+     a->debug_started = 1;
+ }
+@@ -469,11 +470,11 @@ static void start_async_cdrom_transfer(void) {
+     a->total_words = transfer_word_count(3);
+     a->remaining_words = a->total_words;
+     a->cycles_accum = 0;
+-    a->start_addr = channels[3].madr & 0x1FFFFCu;
++    a->start_addr = channels[3].madr & PSX_MAIN_RAM_WORD_MASK;
+     start_cdrom_dma_capture(a->total_words);
+ 
+     if (a->total_words == 0) {
+-        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 1);
++        finish_cdrom_dma_capture(channels[3].madr & PSX_MAIN_RAM_WORD_MASK, 1);
+         cancel_async_transfer(3);
+         complete_transfer(3);
+     }
+@@ -492,8 +493,8 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
+         /* The DMA word loop wraps inside the 2 MB RAM mask; the capture
+          * path below takes a flat ram+offset span and must not follow the
+          * wrap past the end of host RAM. */
+-        if (size > 0x200000u - load_start)
+-            size = 0x200000u - load_start;
++        if (size > PSX_MAIN_RAM_BYTES - load_start)
++            size = PSX_MAIN_RAM_BYTES - load_start;
+         int lba = cdrom_get_setloc_lba();
+         if (lba >= 0) cd_dma_log_push(lba, load_start, size);
+ 
+@@ -523,7 +524,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
+ 
+     if ((ch == 0 && direction == 0) || (ch == 1 && direction != 0)) {
+         uint32_t words = a->total_words;
+-        uint32_t addr = channels[ch].madr & 0x1FFFFCu;
++        uint32_t addr = channels[ch].madr & PSX_MAIN_RAM_WORD_MASK;
+         finish_async_mdec_transfer(ch, addr, words);
+         return;
+     }
+@@ -543,7 +544,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
+     uint32_t words_budget = a->cycles_accum / cycles_per_word;
+     if (words_budget == 0) return;
+ 
+-    uint32_t addr = channels[ch].madr & 0x1FFFFCu;
++    uint32_t addr = channels[ch].madr & PSX_MAIN_RAM_WORD_MASK;
+     uint32_t moved = 0;
+     /* ch1 (MDEC→RAM) writes guest RAM here in a deferred step; mark it as
+      * DMA-sourced so write-provenance tags these writes with ch1 + the kick PC
+@@ -564,13 +565,13 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
+             if (!mdec_dma_write_ready()) break;
+             uint32_t n = a->remaining_words < words_budget
+                        ? a->remaining_words : words_budget;
+-            uint32_t max_by_ram = (0x200000u - addr) / 4u;
++            uint32_t max_by_ram = (PSX_MAIN_RAM_BYTES - addr) / 4u;
+             if (max_by_ram == 0) break;
+             if (n > max_by_ram) n = max_by_ram;
+             uint32_t got =
+                 mdec_dma_write_words((const uint32_t *)(ram + addr), n);
+             if (got == 0) break;
+-            addr = (addr + got * 4u) & 0x1FFFFCu;
++            addr = (addr + got * 4u) & PSX_MAIN_RAM_WORD_MASK;
+             a->remaining_words -= got;
+             words_budget -= got;
+             moved += got;
+@@ -586,7 +587,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
+                 psx_write_word(addr, mdec_dma_read_word());
+             }
+ 
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+             a->remaining_words--;
+             words_budget--;
+             moved++;
+@@ -609,26 +610,26 @@ static void execute_ch0_mdec_in(void) {
+     uint32_t direction = chcr & 1;           /* 1=from RAM to MDEC */
+     uint32_t step = (chcr >> 1) & 1;
+     uint32_t total_words = transfer_word_count(0);
+-    uint32_t addr = channels[0].madr & 0x1FFFFCu;
++    uint32_t addr = channels[0].madr & PSX_MAIN_RAM_WORD_MASK;
+     int32_t addr_step = step ? -4 : 4;
+ 
+     if (direction != 0) {
+         mdec_debug_dma_in_start(addr, total_words);
+         if (addr_step == 4 && total_words > 0 &&
+-            addr + total_words * 4u <= 0x200000u) {
++            addr + total_words * 4u <= PSX_MAIN_RAM_BYTES) {
+             extern uint8_t *memory_get_ram_ptr(void);
+             uint32_t got = mdec_dma_write_words(
+                 (const uint32_t *)(memory_get_ram_ptr() + addr), total_words);
+-            addr = (addr + got * 4u) & 0x1FFFFCu;
++            addr = (addr + got * 4u) & PSX_MAIN_RAM_WORD_MASK;
+             /* If the FIFO stalled mid-burst, finish any remainder word-wise. */
+             for (uint32_t i = got; i < total_words; i++) {
+                 mdec_dma_write_word(psx_read_word(addr));
+-                addr = (addr + 4u) & 0x1FFFFCu;
++                addr = (addr + 4u) & PSX_MAIN_RAM_WORD_MASK;
+             }
+         } else {
+             for (uint32_t i = 0; i < total_words; i++) {
+                 mdec_dma_write_word(psx_read_word(addr));
+-                addr = (addr + addr_step) & 0x1FFFFCu;
++                addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+             }
+         }
+         mdec_debug_dma_in_end(addr, total_words);
+@@ -643,14 +644,14 @@ static void execute_ch1_mdec_out(void) {
+     uint32_t direction = chcr & 1;           /* 0=from MDEC to RAM */
+     uint32_t step = (chcr >> 1) & 1;
+     uint32_t total_words = transfer_word_count(1);
+-    uint32_t addr = channels[1].madr & 0x1FFFFCu;
++    uint32_t addr = channels[1].madr & PSX_MAIN_RAM_WORD_MASK;
+     int32_t addr_step = step ? -4 : 4;
+ 
+     if (direction == 0) {
+         mdec_debug_dma_out_start(addr, total_words);
+         for (uint32_t i = 0; i < total_words; i++) {
+             psx_write_word(addr, mdec_dma_read_word());
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+         mdec_debug_dma_out_end(addr, total_words);
+         channels[1].madr = addr;
+@@ -756,12 +757,12 @@ static uint32_t execute_ch2_gpu(void) {
+             uint32_t block_size = channels[2].bcr & 0xFFFF;
+             uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
+             uint32_t total_words = block_size * block_count;
+-            uint32_t addr = channels[2].madr & 0x1FFFFCu;
++            uint32_t addr = channels[2].madr & PSX_MAIN_RAM_WORD_MASK;
+             int32_t  addr_step = step ? -4 : 4;
+             for (uint32_t i = 0; i < total_words; i++) {
+                 uint32_t pixel_data = gpu_read_gpuread();
+                 psx_write_word(addr, pixel_data);
+-                addr = (addr + addr_step) & 0x1FFFFCu;
++                addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+             }
+             channels[2].madr = addr;
+             actual_words = total_words;
+@@ -775,14 +776,14 @@ static uint32_t execute_ch2_gpu(void) {
+         uint32_t block_size = channels[2].bcr & 0xFFFF;
+         uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
+         uint32_t total_words = block_size * block_count;
+-        uint32_t addr = channels[2].madr & 0x1FFFFCu; /* mask to RAM, word-aligned */
++        uint32_t addr = channels[2].madr & PSX_MAIN_RAM_WORD_MASK; /* mask to RAM, word-aligned */
+         int32_t  addr_step = step ? -4 : 4;
+ 
+         for (uint32_t i = 0; i < total_words; i++) {
+             uint32_t word = psx_read_word(addr);
+             gpu_set_gp0_source(addr);
+             gpu_write_gp0(word);
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+         channels[2].madr = addr;
+         actual_words = total_words;
+@@ -794,14 +795,14 @@ static uint32_t execute_ch2_gpu(void) {
+         /* Burst mode (sync_mode == 0) */
+         uint32_t word_count = channels[2].bcr & 0xFFFF;
+         if (word_count == 0) word_count = 0x10000; /* 0 means 0x10000 */
+-        uint32_t addr = channels[2].madr & 0x1FFFFCu;
++        uint32_t addr = channels[2].madr & PSX_MAIN_RAM_WORD_MASK;
+         int32_t  addr_step = step ? -4 : 4;
+ 
+         for (uint32_t i = 0; i < word_count; i++) {
+             uint32_t word = psx_read_word(addr);
+             gpu_set_gp0_source(addr);
+             gpu_write_gp0(word);
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+         channels[2].madr = addr;
+         actual_words = word_count;
+@@ -831,18 +832,18 @@ static uint32_t execute_ch4_spu(void) {
+     uint32_t direction = chcr & 1;           /* 1=from RAM to SPU, 0=SPU to RAM */
+     uint32_t step = (chcr >> 1) & 1;
+     uint32_t total_words = transfer_word_count(4);
+-    uint32_t addr = channels[4].madr & 0x1FFFFCu;
++    uint32_t addr = channels[4].madr & PSX_MAIN_RAM_WORD_MASK;
+     int32_t addr_step = step ? -4 : 4;
+ 
+     if (direction != 0) {
+         for (uint32_t i = 0; i < total_words; i++) {
+             spu_dma_write(psx_read_word(addr));
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+         /* One aggregated event per SPU-bound transfer (per-word would flood
+          * the ring: a full sound-bank upload is ~128k words). */
+         audio_trace_event(AUDIO_EV_DMA_WRITE, total_words,
+-                          channels[4].madr & 0x1FFFFCu);
++                          channels[4].madr & PSX_MAIN_RAM_WORD_MASK);
+     } else {
+         /* SPU RAM -> CPU RAM. This direction previously zero-filled the
+          * destination, which is not a transfer at all: SPU RAM is readable
+@@ -853,10 +854,10 @@ static uint32_t execute_ch4_spu(void) {
+          * fell back to a cold-boot path. */
+         for (uint32_t i = 0; i < total_words; i++) {
+             psx_write_word(addr, spu_dma_read());
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+         audio_trace_event(AUDIO_EV_DMA_READ, total_words,
+-                          channels[4].madr & 0x1FFFFCu);
++                          channels[4].madr & PSX_MAIN_RAM_WORD_MASK);
+     }
+ 
+     channels[4].madr = addr;
+@@ -870,7 +871,7 @@ static void execute_ch6_otc(void) {
+      * BCR bits 0-15 = number of entries. */
+     uint32_t num_entries = channels[6].bcr & 0xFFFF;
+     if (num_entries == 0) num_entries = 0x10000;
+-    uint32_t addr = channels[6].madr & 0x1FFFFCu;
++    uint32_t addr = channels[6].madr & PSX_MAIN_RAM_WORD_MASK;
+ 
+     for (uint32_t i = 0; i < num_entries; i++) {
+         uint32_t val;
+@@ -882,7 +883,7 @@ static void execute_ch6_otc(void) {
+             val = (addr - 4) & 0x00FFFFFFu;
+         }
+         psx_write_word(addr, val);
+-        addr = (addr - 4) & 0x1FFFFCu;
++        addr = (addr - 4) & PSX_MAIN_RAM_WORD_MASK;
+     }
+ 
+     complete_transfer(6);
+@@ -898,20 +899,20 @@ static void execute_ch5_pio(void) {
+     uint32_t direction = chcr & 1u;
+     uint32_t step = (chcr >> 1) & 1u;
+     uint32_t total_words = transfer_word_count(5);
+-    uint32_t addr = channels[5].madr & 0x1FFFFCu;
++    uint32_t addr = channels[5].madr & PSX_MAIN_RAM_WORD_MASK;
+     int32_t addr_step = step ? -4 : 4;
+ 
+     if (direction == 1) {
+         /* from RAM to device: just read and discard */
+         for (uint32_t i = 0; i < total_words; i++) {
+             (void)psx_read_word(addr);
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+     } else {
+         /* to RAM from device: write zeros (device not emulated) */
+         for (uint32_t i = 0; i < total_words; i++) {
+             psx_write_word(addr, 0);
+-            addr = (addr + addr_step) & 0x1FFFFCu;
++            addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+         }
+     }
+     channels[5].madr = addr;
+@@ -1132,7 +1133,7 @@ void dma_advance(uint32_t cycles) {
+             }
+ 
+             uint32_t words_budget = a->cycles_accum / DMA_CDROM_CYCLES_PER_WORD;
+-            uint32_t addr = channels[3].madr & 0x1FFFFCu;
++            uint32_t addr = channels[3].madr & PSX_MAIN_RAM_WORD_MASK;
+             uint32_t moved = 0;
+             g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
+             g_dma_initiator_pc = s_dma_ch_initiator_pc[3];  /* deferred: restore kick PC */
+@@ -1143,7 +1144,7 @@ void dma_advance(uint32_t cycles) {
+             if (a->remaining_words == a->total_words && words_budget > 0 &&
+                 addr < 0x1C0000u) {
+                 uint32_t bytes = a->total_words * 4u;
+-                if (bytes > 0x200000u - addr) bytes = 0x200000u - addr;
++                if (bytes > PSX_MAIN_RAM_BYTES - addr) bytes = PSX_MAIN_RAM_BYTES - addr;
+                 overlay_capture_before_dma(addr, bytes);
+             }
+             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
+@@ -1152,7 +1153,7 @@ void dma_advance(uint32_t cycles) {
+                 psx_write_word(addr, word);
+                 record_cdrom_dma_word(word);
+                 dirty_ram_mark_executable_range(addr, 4);
+-                addr = (addr + addr_step) & 0x1FFFFCu;
++                addr = (addr + addr_step) & PSX_MAIN_RAM_WORD_MASK;
+                 a->remaining_words--;
+                 words_budget--;
+                 moved++;
+diff --git a/runtime/src/freeze_heartbeat.c b/runtime/src/freeze_heartbeat.c
+index 52c8e86b..8dcdea03 100644
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -1,5 +1,6 @@
+ /* freeze_heartbeat.c — see header for rationale. */
+ 
++#include "psx_memory.h"
+ #include "freeze_heartbeat.h"
+ #include "freeze_dump_policy.h"
+ #include "debug_server.h"
+@@ -344,10 +345,10 @@ static int hb_append_ram_peek(char *out, int n, size_t cap, uint32_t vaddr, int
+                 ncopy = (int)(0x400u - off);
+         }
+     } else if (phys < 0x00800000u && g_psx_ram) {
+-        uint32_t folded = phys & 0x1FFFFFu;
++        uint32_t folded = phys & PSX_MAIN_RAM_MASK;
+         src = g_psx_ram + folded;
+-        if (folded + (uint32_t)ncopy > 0x200000u)
+-            ncopy = (int)(0x200000u - folded);
++        if (folded + (uint32_t)ncopy > PSX_MAIN_RAM_BYTES)
++            ncopy = (int)(PSX_MAIN_RAM_BYTES - folded);
+     }
+     if (!src) ncopy = 0;
+     int m = snprintf(out + n, cap - (size_t)n,
+@@ -373,7 +374,7 @@ static uint32_t hb_jal_target_from_ra(uint32_t ra) {
+         uint8_t *sp = memory_get_scratchpad_ptr();
+         if (sp) src = sp + (phys - 0x1F800000u);
+     } else if (phys < 0x00800000u && g_psx_ram) {
+-        src = g_psx_ram + (phys & 0x1FFFFFu);
++        src = g_psx_ram + (phys & PSX_MAIN_RAM_MASK);
+     }
+     if (!src) return 0;
+     memcpy(&insn, src, 4);
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index aaf69df7..654dcbac 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -10,6 +10,7 @@
+  * Reference: nocash PSX specs, DuckStation src/core/gpu.cpp
+  */
+ 
++#include "psx_memory.h"
+ #include "gpu.h"
+ #include "display_scanout.h"
+ #include "pgxp.h"
+@@ -1795,7 +1796,7 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
+  * start (the first character of a frame would be suppressed forever). */
+ void psx_ws_sprite_tag(CPUState* cpu) {
+     if (!ws_engaged() || !ws_anchor_addr) return;
+-    uint32_t key = cpu->gpr[4] & 0x1FFFFCu;
++    uint32_t key = cpu->gpr[4] & PSX_MAIN_RAM_WORD_MASK;
+     if (!key) return;
+     uint32_t sxy = cpu->read_word(ws_anchor_addr);
+     int32_t  ax  = (int32_t)(int16_t)(sxy & 0xFFFFu);
+@@ -1821,7 +1822,7 @@ static int ws_tagged_anchor(int32_t *out_ax) {
+     if (!ws_active() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+     uint32_t now = (uint32_t)s_frame_count;
+     for (int variant = 0; variant < 2; variant++) {
+-        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFCu;
++        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & PSX_MAIN_RAM_WORD_MASK;
+         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
+         for (int i = 0; i < WS_TAG_PROBES; i++) {
+             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
+@@ -1958,7 +1959,7 @@ int psx_ws_prim_is_tagged(void) {
+     if (!ws_engaged() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+     uint32_t now = (uint32_t)s_frame_count;
+     for (int variant = 0; variant < 2; variant++) {
+-        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFCu;
++        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & PSX_MAIN_RAM_WORD_MASK;
+         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
+         for (int i = 0; i < WS_TAG_PROBES; i++) {
+             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
+@@ -2046,7 +2047,7 @@ static int ws_auto_ui_anchor(int32_t *out_anchor) {
+     if (!ws_auto_ui_squash || !ws_active() ||
+         gp0_cmd_source_addr == 0xFFFFFFFFu)
+         return 0;
+-    uint32_t src = gp0_cmd_source_addr & 0x1FFFFCu;
++    uint32_t src = gp0_cmd_source_addr & PSX_MAIN_RAM_WORD_MASK;
+     for (uint32_t i = 0; i < ws_ui_prepass_count; i++) {
+         if (ws_ui_prepass[i].src_addr != src) continue;
+         if (out_anchor) *out_anchor = ws_ui_prepass[i].group.anchor;
+@@ -3397,7 +3398,7 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
+     int indices[3] = { i0, i1, i2 };
+     uint16_t z[3];
+     for (int i = 0; i < 3; i++) {
+-        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
++        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & PSX_MAIN_RAM_WORD_MASK;
+         if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
+             z[i] == 0) {
+             s_texcorr.no_depth++;
+@@ -4451,8 +4452,8 @@ static void gp0_exec_cpu_to_vram(void) {
+             a0_history[slot].s2_val = debug_cpu_ptr->gpr[18]; /* $s2 = source ptr */
+             a0_history[slot].a0_val = debug_cpu_ptr->gpr[4];  /* $a0 */
+             a0_history[slot].a1_val = debug_cpu_ptr->gpr[5];  /* $a1 */
+-            uint32_t sp_phys = sp & 0x1FFFFFu;
+-            for (int si = 0; si < 10 && sp_phys + (si + 1) * 4 <= 0x200000u; si++)
++            uint32_t sp_phys = sp & PSX_MAIN_RAM_MASK;
++            for (int si = 0; si < 10 && sp_phys + (si + 1) * 4 <= PSX_MAIN_RAM_BYTES; si++)
+                 a0_history[slot].stack[si] = psx_read_word(sp + si * 4);
+         }
+         a0_capture_slot = slot;
+@@ -4695,7 +4696,7 @@ static void ws_ui_prepass_add(const uint32_t *words, uint32_t source_addr,
+     item->group.height = height;
+     item->group.anchor = 0;
+     item->group.root = ws_ui_prepass_count - 1u;
+-    item->src_addr = source_addr & 0x1FFFFCu;
++    item->src_addr = source_addr & PSX_MAIN_RAM_WORD_MASK;
+     item->ot_rank = rank;
+     item->y  = min_y;
+     item->h  = height;
+@@ -4842,7 +4843,7 @@ static void gp0_capture_builder_chain(uint32_t out[6]) {
+     for (int i = 0; i < 6; i++) out[i] = 0;
+     uint8_t *ram = memory_get_ram_ptr();
+     if (!ram) return;
+-    const uint32_t RMASK = 0x001FFFFFu;             /* 2 MB, mirror-folded */
++    const uint32_t RMASK = PSX_MAIN_RAM_MASK;             /* 2 MB, mirror-folded */
+     uint32_t rawsp = debug_guest_sp();
+     g_gp0_last_copy_sp = rawsp;
+     if ((rawsp & 0x1FFFFFFFu) >= 0x00800000u) return; /* not in RAM/mirror */
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index 9d55ad16..d20a8f12 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -30,7 +30,14 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-#define RAM_SIZE        (2 * 1024 * 1024)
++#include "psx_memory.h"
++/* Main-RAM geometry is the compile-time contract in psx_memory.h: retail
++ * 2 MiB (mirrored 4x across the 8 MiB decode window) or the dev-console /
++ * DuckStation-style expanded 8 MiB (unique decode, no mirrors). Expanded
++ * builds trade the mirrors away — software that parks state in a mirror
++ * (e.g. Kula World's crt0 $sp in the 4th mirror) needs the retail
++ * geometry, so expanded stays an explicit per-game opt-in. */
++#define RAM_SIZE        PSX_MAIN_RAM_BYTES
+ #define SCRATCHPAD_SIZE 1024
+ #define BIOS_ROM_SIZE   (512 * 1024)
+ #define MOD_MEMORY_BASE 0x1F000000u
+@@ -1222,7 +1229,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
+     if (addr == 0x1F801810u) {
+         uint32_t src = addr;
+         if (g_debug_last_store_pc == 0xBFC38B1Cu && debug_cpu_ptr) {
+-            src = (debug_cpu_ptr->gpr[4] - 4u) & 0x1FFFFCu;
++            src = (debug_cpu_ptr->gpr[4] - 4u) & PSX_MAIN_RAM_WORD_MASK;
+         }
+         gpu_set_gp0_source(src);
+         gpu_write_gp0(val);
+diff --git a/runtime/src/netplay_state_digest.c b/runtime/src/netplay_state_digest.c
+index cde6ccce..794b0b79 100644
+--- a/runtime/src/netplay_state_digest.c
++++ b/runtime/src/netplay_state_digest.c
+@@ -1,3 +1,4 @@
++#include "psx_memory.h"
+ #include "netplay_state_digest.h"
+ #include "cdrom.h"
+ #include "crc32.h"
+@@ -55,7 +56,7 @@ static uint32_t digest_module(uint32_t (*bytes_fn)(void), void (*write_fn)(uint8
+     return crc32_compute(buf, n);
+ }
+ 
+-#define NP_RAM_SIZE (2u * 1024u * 1024u)
++#define NP_RAM_SIZE PSX_MAIN_RAM_BYTES
+ 
+ uint32_t netplay_cdrom_digest(void)
+ {
+diff --git a/runtime/src/overlay_capture.c b/runtime/src/overlay_capture.c
+index 78ae757a..34c4c3e9 100644
+--- a/runtime/src/overlay_capture.c
++++ b/runtime/src/overlay_capture.c
+@@ -1,3 +1,4 @@
++#include "psx_memory.h"
+ #include "overlay_capture.h"
+ #include "overlay_loader.h"
+ #include "dirty_ram_interp.h"
+@@ -355,11 +356,11 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
+              * boot/overlay capture-window boundary is required: those windows
+              * stabilize region keys, but they are not MIPS execution barriers.
+              * Adjacent dirty pages were already folded into this run. */
+-            const uint32_t ram_size = 2u * 1024u * 1024u;
++            const uint32_t ram_size = PSX_MAIN_RAM_BYTES;
+             if (phys <= ram_size && size <= ram_size - phys &&
+                 phys + size <= ram_size - 4u)
+                 size += 4u;
+-            uint32_t virt = 0x80000000u | (phys & 0x1FFFFFu);
++            uint32_t virt = 0x80000000u | (phys & PSX_MAIN_RAM_MASK);
+             in_run = 0;
+ 
+             /* Seeds: only per-PC interpreter hits — execution-verified. */
+@@ -789,7 +790,7 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
+                                    uint32_t scope_lo, uint32_t scope_hi,
+                                    int include_halo)
+ {
+-    const uint32_t ram_size = 2u * 1024u * 1024u;
++    const uint32_t ram_size = PSX_MAIN_RAM_BYTES;
+     memset(bitmap, 0, (size_t)bw * sizeof(uint32_t));
+     if (scope_hi > ram_size) scope_hi = ram_size;
+     if (scope_lo >= scope_hi) return;
+@@ -843,16 +844,16 @@ void overlay_capture_write_json(void)
+      * can otherwise merge them into a giant region that changes every run.
+      * Final/manual captures use the same executed-page scope as autocapture. */
+     (void)overlay_capture_write_current("shutdown-or-manual",
+-                                        0, 2u * 1024u * 1024u, 0);
++                                        0, PSX_MAIN_RAM_BYTES, 0);
+ }
+ 
+ void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
+ {
+     if (!s_enabled || !s_active || size == 0) return;
+-    uint32_t lo = load_addr & 0x1FFFFFu;
++    uint32_t lo = load_addr & PSX_MAIN_RAM_MASK;
+     uint32_t hi = lo + size;
+-    if (lo >= 2u * 1024u * 1024u) return;
+-    if (hi > 2u * 1024u * 1024u || hi < lo) hi = 2u * 1024u * 1024u;
++    if (lo >= PSX_MAIN_RAM_BYTES) return;
++    if (hi > PSX_MAIN_RAM_BYTES || hi < lo) hi = PSX_MAIN_RAM_BYTES;
+ 
+     /* Snapshot complete pages touched by this DMA. Page scope prevents sticky
+      * dirty runs from turning a small sector replacement into a multi-megabyte
+@@ -1179,7 +1180,7 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
+                                                 int scoped)
+ {
+     extern uint8_t *memory_get_ram_ptr(void);
+-    const size_t ram_size = 2u * 1024u * 1024u;
++    const size_t ram_size = PSX_MAIN_RAM_BYTES;
+     uint32_t bw = dirty_ram_get_bitmap_word_count();
+     AutocapWriteJob *job = (AutocapWriteJob *)calloc(1, sizeof(*job));
+     if (!job) return NULL;
+@@ -1217,7 +1218,7 @@ static int autocap_write_start(void)
+      * RAM. Evidence-scoping keeps the background manifest proportional to live
+      * coverage and avoids multi-megabyte rewrites every cooldown. */
+     AutocapWriteJob *job = capture_snapshot_create(
+-        0, 2u * 1024u * 1024u, 1);
++        0, PSX_MAIN_RAM_BYTES, 1);
+     if (!job) return 0;
+     if (!autocap_write_launch(job)) {
+         s_autocap_write_job = NULL;
+diff --git a/runtime/src/overlay_loader.c b/runtime/src/overlay_loader.c
+index 6a0ca686..8beec864 100644
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -1,3 +1,4 @@
++#include "psx_memory.h"
+ #include "overlay_loader.h"
+ #include "overlay_api.h"
+ #include "overlay_path_canon.h"
+@@ -116,7 +117,7 @@ static int       s_cand_n = 0;
+  * scales catastrophically once a warmed cache contains hundreds of variant
+  * DLLs. Index candidates by the 4 KiB RAM pages touched by their code ranges;
+  * a continuation then examines only candidates that could contain its PC. */
+-#define RANGE_PAGE_COUNT (2u * 1024u * 1024u / 4096u)
++#define RANGE_PAGE_COUNT (PSX_MAIN_RAM_BYTES / 4096u)
+ #define RANGE_LINK_CAP   (CAND_CAP * 8)
+ typedef struct { int cand, next; } RangeLink;
+ static int       s_range_page_head[RANGE_PAGE_COUNT];
+@@ -182,7 +183,7 @@ static uint32_t s_exact_entry_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+ 
+ static void exact_entry_set(uint32_t phys) {
+     phys &= 0x1FFFFFFFu;
+-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
++    if (phys < PSX_MAIN_RAM_BYTES && (phys & 3u) == 0u) {
+         uint32_t word = phys >> 2;
+         s_exact_entry_bitmap[word >> 5] |= 1u << (word & 31u);
+     }
+@@ -190,7 +191,7 @@ static void exact_entry_set(uint32_t phys) {
+ 
+ static int exact_entry_has(uint32_t phys) {
+     phys &= 0x1FFFFFFFu;
+-    if (phys >= 2u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
++    if (phys >= PSX_MAIN_RAM_BYTES || (phys & 3u) != 0u) return 0;
+     uint32_t word = phys >> 2;
+     return (s_exact_entry_bitmap[word >> 5] >> (word & 31u)) & 1u;
+ }
+@@ -585,8 +586,8 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
+     for (uint32_t i = 0; i < count; i++) {
+         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+         uint32_t len = lo_len_pairs[i * 2u + 1u];
+-        if (len == 0u || lo >= 2u * 1024u * 1024u ||
+-            len > 2u * 1024u * 1024u - lo) {
++        if (len == 0u || lo >= PSX_MAIN_RAM_BYTES ||
++            len > PSX_MAIN_RAM_BYTES - lo) {
+             s_static_match_crc_misses++;
+             return 0;
+         }
+@@ -662,7 +663,7 @@ typedef struct {
+     int      n;
+ } ManFn;
+ 
+-#define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
++#define OVERLAY_RAM_SIZE PSX_MAIN_RAM_BYTES
+ #define MANIFEST_LINE_MAX 128u
+ #define MANIFEST_PHYSICAL_LINE_MAX 159u
+ #define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
+@@ -895,7 +896,7 @@ static int mips_control_kind(uint32_t instr) {
+ static int ranges_contain_word(const uint32_t *lo_list,
+                                const uint32_t *len_list, int n,
+                                uint32_t phys) {
+-    if ((phys & 3u) != 0u || phys > (2u * 1024u * 1024u) - 4u) return 0;
++    if ((phys & 3u) != 0u || phys > PSX_MAIN_RAM_BYTES - 4u) return 0;
+     for (int r = 0; r < n; r++) {
+         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
+         uint32_t len = len_list[r];
+@@ -911,7 +912,7 @@ static int ranges_contain_word(const uint32_t *lo_list,
+ static int ranges_delay_slots_hashed(const uint32_t *lo_list,
+                                      const uint32_t *len_list, int n) {
+     const uint8_t *ram = memory_get_ram_ptr();
+-    const uint32_t ram_size = 2u * 1024u * 1024u;
++    const uint32_t ram_size = PSX_MAIN_RAM_BYTES;
+     if (!ram || n < 1 || n > MAX_CODE_RANGES) return 0;
+     for (int r = 0; r < n; r++) {
+         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
+@@ -3990,7 +3991,7 @@ int overlay_fp_enabled(void) {
+  * so the comparison isolates COMPUTATION (and is longjmp-safe). A divergence
+  * here = a real codegen bug (function + exact register/RAM). Zero divergence =
+  * computation is correct and the fault is timing/interrupt-ordering. */
+-#define SHADOW_RAM_SIZE  (2u * 1024u * 1024u)
++#define SHADOW_RAM_SIZE  PSX_MAIN_RAM_BYTES
+ #define SHADOW_SPAD_SIZE 1024u
+ static uint8_t  s_ram0[SHADOW_RAM_SIZE], s_ramN[SHADOW_RAM_SIZE], s_ramI[SHADOW_RAM_SIZE];
+ static uint8_t  s_spad0[SHADOW_SPAD_SIZE], s_spadI[SHADOW_SPAD_SIZE];
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 654f4ca4..d89cd9c4 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -31,6 +31,7 @@
+  * speculative native-validation bracket suppresses all recording.
+  */
+ 
++#include "psx_memory.h"
+ #include "pgxp.h"
+ #include "pgxp_hooks.h"
+ #include "cpu_state.h"
+@@ -61,7 +62,7 @@ struct PGXPValue {
+     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
+ };
+ 
+-#define PGXP_RAM_WORDS     (0x200000u >> 2)   /* 2 MB RAM                     */
++#define PGXP_RAM_WORDS     (PSX_MAIN_RAM_BYTES >> 2)   /* 2 MB RAM                     */
+ #define PGXP_SCRATCH_WORDS (0x400u >> 2)      /* 1 KB scratchpad              */
+ #define PGXP_REG_HI        32
+ #define PGXP_REG_LO        33
+@@ -154,7 +155,7 @@ extern "C" void pgxp_get_stats(PGXPStats *out) {
+ static inline PGXPValue *pgxp_ptr(uint32_t addr) {
+     uint32_t m = addr & 0x1FFFFFFFu;
+     if (m < 0x00800000u)                       /* RAM + its mirrors           */
+-        return s_ram ? &s_ram[(m & 0x1FFFFCu) >> 2] : nullptr;
++        return s_ram ? &s_ram[(m & PSX_MAIN_RAM_WORD_MASK) >> 2] : nullptr;
+     if ((m & 0xFFFFFC00u) == 0x1F800000u)      /* scratchpad                  */
+         return &s_scratch[(m & 0x3FCu) >> 2];
+     return nullptr;
+diff --git a/runtime/src/psx_netplay_rb.c b/runtime/src/psx_netplay_rb.c
+index c6b28665..75215cc8 100644
+--- a/runtime/src/psx_netplay_rb.c
++++ b/runtime/src/psx_netplay_rb.c
+@@ -1,3 +1,4 @@
++#include "psx_memory.h"
+ #include "psx_netplay_rb.h"
+ #include "cpu_state.h" /* full CPUState — stub path assigns *out = *in */
+ 
+@@ -1580,7 +1581,7 @@ static int rb_resume_pc_ok(uint32_t pc)
+         return 1; /* BIOS ROM */
+     phys = pc & 0x1fffffffu;
+     /* 2MB main RAM; skip the low scratch page (catches 0xB0 / 0x800000B0). */
+-    if (phys >= 0x1000u && phys < 0x200000u)
++    if (phys >= 0x1000u && phys < PSX_MAIN_RAM_BYTES)
+         return 1;
+     return 0;
+ }
+diff --git a/runtime/src/psx_selfcheck.c b/runtime/src/psx_selfcheck.c
+index c6203333..22d2e141 100644
+--- a/runtime/src/psx_selfcheck.c
++++ b/runtime/src/psx_selfcheck.c
+@@ -22,6 +22,7 @@
+  * collapses most of that. Live-vs-resim is reported as restore-drift.
+  */
+ 
++#include "psx_memory.h"
+ #include "psx_selfcheck.h"
+ 
+ #include <stdio.h>
+@@ -925,7 +926,7 @@ static int sc_resume_pc_ok(uint32_t pc)
+     if ((pc & 0xfff00000u) == 0xbfc00000u)
+         return 1;
+     phys = pc & 0x1fffffffu;
+-    if (phys >= 0x1000u && phys < 0x200000u)
++    if (phys >= 0x1000u && phys < PSX_MAIN_RAM_BYTES)
+         return 1;
+     return 0;
+ }
+diff --git a/runtime/src/text_xlate.cpp b/runtime/src/text_xlate.cpp
+index dbd6b5b2..1f861808 100644
+--- a/runtime/src/text_xlate.cpp
++++ b/runtime/src/text_xlate.cpp
+@@ -1,6 +1,7 @@
+ /* text_xlate.cpp — on-the-fly string translation / localization (framework).
+  * See text_xlate.h + docs/STRING_TRANSLATION.md. */
+ 
++#include "psx_memory.h"
+ #include "text_xlate.h"
+ #include "cpu_state.h"
+ 
+@@ -39,7 +40,7 @@ namespace fs = std::filesystem;
+ // Guest RAM access (little-endian, no swizzle). Main RAM is 2 MB, mirrored
+ // across [0,0x800000). Returns 0 / no-op for out-of-range.
+ // ---------------------------------------------------------------------------
+-constexpr uint32_t kRamSize = 2u * 1024u * 1024u;
++constexpr uint32_t kRamSize = PSX_MAIN_RAM_BYTES;
+ 
+ inline bool ram_fold(uint32_t va, uint32_t* pa_out) {
+     uint32_t p = va & 0x1FFFFFFFu;
+diff --git a/runtime/src/traps.c b/runtime/src/traps.c
+index d6ea4181..e527239d 100644
+--- a/runtime/src/traps.c
++++ b/runtime/src/traps.c
+@@ -4,6 +4,7 @@
+  * Phase 2 expects MMIO abort before any trap fires.
+  */
+ 
++#include "psx_memory.h"
+ #include "cpu_state.h"
+ #include "psx_bss.h"
+ #include "psx_runtime.h"   /* fix B: psx_exc_escape_reason_t + g_exc_escape_reason */
+@@ -1315,7 +1316,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
+                 int hits = 0;
+                 pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                 "\n  RAM scan for 0x%08X:\n", needles[n]);
+-                for (uint32_t off = 0; off + 4 <= 2u * 1024u * 1024u; off += 4) {
++                for (uint32_t off = 0; off + 4 <= PSX_MAIN_RAM_BYTES; off += 4) {
+                     uint32_t word;
+                     memcpy(&word, ram + off, sizeof(word));
+                     if (word != needles[n]) continue;
+diff --git a/tools/compile_overlays.py b/tools/compile_overlays.py
+index bbb9216b..9372082b 100644
+--- a/tools/compile_overlays.py
++++ b/tools/compile_overlays.py
+@@ -4102,6 +4102,10 @@ def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
+            # PGXP flavor bit (overlay_api.h PSX_OVERLAY_FLAVOR_PGXP): arm the
+            # PGXP_*() hook macros the emitter writes into every overlay C.
+            *(['-DPSX_PGXP=1'] if int(flavor) & 2 else []),
++           # RAM8 flavor bit (PSX_OVERLAY_FLAVOR_RAM8): compile the shard
++           # against the expanded 8 MiB main-RAM geometry (psx_memory.h) so
++           # the psx_cyc.h fold mask matches the host runtime's.
++           *(['-DPSX_MAIN_RAM_BYTES=0x00800000u'] if int(flavor) & 4 else []),
+            native_path(c_path), '-o', native_path(out_dll)]
+     for d in include_dirs:
+         cmd.append('-I' + native_path(_bom_free_incdir(d)))
+@@ -4153,6 +4157,10 @@ def _compile_dll_direct(c_path: str, out_dll: str, include_dirs: list[str],
+         # PGXP flavor bit (overlay_api.h PSX_OVERLAY_FLAVOR_PGXP): arm the
+         # PGXP_*() hook macros the emitter writes into every overlay C.
+         *(['-DPSX_PGXP=1'] if int(flavor) & 2 else []),
++        # RAM8 flavor bit (PSX_OVERLAY_FLAVOR_RAM8): compile the shard
++        # against the expanded 8 MiB main-RAM geometry (psx_memory.h) so
++        # the psx_cyc.h fold mask matches the host runtime's.
++        *(['-DPSX_MAIN_RAM_BYTES=0x00800000u'] if int(flavor) & 4 else []),
+         c_path,
+         '-o', out_dll,
+         *includes,

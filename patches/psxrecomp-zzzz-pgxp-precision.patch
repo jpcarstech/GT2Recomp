@@ -1,0 +1,3432 @@
+diff --git a/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml b/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml
+index 58c601e1..5ef60708 100644
+--- a/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml
++++ b/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml
+@@ -1,9 +1,9 @@
+ format_version = 5
+ id = "psx.enhancement.pgxp"
+ version = "1.0.0"
+-name = "PGXP Precision (geometry + textures)"
++name = "PGXP Precision"
+ author = "psxrecomp"
+-description = "Sub-pixel vertex precision and perspective-correct texturing (the PGXP technique): the runtime shadows the GTE's full-precision projections and follows them to the GPU, so 3D polygons stop wobbling between whole pixels and large floor/wall textures stop warping. Visual-only: the game's own math, culling and readback see exactly what real hardware produces."
++description = "Sub-pixel vertex precision and perspective-correct texturing (the PGXP technique): the runtime shadows the GTE's full-precision projections and follows them to the GPU, so 3D polygons stop wobbling between whole pixels and large floor/wall textures stop warping. Single toggle - the configuration underneath is pre-tuned and verified for this title. Visual-only: the game's own math, culling and readback see exactly what real hardware produces."
+ resolver = "declarative"
+ save_compatibility = "shared"
+ 
+@@ -15,58 +15,10 @@ game_id = "*"
+ [[feature]]
+ id = "pgxp"
+ name = "PGXP Precision"
+-description = "Disabled by default (the faithful floor). Corrections are validated per vertex against the exact packet words the game drew with and clamped to half a pixel, so 2D sprites and UI are never touched and a vertex the tracker cannot prove simply draws the faithful way. Most effective on a build compiled with the PGXP hook variant; on other builds coverage is reduced but never harmful. Needs supersampling >= 2 to be visible."
++description = "One switch, best-known configuration: sub-pixel geometry correction with perspective-correct textures, culling correction and seam completion, at unlimited tolerance - every knob pre-tuned and lab-verified for this title. Settings measured harmful here (depth buffer, vertex cache, CPU mode) are fixed off. Corrections are validated per vertex against the exact packet words the game drew with, so 2D sprites and UI are never touched. Needs supersampling >= 2 to be visible."
+ group = "Visual"
+ default_enabled = false
+ 
+-[[option]]
+-feature = "pgxp"
+-id = "geometry"
+-label = "Geometry correction"
+-description = "Sub-pixel vertex positions: 3D polygons stop wobbling between whole pixels. The core PGXP effect."
+-group = "Visual"
+-type = "boolean"
+-default = "true"
+-
+-[[option]]
+-feature = "pgxp"
+-id = "textures"
+-label = "Perspective-correct textures"
+-description = "Interpolate texture coordinates with perspective instead of the PS1's affine mapping: large floor/wall textures stop warping."
+-group = "Visual"
+-type = "boolean"
+-default = "true"
+-
+-[[option]]
+-feature = "pgxp"
+-id = "tolerance"
+-label = "Geometry tolerance"
+-description = "How large a correction is accepted, in pixels. 0.1 applies only near-exact refinements (stable everywhere - the validated default). 0.5 accepts more correction but can flicker where corrections cross the boundary. Unlimited matches DuckStation's -1 setting and gives the strongest correction, but games whose vertices the tracker cannot fully prove can open thin seams between polygons."
+-group = "Visual"
+-type = "choice"
+-default = "0.1"
+-
+-[[option.choice]]
+-value = "0.1"
+-label = "0.1 px (stable)"
+-
+-[[option.choice]]
+-value = "0.5"
+-label = "0.5 px"
+-
+-[[option.choice]]
+-value = "-1"
+-label = "Unlimited (DuckStation)"
+-
+-[[option]]
+-feature = "pgxp"
+-id = "cpu_mode"
+-label = "CPU-mode propagation"
+-description = "Also track precision through CPU arithmetic (register repacking math). Off matches the reference implementations' default; on can raise coverage in games that rebuild vertices with integer math. Always safe either way - validation rejects anything stale."
+-group = "Visual"
+-type = "boolean"
+-default = "false"
+-
+ [[plugin]]
+ feature = "pgxp"
+ id = "psx.pgxp"
+diff --git a/recompiler/src/pgxp_hook_emitter.cpp b/recompiler/src/pgxp_hook_emitter.cpp
+index c5ceb117..30c8228c 100644
+--- a/recompiler/src/pgxp_hook_emitter.cpp
++++ b/recompiler/src/pgxp_hook_emitter.cpp
+@@ -89,7 +89,15 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
+                 code, instr, reg_name(rs), reg_name(rt));
+             return;
+         case 0x20: case 0x21: case 0x22: case 0x23:  /* ADD(U)/SUB(U)         */
+-        case 0x25:                                   /* OR                    */
++        case 0x24: case 0x25: case 0x26:             /* AND / OR / XOR        */
++            /* AND/XOR have no arithmetic shadow algebra, but their VALUE-
++             * conditional identities are exact and load-bearing: compilers
++             * emit branchless min/max as `subu/sra 31/and/addu`, where the
++             * AND's mask operand is all-ones or zero AT RUNTIME - the result
++             * IS one tracked source (or exact zero). Without the hook the
++             * select chain silently drops provenance and the vertex resolves
++             * native (GT2 road-tile corners: sub-pixel seams + wobble). The
++             * runtime applies only the exact identity cases (pgxp.cpp). */
+             if (rd == 0) return;
+             code = fmt::format(
+                 "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {}\n    "
+@@ -107,7 +115,10 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
+             reg_name(rs), code, instr, reg_name(rt),
+             (uint32_t)(int32_t)offset);
+         return;
+-    case 0x0D:                                 /* ORI                         */
++    case 0x0C: case 0x0D: case 0x0E:           /* ANDI / ORI / XORI           */
++        /* ANDI 0xFFFF is the low-half extract of a packed vertex word (the
++         * lhu/sll/or repack family); XORI 0 is a move. Exact identities only -
++         * see the AND/XOR note above. */
+         if (rt == 0) return;
+         code = fmt::format(
+             "{{ uint32_t _pgx1 = {}; {}\n    PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index c262b549..741a3d9f 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -333,6 +333,19 @@ void gpu_texture_correction_set(int enabled);
+ int gpu_texture_correction_enabled(void);
+ /* Triangles drawn with perspective-correct UVs since startup. */
+ uint32_t gpu_texture_correction_hits(void);
++/* PGXP depth buffering (DuckStation PGXP Depth Buffer). Default off. */
++void gpu_pgxp_depth_set(int enabled);
++int gpu_pgxp_depth_enabled(void);
++/* DuckStation-parity PGXP controls (see gpu.c for semantics). */
++void gpu_pgxp_depth_clear_threshold_set(uint32_t sz);
++uint32_t gpu_pgxp_depth_clear_threshold(void);
++void gpu_pgxp_depth_transparent_set(int on);
++int gpu_pgxp_depth_transparent(void);
++void gpu_pgxp_disable_2d_set(int on);
++int gpu_pgxp_disable_2d(void);
++void gpu_pgxp_color_correction_set(int on);
++int gpu_pgxp_color_correction(void);
++void gpu_pgxp_depth_frame_reset(void);
+ /* GTE-activity gameplay detector ([widescreen] gte_game_mode) for 3D titles
+  * with no sprite-tag helper: gte.cpp notes every RTPS/RTPT projection; a frame
+  * that projects enough vertices is stamped as gameplay. */
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 57138e85..3900ac54 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -205,9 +205,12 @@ int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out);
+  * scene_gpu, the native-wide mirror passes; GL_TIMESTAMP pairs), [11]=mirror_gpu_ms
+  * max, [12]=mirror passes/frame avg, [13]=CPU wall in flush_tex_batch avg,
+  * [14]=CPU wall in glb_wide_* avg, [15]=batches/frame avg, [16]=wide target
+- * sets/frame avg, [17]=wide FBO creations/frame avg. GPU phases are true
+- * GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
+-int gl_renderer_perf_aggregate(int wide_filter, double out[18]);
++ * sets/frame avg, [17]=wide FBO creations/frame avg, [18]=CPU wall blocked in
++ * SDL_GL_SwapWindow avg, [19]=CPU wall in pack_flush avg, [20]=CPU wall in the
++ * ensure_cpu readback (glReadPixels sync only) avg, [21]=pack_flush+ensure_cpu
++ * invocations/frame avg. GPU phases are true GL_TIME_ELAPSED times
++ * (CPU-overhead independent). Returns the count. */
++int gl_renderer_perf_aggregate(int wide_filter, double out[22]);
+ 
+ /* Native-wide mirror ablation (perf attribution, debug cmd gl_ws_ablate):
+  * 0 = normal, 1 = skip the whole mirror pass (incl. wide_clear), 2 = full mirror
+diff --git a/runtime/include/gpu_render.h b/runtime/include/gpu_render.h
+index ace31f11..ffb00880 100644
+--- a/runtime/include/gpu_render.h
++++ b/runtime/include/gpu_render.h
+@@ -55,6 +55,15 @@ void gr_set_precise_triangle(int enabled,
+  * vertex i. enabled == 0 restores the PS1's affine UV interpolation. */
+ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
+ 
++/* PGXP depth for the next triangle: per-vertex projected SZ (0..65535), valid
++ * when `enabled`. Backends without depth support may leave the hook NULL. */
++void gr_set_depth_triangle(int enabled, float z0, float z1, float z2);
++
++/* Clear the depth buffer NOW, mid-frame, after everything queued so far has
++ * rasterized (DuckStation depth-clear threshold: the game moved to a farther
++ * drawing layer). NULL-safe like the depth hook. */
++void gr_depth_clear(void);
++
+ /* Primitives */
+ void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
+ void gr_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
+@@ -142,6 +151,8 @@ typedef struct GpuRenderBackend {
+                                  int32_t x1, int32_t y1,
+                                  int32_t x2, int32_t y2);
+     void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
++    void (*set_depth_triangle)(int enabled, float z0, float z1, float z2);
++    void (*depth_clear)(void);
+     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
+     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
+     void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,
+diff --git a/runtime/include/mod_packages.h b/runtime/include/mod_packages.h
+index 65f4510c..f133a7d3 100644
+--- a/runtime/include/mod_packages.h
++++ b/runtime/include/mod_packages.h
+@@ -46,6 +46,9 @@ struct ModFeature {
+     std::string description;
+     std::string group = "General";
+     bool default_enabled = false;
++    /* hidden = true: the feature ships as part of the port - always enabled,
++     * never listed in the launcher UI, saved enable state ignored. For fixes
++     * and infrastructure a user should not have to reason about. */
+     bool hidden = false;
+     bool legacy = false;
+ };
+diff --git a/runtime/include/pgxp.h b/runtime/include/pgxp.h
+index aa55b3aa..42c42dc6 100644
+--- a/runtime/include/pgxp.h
++++ b/runtime/include/pgxp.h
+@@ -38,6 +38,10 @@ int  pgxp_cpu_mode(void);
+  * position exceeds this many pixels. < 0 disables the clamp (default). */
+ void  pgxp_set_tolerance(float pixels);
+ float pgxp_tolerance(void);
++/* DuckStation Vertex Cache (default off): admit the screen-position-keyed
++ * fallback tier as a position source. */
++void pgxp_set_vertex_cache(int enabled);
++int  pgxp_vertex_cache(void);
+ 
+ /* Drop all shadows (savestate load, raw RAM restore, timeline breaks).
+  * O(1) via generation bump. Deferred while suppressed. */
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 922e76bc..e1a5be13 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -28,6 +28,8 @@
+ #include "pgxp.h"
+ #include "dma.h"
+ #include "gpu.h"
++extern void gte_pgxp_culling_set(int on);
++extern int gte_pgxp_culling_enabled(void);
+ #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+ #include "present_ring.h"
+ #include "load_transition_ring.h"
+@@ -5301,6 +5303,86 @@ static void handle_pgxp(int id, const char *json)
+     int cm = json_get_int(json, "cpu_mode", -1);
+     if (cm >= 0)
+         pgxp_set_cpu_mode(cm != 0);
++    /* Depth-buffer live tuning: enable/disable, and the near-band ceiling
++     * (SZ3 units) below which proven-depth triangles are Z-tested. Lets the
++     * near/far boundary be dialed in against a live scene instead of a
++     * rebuild per guess. */
++    int dep = json_get_int(json, "depth", -1);
++    if (dep >= 0)
++        gpu_pgxp_depth_set(dep != 0);
++    /* DuckStation-parity live toggles. */
++    int cull = json_get_int(json, "culling", -1);
++    if (cull >= 0)
++        gte_pgxp_culling_set(cull != 0);
++    int col = json_get_int(json, "color", -1);
++    if (col >= 0)
++        gpu_pgxp_color_correction_set(col != 0);
++    int d2d = json_get_int(json, "disable_2d", -1);
++    if (d2d >= 0)
++        gpu_pgxp_disable_2d_set(d2d != 0);
++    int tdep = json_get_int(json, "transparent_depth", -1);
++    if (tdep >= 0)
++        gpu_pgxp_depth_transparent_set(tdep != 0);
++    int dclr = json_get_int(json, "depth_clear", -1);
++    if (dclr > 0)
++        gpu_pgxp_depth_clear_threshold_set((uint32_t)dclr);
++    int vc = json_get_int(json, "vertex_cache", -1);
++    if (vc >= 0)
++        pgxp_set_vertex_cache(vc != 0);
++    {
++        extern void gte_preserve_proj_set(int on);
++        int pp = json_get_int(json, "preserve", -1);
++        if (pp >= 0)
++            gte_preserve_proj_set(pp != 0);
++    }
++    {
++        extern void gpu_pgxp_dilate_set(int on);
++        extern void gpu_pgxp_dilate_px_set(float px);
++        extern void gpu_pgxp_dilate_all_set(int on);
++        int di = json_get_int(json, "dilate", -1);
++        if (di >= 0)
++            gpu_pgxp_dilate_set(di != 0);
++        int da = json_get_int(json, "dilate_all", -1);
++        if (da >= 0)
++            gpu_pgxp_dilate_all_set(da != 0);
++        const char *dp = strstr(json, "\"dilate_px\"");
++        if (dp) {
++            dp += 11;
++            while (*dp == ' ' || *dp == ':' || *dp == '"') dp++;
++            if (*dp == '-' || (*dp >= '0' && *dp <= '9') || *dp == '.')
++                gpu_pgxp_dilate_px_set((float)strtod(dp, NULL));
++        }
++        {
++            extern int gpu_pgxp_completion_enabled_flag;
++            int co = json_get_int(json, "completion", -1);
++            if (co >= 0)
++                gpu_pgxp_completion_enabled_flag = co ? 1 : 0;
++        }
++        {
++            extern void gl_renderer_set_gf_thr(float);
++            extern void gl_renderer_set_gf_sim(float);
++            extern void gl_renderer_set_gf_rad(int);
++            {   const char *q;
++                if ((q = strstr(json, "\"gfthr\""))) {
++                    q += 7; while (*q == ' ' || *q == ':' || *q == '"') q++;
++                    gl_renderer_set_gf_thr((float)strtod(q, NULL));
++                }
++                if ((q = strstr(json, "\"gfsim\""))) {
++                    q += 7; while (*q == ' ' || *q == ':' || *q == '"') q++;
++                    gl_renderer_set_gf_sim((float)strtod(q, NULL));
++                }
++            }
++            { int gr = json_get_int(json, "gfrad", -1);
++              if (gr >= 0) gl_renderer_set_gf_rad(gr); }
++            extern void gpu_pgxp_whole_set(int on);
++            int wh = json_get_int(json, "whole", -1);
++            if (wh >= 0) gpu_pgxp_whole_set(wh);
++            extern void gl_renderer_set_gapfill(int on);
++            int gp = json_get_int(json, "gapfill", -1);
++            if (gp >= 0)
++                gl_renderer_set_gapfill(gp);
++        }
++    }
+     /* tolerance is fractional (sub-pixel), so scan it directly — json_get_int
+      * would truncate 0.5 to 0. */
+     const char *p = strstr(json, "\"tolerance\"");
+@@ -5311,9 +5393,195 @@ static void handle_pgxp(int id, const char *json)
+             pgxp_set_tolerance((float)strtod(p, NULL));
+     }
+     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"cpu_mode\":%d,"
+-             "\"tolerance\":%.3f,\"suppress\":%u,\"active\":%d}",
++             "\"tolerance\":%.3f,\"suppress\":%u,\"active\":%d,"
++             "\"depth\":%d,\"depth_clear\":%u,"
++             "\"transparent_depth\":%d,\"culling\":%d,\"color\":%d,"
++             "\"disable_2d\":%d,\"vertex_cache\":%d,\"preserve\":%d,"
++             "\"dilate\":%d,\"texture\":%d,\"gapfill\":%d,\"whole\":%d,"
++             "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d}",
+              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+-             (unsigned)pgxp_test_suppress_depth(), pgxp_test_active());
++             (unsigned)pgxp_test_suppress_depth(), pgxp_test_active(),
++             gpu_pgxp_depth_enabled(),
++             (unsigned)gpu_pgxp_depth_clear_threshold(),
++             gpu_pgxp_depth_transparent(), gte_pgxp_culling_enabled(),
++             gpu_pgxp_color_correction(), gpu_pgxp_disable_2d(),
++             pgxp_vertex_cache(),
++             ({ extern int gte_preserve_proj_enabled(void);
++                gte_preserve_proj_enabled(); }),
++             ({ extern int gpu_pgxp_dilate(void); gpu_pgxp_dilate(); }),
++             /* Perspective-correct textures, the crack-fill mode, whole-primitive
++              * completion and the EFFECTIVE internal scale were all runtime state
++              * with no way to read them back - the same blind spot that let a
++              * silently-clamped 4x scale survive four rounds of investigation.
++              * Anything that can differ from what the user configured has to be
++              * reportable. */
++             ({ extern int gpu_texture_correction_enabled(void);
++                gpu_texture_correction_enabled(); }),
++             ({ extern int gl_renderer_get_gapfill(void);
++                gl_renderer_get_gapfill(); }),
++             ({ extern int gpu_pgxp_whole_get(void); gpu_pgxp_whole_get(); }),
++             ({ extern int gr_scale(void); gr_scale(); }),
++             ({ extern int gl_renderer_gapfill_status(int *);
++                gl_renderer_gapfill_status(NULL); }),
++             ({ extern int gl_renderer_gapfill_status(int *);
++                int m = 0; (void)gl_renderer_gapfill_status(&m); m; }),
++             ({ extern float gl_renderer_get_gf_thr(void); (double)gl_renderer_get_gf_thr(); }),
++             ({ extern float gl_renderer_get_gf_sim(void); (double)gl_renderer_get_gf_sim(); }),
++             ({ extern int gl_renderer_get_gf_rad(void); gl_renderer_get_gf_rad(); }));
++}
++
++/* pgxp_tri — vertex-coverage census: triangles by number of precise corners
++ * (mixed = crack candidates), plus up to 64 sampled mixed triangles with
++ * per-vertex source address / word / tier. {"reset":1} clears the samples. */
++typedef struct {
++    uint32_t addr[3], word[3];
++    uint8_t  tier[3];
++    uint8_t  rstate[3];
++    uint32_t frame;
++} DbgMixedTriSample;
++/* Fully-native sample: the 3D-untracked population (see gpu.c). */
++typedef struct {
++    uint32_t word[3];
++    int32_t  x[3], y[3];
++    uint32_t addr;
++    uint32_t seq_delta;
++    uint32_t frame;
++    uint8_t  textured;
++    uint8_t  rstate[3];
++    uint8_t  ambig[3];
++} DbgNativeTriSample;
++extern void gpu_pgxp_tri_census(uint64_t out[4]);
++extern int gpu_pgxp_mixed_samples(const void **out);
++extern void gpu_pgxp_mixed_reset(void);
++extern void gpu_pgxp_native_census(uint64_t *n3d, uint64_t *n2d);
++extern int gpu_pgxp_native_samples(const void **out);
++extern void gpu_pgxp_native_reset(void);
++extern uint64_t gpu_pgxp_whole_count(void);
++static void handle_pgxp_tri(int id, const char *json)
++{
++    if (json_get_int(json, "reset", 0)) {
++        gpu_pgxp_mixed_reset();
++        gpu_pgxp_native_reset();
++    }
++    uint64_t c[4];
++    gpu_pgxp_tri_census(c);
++    uint64_t n3d = 0, n2d = 0;
++    gpu_pgxp_native_census(&n3d, &n2d);
++    const void *nraw = NULL;
++    int nn = gpu_pgxp_native_samples(&nraw);
++    const DbgNativeTriSample *nt = (const DbgNativeTriSample *)nraw;
++    const void *raw = NULL;
++    int n = gpu_pgxp_mixed_samples(&raw);
++    const DbgMixedTriSample *m = (const DbgMixedTriSample *)raw;
++    char buf[16384];
++    int off = snprintf(buf, sizeof buf,
++        "{\"id\":%d,\"ok\":true,\"census\":[%llu,%llu,%llu,%llu],"
++        "\"native3d\":%llu,\"native2d\":%llu,\"whole_done\":%llu,\"nat\":[",
++        id,
++        (unsigned long long)c[0], (unsigned long long)c[1],
++        (unsigned long long)c[2], (unsigned long long)c[3],
++        (unsigned long long)n3d, (unsigned long long)n2d,
++        (unsigned long long)gpu_pgxp_whole_count());
++    int ncap = nn < 16 ? nn : 16;
++    for (int i = 0; i < ncap; i++) {
++        off += snprintf(buf + off, sizeof buf - (size_t)off,
++            "%s{\"f\":%u,\"a\":\"0x%08X\",\"d\":%u,\"tx\":%u,"
++            "\"rs\":[%u,%u,%u],\"amb\":[%u,%u,%u],"
++            "\"p\":[[%d,%d],[%d,%d],[%d,%d]]}",
++            i ? "," : "", nt[i].frame, nt[i].addr, nt[i].seq_delta,
++            nt[i].textured,
++            nt[i].rstate[0], nt[i].rstate[1], nt[i].rstate[2],
++            nt[i].ambig[0], nt[i].ambig[1], nt[i].ambig[2],
++            nt[i].x[0], nt[i].y[0], nt[i].x[1], nt[i].y[1],
++            nt[i].x[2], nt[i].y[2]);
++        if (off >= (int)sizeof buf - 512) break;
++    }
++    off += snprintf(buf + off, sizeof buf - (size_t)off, "],\"mixed\":[");
++    int cap = n < 24 ? n : 24;
++    for (int i = 0; i < cap; i++) {
++        off += snprintf(buf + off, sizeof buf - (size_t)off,
++            "%s{\"f\":%u,\"v\":["
++            "{\"a\":\"0x%08X\",\"w\":\"0x%08X\",\"t\":%u,\"r\":%u},"
++            "{\"a\":\"0x%08X\",\"w\":\"0x%08X\",\"t\":%u,\"r\":%u},"
++            "{\"a\":\"0x%08X\",\"w\":\"0x%08X\",\"t\":%u,\"r\":%u}]}",
++            i ? "," : "", m[i].frame,
++            m[i].addr[0], m[i].word[0], m[i].tier[0], m[i].rstate[0],
++            m[i].addr[1], m[i].word[1], m[i].tier[1], m[i].rstate[1],
++            m[i].addr[2], m[i].word[2], m[i].tier[2], m[i].rstate[2]);
++        if (off >= (int)sizeof buf - 256) break;
++    }
++    snprintf(buf + off, sizeof buf - (size_t)off, "]}");
++    send_line(buf);
++}
++
++/* pgxp_probe — tracker state for one RAM word + writer trap.
++ * {"addr":"0x..."} probes; {"trap":"0x..."} arms the writer trap on that
++ * word; the reply always includes any trap hits so far (kind 1=sw 2=sh
++ * 4=swc2), each with the guest store PC. */
++extern int pgxp_probe(uint32_t addr, uint32_t *flags, uint32_t *value,
++                      int32_t *x16, int32_t *y16, uint32_t *z, int *live);
++extern void pgxp_trap_set(uint32_t addr);
++typedef struct { uint32_t pc, instr, value; uint8_t kind; uint32_t frame;
++                 uint32_t src_flags, src_live, src_value; } DbgTrapHit;
++extern int pgxp_trap_read(void *out, int max);
++extern int pgxp_trap_total(void);
++static void handle_pgxp_probe(int id, const char *json)
++{
++    char tstr[32];
++    if (json_get_str(json, "trap", tstr, sizeof tstr))
++        pgxp_trap_set(hex_to_u32(tstr));
++    char astr[32];
++    char probe[256] = "null";
++    if (json_get_str(json, "addr", astr, sizeof astr)) {
++        uint32_t a = hex_to_u32(astr);
++        uint32_t fl = 0, val = 0, z = 0; int32_t x16 = 0, y16 = 0; int live = 0;
++        if (pgxp_probe(a, &fl, &val, &x16, &y16, &z, &live)) {
++            uint32_t ram = psx_read_word(a);
++            snprintf(probe, sizeof probe,
++                "{\"live\":%d,\"flags\":%u,\"shadow_value\":\"0x%08X\","
++                "\"ram_value\":\"0x%08X\",\"x16\":%d,\"y16\":%d,\"z\":%u}",
++                live, fl, val, ram, x16, y16, z);
++        }
++    }
++    typedef struct { uint32_t addr, value; uint8_t live; } DbgDeadLwc2;
++    extern uint32_t pgxp_dead_lwc2(void *out, int max);
++    DbgDeadLwc2 dl[32];
++    uint32_t dret = pgxp_dead_lwc2(dl, 32);
++    int dn = (int)(dret & 0xFF);
++    char db[1600]; int doff = 0; db[0] = 0;
++    for (int i = 0; i < dn; i++) {
++        doff += snprintf(db + doff, sizeof db - (size_t)doff,
++            "%s{\"a\":\"0x%08X\",\"w\":\"0x%08X\",\"lv\":%u}",
++            i ? "," : "", dl[i].addr, dl[i].value, dl[i].live);
++        if (doff >= (int)sizeof db - 100) break;
++    }
++    DbgTrapHit hits[16];
++    int n = pgxp_trap_read(hits, 16);
++    char hb[2048]; int off = 0; hb[0] = 0;
++    for (int i = 0; i < n; i++) {
++        off += snprintf(hb + off, sizeof hb - (size_t)off,
++            "%s{\"pc\":\"0x%08X\",\"instr\":\"0x%08X\",\"val\":\"0x%08X\","
++            "\"kind\":%u,\"f\":%u,\"sf\":%u,\"sl\":%u,\"sv\":\"0x%08X\"}",
++            i ? "," : "", hits[i].pc, hits[i].instr, hits[i].value,
++            hits[i].kind, hits[i].frame,
++            hits[i].src_flags, hits[i].src_live, hits[i].src_value);
++        if (off >= (int)sizeof hb - 200) break;
++    }
++    {
++        extern uint32_t pgxp_generation(void);
++        extern uint32_t pgxp_invalidate_calls(void);
++        extern void pgxp_cop2_counts(uint32_t out[4]);
++        uint32_t cc[4];
++        pgxp_cop2_counts(cc);
++        send_fmt("{\"id\":%d,\"ok\":true,\"gen\":%u,\"invalidations\":%u,"
++                 "\"lwc2\":%u,\"swc2\":%u,\"mfc2\":%u,\"mtc2\":%u,"
++                 "\"probe\":%s,\"trap_total\":%d,\"hits\":[%s],"
++                 "\"dead_lwc2_total\":%u,\"dead_lwc2\":[%s]}",
++                 id, pgxp_generation(), pgxp_invalidate_calls(),
++                 cc[0], cc[1], cc[2], cc[3],
++                 probe, pgxp_trap_total(), hb,
++                 (unsigned)(dret >> 8), db);
++    }
+ }
+ 
+ static void handle_gpu_state(int id, const char *json)
+@@ -7773,7 +8041,7 @@ static void handle_synth_recurse(int id, const char *json)
+ static void handle_frame_perf(int id, const char *json)
+ {
+     (void)json;
+-    double all[18], wide[18], n43[18];
++    double all[22], wide[22], n43[22];
+     int na = gl_renderer_perf_aggregate(-1, all);
+     gl_renderer_perf_aggregate(1, wide);
+     gl_renderer_perf_aggregate(0, n43);
+@@ -7794,7 +8062,9 @@ static void handle_frame_perf(int id, const char *json)
+              "\"batch_diag\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
+              "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
+              "\"present_wall_ms_avg\":%.3f,\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
+-             "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f,\"prims_avg\":%.0f},"
++             "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f,\"prims_avg\":%.0f,"
++             "\"swap_ms_avg\":%.3f,\"pack_ms_avg\":%.3f,\"ensure_ms_avg\":%.3f,"
++             "\"sync_calls_avg\":%.1f},"
+              "\"wide_16_9\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
+              "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
+              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
+@@ -7805,18 +8075,22 @@ static void handle_frame_perf(int id, const char *json)
+              "\"a4_3\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
+              "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
+              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
+-             "\"cpu_flush_ms_avg\":%.3f,\"batches_avg\":%.1f}}",
++             "\"cpu_flush_ms_avg\":%.3f,\"batches_avg\":%.1f,"
++             "\"swap_ms_avg\":%.3f,\"pack_ms_avg\":%.3f,\"ensure_ms_avg\":%.3f,"
++             "\"sync_calls_avg\":%.1f}}",
+              id, na, (int)wide[0], (int)n43[0], tex_frac, gl_renderer_get_ws_ablate(),
+              (unsigned long long)br[0], (unsigned long long)br[1],
+              (unsigned long long)br[2], (unsigned long long)br[3],
+              (unsigned long long)br[4], (unsigned long long)br[5],
+              (unsigned long long)br[6], (unsigned long long)br[7],
+              all[1], all[2], all[3], all[4], all[5], all[6], all[7], all[8], all[9],
++             all[18], all[19], all[20], all[21],
+              (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[7], wide[9], wpp,
+              wide[10], wide[11], wcanon, wide[12], wmpp,
+              wide[13], wide[14], wide[15], wide[16], wide[17],
+              (int)n43[0], n43[1], n43[3], n43[5], n43[6], n43[7], n43[9], npp,
+-             n43[13], n43[15]);
++             n43[13], n43[15],
++             n43[18], n43[19], n43[20], n43[21]);
+ }
+ 
+ /* gl_ws_ablate mode=<0..3>: native-wide mirror ablation for perf attribution.
+@@ -13680,6 +13954,8 @@ static const CmdEntry s_commands[] = {
+     { "gpu_state",         handle_gpu_state },
+     { "geom_correction",   handle_geom_correction },
+     { "pgxp",              handle_pgxp },
++    { "pgxp_tri",          handle_pgxp_tri },
++    { "pgxp_probe",        handle_pgxp_probe },
+     { "ws_aspect_cone_site", handle_ws_aspect_cone_site },
+     { "ws_margin",         handle_ws_margin },
+     { "ws_hud_mode",       handle_ws_hud_mode },
+@@ -14644,6 +14920,8 @@ void debug_server_wait_if_paused(void)
+      * old `while (s_paused)` loop would have been a no-op anyway. */
+ }
+ 
++uint64_t debug_server_frame_count(void) { return s_frame_count; }
++
+ void debug_server_check_watchpoints(void)
+ {
+     if (s_fmv_quiet) return;
+diff --git a/runtime/src/dirty_ram_interp.c b/runtime/src/dirty_ram_interp.c
+index 1bedaa68..71e26b8e 100644
+--- a/runtime/src/dirty_ram_interp.c
++++ b/runtime/src/dirty_ram_interp.c
+@@ -1832,10 +1832,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+             cpu->gpr[0] = 0;
+             return 0;
+         }
+-        case 0x24: /* AND */
+-            cpu->gpr[rd] = cpu->gpr[rs] & cpu->gpr[rt];
++        case 0x24: { /* AND - PGXP: exact value-conditional identities only */
++            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
++            cpu->gpr[rd] = a & b;
++            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
+             cpu->gpr[0] = 0;
+             return 0;
++        }
+         case 0x25: { /* OR */
+             uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
+             cpu->gpr[rd] = a | b;
+@@ -1843,10 +1846,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+             cpu->gpr[0] = 0;
+             return 0;
+         }
+-        case 0x26: /* XOR */
+-            cpu->gpr[rd] = cpu->gpr[rs] ^ cpu->gpr[rt];
++        case 0x26: { /* XOR - PGXP: move idiom (zero operand) only */
++            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
++            cpu->gpr[rd] = a ^ b;
++            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
+             cpu->gpr[0] = 0;
+             return 0;
++        }
+         case 0x27: /* NOR */
+             cpu->gpr[rd] = ~(cpu->gpr[rs] | cpu->gpr[rt]);
+             cpu->gpr[0] = 0;
+@@ -2074,10 +2080,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+         cpu->gpr[0] = 0;
+         return 0;
+     }
+-    case 0x0C: /* ANDI */
+-        cpu->gpr[rt] = cpu->gpr[rs] & imm;
++    case 0x0C: { /* ANDI - PGXP: low-half extract / exact-zero identities */
++        uint32_t a = cpu->gpr[rs];
++        cpu->gpr[rt] = a & imm;
++        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, imm);
+         cpu->gpr[0] = 0;
+         return 0;
++    }
+     case 0x0D: { /* ORI */
+         uint32_t a = cpu->gpr[rs];
+         cpu->gpr[rt] = a | imm;
+@@ -2085,10 +2094,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+         cpu->gpr[0] = 0;
+         return 0;
+     }
+-    case 0x0E: /* XORI */
+-        cpu->gpr[rt] = cpu->gpr[rs] ^ imm;
++    case 0x0E: { /* XORI - PGXP: move idiom (imm 0) only */
++        uint32_t a = cpu->gpr[rs];
++        cpu->gpr[rt] = a ^ imm;
++        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, imm);
+         cpu->gpr[0] = 0;
+         return 0;
++    }
+     case 0x0F: /* LUI rt, imm */
+         if (psx_ws_is_signed_x_bound_site(pc, insn))
+             cpu->gpr[rt] = (uint32_t)psx_ws_player_x_bound((int32_t)(imm << 16));
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 04c6ca58..88e85d2f 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -14,6 +14,7 @@
+ #include "gpu.h"
+ #include "display_scanout.h"
+ #include "pgxp.h"
++#include <math.h>   /* sqrtf: sub-pixel polygon dilation */
+ #include "mod_memory.h"
+ #include "gpu_primitive_reject.h"
+ #include "gpu_sw_renderer.h"
+@@ -3350,10 +3351,188 @@ int gpu_texture_correction_enabled(void) {
+     return s_texture_correction_enabled;
+ }
+ 
++/* PGXP depth buffering (DuckStation "PGXP Depth Buffer" parity): when armed,
++ * triangles whose three vertices carry validated projected depths (SZ3 from
++ * the dataflow shadows) hand them to the render backend, which depth-tests
++ * opaque world geometry instead of relying purely on painter's order -
++ * eliminating overlap flicker between interpenetrating polygons. Vertices
++ * without proven depth (2D/UI, unproven provenance) draw exactly as before.
++ * Requires geometry correction (the lookups run on its path). */
++static int s_pgxp_depth_enabled = 0;
++void gpu_pgxp_depth_set(int enabled) { s_pgxp_depth_enabled = enabled ? 1 : 0; }
++int  gpu_pgxp_depth_enabled(void)    { return s_pgxp_depth_enabled; }
++
++/* DuckStation-parity depth-clear threshold (gpu_pgxp_depth_clear_threshold,
++ * default 4096/65535): when a depth-tested polygon's average SZ jumps at
++ * least this far BEYOND the previous one's, the game has moved to a farther
++ * drawing layer (sky, background scenery painted near-first) - the depth
++ * buffer is cleared mid-frame so the new layer composites by draw order
++ * instead of losing the Z-test to the previous layer. This, not a distance
++ * band, is how DuckStation keeps layered scenery intact under its depth
++ * buffer. */
++static uint32_t s_pgxp_depth_clear_threshold = 4096;
++static uint32_t s_pgxp_depth_last_avg = 0xFFFFu; /* ~ DS m_last_depth_z=1.0 */
++void gpu_pgxp_depth_clear_threshold_set(uint32_t sz) {
++    s_pgxp_depth_clear_threshold = sz ? sz : 1;
++}
++uint32_t gpu_pgxp_depth_clear_threshold(void) {
++    return s_pgxp_depth_clear_threshold;
++}
++/* Depth-test semi-transparent polygons too (DS PGXPTransparentDepthTest,
++ * default off: transparents composite purely by draw order). */
++static int s_pgxp_depth_transparent = 0;
++void gpu_pgxp_depth_transparent_set(int on) { s_pgxp_depth_transparent = on ? 1 : 0; }
++int  gpu_pgxp_depth_transparent(void)       { return s_pgxp_depth_transparent; }
++/* Drop the xy correction on polygons without full projection provenance
++ * (DS PGXPDisableOn2DPolygons, default off). */
++static int s_pgxp_disable_2d = 0;
++void gpu_pgxp_disable_2d_set(int on) { s_pgxp_disable_2d = on ? 1 : 0; }
++int  gpu_pgxp_disable_2d(void)       { return s_pgxp_disable_2d; }
++/* Perspective-correct gouraud color interpolation (DS
++ * PGXPColorCorrection, default off: PS1 colors interpolate affine). */
++static int s_pgxp_color_correction = 0;
++void gpu_pgxp_color_correction_set(int on) { s_pgxp_color_correction = on ? 1 : 0; }
++int  gpu_pgxp_color_correction(void)       { return s_pgxp_color_correction; }
++/* Sub-pixel polygon dilation (crack concealment for corrected geometry).
++ * PGXP correction moves each vertex to its exact projection - but polygons
++ * that agree in INTEGER space without sharing exact vertices then disagree
++ * sub-pixel, opening backdrop-colored seams. GT2's road/scenery is the
++ * canonical case: its LOD bands meet at T-junctions, where a fine band's
++ * vertex sits ON a coarse band's edge in integer space but its exact
++ * projection does not sit on the coarse edge's exact line. No per-vertex
++ * provenance tracking can reconcile a vertex with an edge it was never
++ * derived from, so the fix lives at the renderer: expand fully-precise 3D
++ * polygons roughly half a PSX pixel outward so neighbours overlap instead
++ * of gapping (measured on a Tahiti scene: backdrop-leak pixels 919/frame
++ * -> ~0 with geometry correction off; dilation closes the same seams while
++ * keeping the correction). Overlap is bounded by the same sub-pixel scale
++ * as the correction itself and texture sampling cannot bleed: fetch_texel
++ * clamps UVs to each primitive's own bounds before the texture window.
++ * Gated to opaque polygons with full projection provenance (all three SZ
++ * validated): 2D/UI keeps exact geometry, and semi-transparent polygons
++ * would double-blend where neighbours overlap. Debug A/B via the "pgxp"
++ * command's dilate field; no launcher knob (part of the port's renderer). */
++/* Mixed-corner completion A/B toggle (debug server "pgxp" completion field).
++ * DuckStation renders mixed polygons with native integer corners untouched;
++ * completion is this port's extension and a candidate seam SOURCE (an
++ * ambiguity-tolerant table lookup can assign a corner a fraction its
++ * neighbouring polygon's identical corner does not get). */
++int gpu_pgxp_completion_enabled_flag = 1;
++
++/* DEFAULT OFF - superseded by the renderer's coverage-based crack fill
++ * (gpu_gl_renderer.c cov_pass_draw / PRESENT_FS gap_fill), which closes the
++ * same seams without touching geometry: dilation expanded fully-tracked
++ * meshes too, poking panel-edge slivers out of the car's silhouette at high
++ * internal scale (John's 4K screenshots). Kept as a debug-server A/B tool. */
++static int s_pgxp_dilate = 0;
++static float s_pgxp_dilate_px = 0.5f;   /* base, PSX pixels; debug-tunable */
++/* SZ provenance is NOT required (dilate_all=1): the census showed the seam
++ * owners are precise-XY polygons whose SZ never validated (completion-resolved
++ * corners carry no depth), and the gated variant measurably left their cracks
++ * open (322 leak px vs 12 ungated on the same scene). Fully-precise 2D such
++ * as GTE-projected sky tiles dilating into each other is harmless overlap of
++ * continuous texture - and closes the sky's own tile gaps. CPU-built UI is
++ * native (n_precise 0) and never dilates. */
++static int s_pgxp_dilate_all = 0;   /* selective (completed-corner) by default */
++void gpu_pgxp_dilate_set(int on) { s_pgxp_dilate = on ? 1 : 0; }
++int  gpu_pgxp_dilate(void)       { return s_pgxp_dilate; }
++void gpu_pgxp_dilate_px_set(float px) {
++    if (px >= 0.0f && px <= 4.0f) s_pgxp_dilate_px = px;
++}
++float gpu_pgxp_dilate_px(void)   { return s_pgxp_dilate_px; }
++void gpu_pgxp_dilate_all_set(int on) { s_pgxp_dilate_all = on ? 1 : 0; }
++int  gpu_pgxp_dilate_all(void)   { return s_pgxp_dilate_all; }
+ uint32_t gpu_texture_correction_hits(void) {
+     return sw_perspective_triangle_count();
+ }
+ 
++/* Coverage census (debug server "pgxp_tri"): triangle counts by number of
++ * precise corners, plus a bounded sample ring of MIXED triangles (the
++ * sub-pixel-crack signature) with per-vertex source address / packet word /
++ * resolution tier, so a coverage hole names the address that missed. */
++typedef struct {
++    uint32_t addr[3], word[3];
++    uint8_t  tier[3];
++    uint8_t  rstate[3];
++    uint32_t frame;
++} MixedTriSample;
++static uint64_t s_tri_census[4];         /* [n_precise 0..3] */
++static MixedTriSample s_mixed_ring[64];
++static int s_mixed_ring_n = 0;
++
++/* Fully-native (n_precise == 0) triangles split by whether the GTE projection
++ * counter advanced since the previous primitive. That single bit separates the
++ * two populations hiding in one census bucket:
++ *   - "3D-untracked": projections ran, so this IS transformed geometry whose
++ *     provenance the shadow lost. Its neighbours resolve precise, so every
++ *     shared edge is a crack. This is the population worth fixing.
++ *   - "2D": no projection since the last packet, so the coordinates were never
++ *     GTE output at all (HUD, sprites, CPU-placed backgrounds). Native is the
++ *     CORRECT answer here - "correcting" it is what makes 2D tiles gap, the
++ *     documented reason DuckStation's vertex cache ships off.
++ * Mirrors REDRIVER2/PsyCross's own 3D/2D discriminator (PGXP_GetIndex returns
++ * 0xFFFF unless a GTE transform occurred since the last addPrim). Sampling is
++ * bounded and debug-only; the counters are always cheap. */
++extern uint32_t gte_geometry_seq(void);  /* gte.cpp: projection ordinal */
++static uint64_t s_native3d_tris = 0;     /* n_precise==0, projections advanced */
++static uint64_t s_native2d_tris = 0;     /* n_precise==0, counter static       */
++static uint64_t s_whole_completed = 0;   /* whole-primitive completions        */
++/* Whole-primitive completion (see prepare_precise_triangle). Default ON; the
++ * debug server exposes it as pgxp {"whole":0|1} for deterministic A/B. */
++/* DEFAULT OFF. The 3D proof this relies on - that all three corners coincide
++ * with recorded GTE projections, which CPU-authored 2D should never do - held
++ * in the lab but NOT on the reporting machine: their census came back with
++ * native2d = 0 and whole_done = 2880, i.e. every fully-native primitive was
++ * completed, UI included, and their pause menu renders with skewed plates and
++ * seams down the edges. That is the exact failure mode that forces
++ * DuckStation's vertex cache off by default. It also never bought anything
++ * visible - the polygons it recovers are far-LOD micro-triangles - so the
++ * honest trade is off, available via pgxp {"whole":1} for anyone who wants
++ * the coverage number. */
++int gpu_pgxp_whole_completion_flag = 0;
++void gpu_pgxp_whole_set(int on) { gpu_pgxp_whole_completion_flag = on ? 1 : 0; }
++int  gpu_pgxp_whole_get(void)   { return gpu_pgxp_whole_completion_flag; }
++uint64_t gpu_pgxp_whole_count(void) { return s_whole_completed; }
++typedef struct {
++    uint32_t word[3];
++    int32_t  x[3], y[3];
++    uint32_t addr;
++    uint32_t seq_delta;                  /* corners with a recorded projection */
++    uint32_t frame;
++    uint8_t  textured;
++    uint8_t  rstate[3];                  /* why the dataflow tier declined     */
++    uint8_t  ambig[3];                   /* corner's table entry is ambiguous  */
++} NativeTriSample;
++static NativeTriSample s_native_ring[64];
++static int s_native_ring_n = 0;
++static uint32_t s_geom_seq_prev = 0;
++void gpu_pgxp_tri_census(uint64_t out[4]) {
++    for (int i = 0; i < 4; i++) out[i] = s_tri_census[i];
++}
++void gpu_pgxp_native_census(uint64_t *n3d, uint64_t *n2d) {
++    if (n3d) *n3d = s_native3d_tris;
++    if (n2d) *n2d = s_native2d_tris;
++}
++int gpu_pgxp_native_samples(const void **out) {
++    *out = s_native_ring;
++    return s_native_ring_n;
++}
++void gpu_pgxp_native_reset(void) {
++    s_native_ring_n = 0;
++    s_native3d_tris = 0;
++    s_native2d_tris = 0;
++    s_whole_completed = 0;
++    /* Clear the corner census too, so every number the pgxp_tri reply reports
++     * covers the SAME window - a cumulative census beside a windowed split
++     * cannot be turned into a share. */
++    for (int i = 0; i < 4; i++) s_tri_census[i] = 0;
++}
++int gpu_pgxp_mixed_samples(const void **out) {
++    *out = s_mixed_ring;
++    return s_mixed_ring_n;
++}
++void gpu_pgxp_mixed_reset(void) { s_mixed_ring_n = 0; }
++
+ /* Per-vertex precise positions (PGXP, ENHANCEMENTS.md G1). Each of the three
+  * packet words is resolved independently: the address-keyed dataflow shadow
+  * first (validated against the actual word — exact provenance, survives
+@@ -3366,13 +3545,18 @@ uint32_t gpu_texture_correction_hits(void) {
+ static void prepare_precise_triangle(int i0, int i1, int i2,
+                                      const int32_t vx[3], const int32_t vy[3]) {
+     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
++    gr_set_depth_triangle(0, 0.0f, 0.0f, 0.0f);
+     if (!gte_geometry_correction_enabled()) {
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
+         return;
+     }
+     const int idx[3] = { i0, i1, i2 };
+     int32_t fx[3], fy[3];
+-    int any_precise = 0;
++    uint16_t sz[3] = { 0, 0, 0 };
++    int any_precise = 0, n_precise = 0;
++    int tier[3] = { 0, 0, 0 };
++    uint8_t rst[3] = { 0, 0, 0 };
++    uint32_t vaddr[3] = { 0, 0, 0 };
+     for (int i = 0; i < 3; i++) {
+         uint32_t word = gp0_cmd_buf[idx[i]];
+         int32_t raw_x, raw_y;
+@@ -3381,19 +3565,251 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+                             ? 0xFFFFFFFFu
+                             : gp0_cmd_source_addr + (uint32_t)idx[i] * 4u;
+         int32_t px, py;
+-        uint16_t sz;
+-        if (pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
+-                                    &px, &py, &sz) != PGXP_SRC_NATIVE)
+-            any_precise = 1;
++        tier[i] = pgxp_get_precise_vertex(addr, word, raw_x, raw_y,
++                                          &px, &py, &sz[i]);
++        {
++            extern uint8_t pgxp_last_resolve_state(void);
++            rst[i] = pgxp_last_resolve_state();
++        }
++        vaddr[i] = addr;
++        if (tier[i] != PGXP_SRC_NATIVE) { any_precise = 1; n_precise++; }
+         fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
+         fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
+     }
++    /* Mixed-primitive completion: corners that resolved native inside a
++     * primitive with dataflow-tracked corners are re-resolved against the
++     * exact-packed-word projection table (see pgxp_complete_mixed_vertex).
++     * Closes the sub-pixel cracks between neighbouring polygons that share
++     * a corner the game post-processed on the CPU. */
++    extern int gpu_pgxp_completion_enabled_flag;
++    if (gpu_pgxp_completion_enabled_flag && n_precise > 0 && n_precise < 3) {
++        extern int pgxp_complete_mixed_vertex(uint32_t, int32_t, int32_t,
++                                              int32_t *, int32_t *);
++        for (int i = 0; i < 3; i++) {
++            if (tier[i] != PGXP_SRC_NATIVE) continue;
++            uint32_t word = gp0_cmd_buf[idx[i]];
++            int32_t raw_x, raw_y;
++            parse_vertex(word, &raw_x, &raw_y);
++            int32_t px, py;
++            if (pgxp_complete_mixed_vertex(word, raw_x, raw_y, &px, &py)) {
++                fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
++                fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
++                tier[i] = PGXP_SRC_FALLBACK;
++                n_precise++;
++                (void)0;
++            }
++        }
++    }
++    /* WHOLE-primitive completion — the remaining scenery cracks.
++     *
++     * Mixed completion above proves a primitive is 3D from its own tracked
++     * corners, so it cannot help a polygon where tracking lost ALL THREE. The
++     * lab census says that population is neither small nor 2D: in-race, ~4-11%
++     * of triangles resolve fully-native, ~90% of those have a GTE projection
++     * recorded at ALL THREE corner pixels, and every sampled corner's table
++     * entry is AMBIGUOUS. That is the whole failure: GT2's far-LOD scenery
++     * collapses many distinct projections onto the same integer pixels, the
++     * strict ambiguity gate refuses them, and the polygons fall back to
++     * integer positions while their neighbours stay precise — a guaranteed
++     * crack along every shared edge, which is exactly the sky-through-track
++     * and skybox-gap artifact.
++     *
++     * REDRIVER2/PsyCross never hit this because they are a DECOMPILATION: they
++     * widened the game's own primitive structs so gte_stsxy stores half-floats
++     * and sub-pixel precision rides in-band, leaving nothing to look up and no
++     * ambiguity to resolve. A static recompilation of an unmodified PS-EXE
++     * cannot widen the guest's structs, so the recoverable equivalent is their
++     * OTHER idea: treat "was this transformed by the GTE?" as a per-primitive
++     * property (their PGXP_GetIndex/addPrim stamp) rather than a per-vertex
++     * one, and let a primitive that IS 3D use the ambiguity-tolerant table.
++     *
++     * The 3D proof here is unanimity: all three corners must have a recorded
++     * projection at their exact pixel. A CPU-authored 2D element does not have
++     * three corners each coinciding with a distinct GTE projection — the lab
++     * measures those at zero recorded corners, so they stay native, and the
++     * documented vertex-cache failure (2D background tiles inheriting a 3D
++     * fraction and gapping) cannot reproduce. Completion is all-or-nothing, so
++     * it never manufactures a new mixed primitive, and every corner is still
++     * validated by pgxp_complete_mixed_vertex's integer-agreement + tolerance
++     * checks — a wrong candidate cannot move a vertex outside its own pixel.
++     * Consistency, which is what actually closes a crack, is free: the table is
++     * first-writer-wins within a generation, so two neighbours resolving the
++     * same packed word get the same sub-pixel value by construction. */
++    extern int gpu_pgxp_whole_completion_flag;
++    if (gpu_pgxp_whole_completion_flag && gpu_pgxp_completion_enabled_flag &&
++        n_precise == 0) {
++        extern int pgxp_complete_mixed_vertex(uint32_t, int32_t, int32_t,
++                                              int32_t *, int32_t *);
++        int32_t cx[3], cy[3];
++        int unanimous = 1;
++        for (int i = 0; i < 3 && unanimous; i++) {
++            uint32_t word = gp0_cmd_buf[idx[i]];
++            int32_t raw_x, raw_y;
++            parse_vertex(word, &raw_x, &raw_y);
++            if (!pgxp_complete_mixed_vertex(word, raw_x, raw_y, &cx[i], &cy[i]))
++                unanimous = 0;
++            else {
++                cx[i] = (int32_t)((int64_t)cx[i] + (int64_t)(vx[i] - raw_x) * 65536);
++                cy[i] = (int32_t)((int64_t)cy[i] + (int64_t)(vy[i] - raw_y) * 65536);
++            }
++        }
++        if (unanimous) {
++            for (int i = 0; i < 3; i++) {
++                fx[i] = cx[i];
++                fy[i] = cy[i];
++                tier[i] = PGXP_SRC_FALLBACK;
++            }
++            n_precise = 3;
++            any_precise = 1;
++            s_whole_completed++;
++        }
++    }
++    /* Coverage census: a MIXED triangle (precise and native corners in one
++     * primitive) is the crack signature - its shared edges can disagree
++     * sub-pixel with a neighbour. Count + sample for the debug server. */
++    if (gte_geometry_correction_enabled()) {
++        s_tri_census[n_precise]++;
++        if (n_precise > 0 && n_precise < 3 &&
++            s_mixed_ring_n < (int)(sizeof s_mixed_ring / sizeof s_mixed_ring[0])) {
++            MixedTriSample *m = &s_mixed_ring[s_mixed_ring_n++];
++            for (int i = 0; i < 3; i++) {
++                m->addr[i] = vaddr[i];
++                m->word[i] = gp0_cmd_buf[idx[i]];
++                m->tier[i] = (uint8_t)tier[i];
++                m->rstate[i] = rst[i];
++            }
++            m->frame = (uint32_t)s_frame_count;
++        }
++        /* Fully-native split (see s_native3d_tris). The discriminator is NOT the
++         * projection counter's motion - GT2 batch-projects a mesh before
++         * emitting its packets, so the counter is static during emission and
++         * would call real 3D geometry "2D". The decisive test is whether a
++         * projection was ever RECORDED at this corner's exact screen pixel this
++         * timeline: if the GTE put a vertex here, the primitive is transformed
++         * geometry whose provenance the shadow lost (a coverage hole worth
++         * closing); if nothing was ever projected there, the coordinates are
++         * CPU-authored and native is the correct answer. */
++        if (n_precise == 0) {
++            extern int gte_geometry_correction_lookup_any(uint32_t, int32_t *, int32_t *);
++            extern int gte_geometry_correction_lookup(uint32_t, int32_t *, int32_t *);
++            int proj_corners = 0;
++            uint8_t amb[3] = { 0, 0, 0 };
++            for (int i = 0; i < 3; i++) {
++                int32_t qx, qy;
++                if (gte_geometry_correction_lookup_any(gp0_cmd_buf[idx[i]], &qx, &qy)) {
++                    proj_corners++;
++                    /* Strict lookup applies the ambiguity gate; a recorded-but-
++                     * refused corner means several projections shared the pixel. */
++                    amb[i] = gte_geometry_correction_lookup(gp0_cmd_buf[idx[i]], &qx, &qy)
++                                 ? 0 : 1;
++                }
++            }
++            if (proj_corners) s_native3d_tris++; else s_native2d_tris++;
++            if (proj_corners &&
++                s_native_ring_n < (int)(sizeof s_native_ring / sizeof s_native_ring[0])) {
++                NativeTriSample *n = &s_native_ring[s_native_ring_n++];
++                for (int i = 0; i < 3; i++) {
++                    n->word[i] = gp0_cmd_buf[idx[i]];
++                    n->x[i] = vx[i];
++                    n->y[i] = vy[i];
++                    n->rstate[i] = rst[i];
++                    n->ambig[i] = amb[i];
++                }
++                n->addr = gp0_cmd_source_addr;
++                n->seq_delta = (uint32_t)proj_corners;   /* corners with a projection */
++                n->frame = (uint32_t)s_frame_count;
++                n->textured = (uint8_t)((gp0_cmd_buf[0] >> 24) & 0x04u ? 1 : 0);
++            }
++        }
++        s_geom_seq_prev = gte_geometry_seq();
++    }
++    /* DS PGXPDisableOn2DPolygons: a polygon without full projection
++     * provenance (any vertex missing its validated SZ) keeps its native
++     * positions entirely when the option is on. */
++    if (s_pgxp_disable_2d && (!sz[0] || !sz[1] || !sz[2]))
++        any_precise = 0;
+     if (!any_precise) {
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
+         return;
+     }
++    /* Sub-pixel dilation - see s_pgxp_dilate above. Each vertex moves away
++     * from the midpoint of its opposite edge (outward regardless of winding,
++     * and better behaved than the centroid on thin slivers). 16.16 units. */
++    {
++        uint32_t cmd0 = gp0_cmd_buf[0] >> 24;
++        /* Selective dilation: only polygons carrying a COMPLETED corner (a
++         * native corner re-resolved through the projection table) expand.
++         * Those are precisely the crack participants - the corner's fraction
++         * was reconstructed rather than tracked, so the neighbouring polygon
++         * that references the same point through different provenance can
++         * disagree with it. Fully-dataflow-tracked meshes (the car: every
++         * corner exact, shared vertices identical) never dilate, so their
++         * silhouettes stay pixel-exact. dilate_all=1 restores whole-scene
++         * expansion for A/B. */
++        int has_completed = (tier[0] == PGXP_SRC_FALLBACK ||
++                             tier[1] == PGXP_SRC_FALLBACK ||
++                             tier[2] == PGXP_SRC_FALLBACK);
++        if (s_pgxp_dilate && n_precise == 3 && !(cmd0 & 0x02u) &&
++            (s_pgxp_dilate_all || has_completed)) {
++            const float X[3] = { (float)fx[0], (float)fx[1], (float)fx[2] };
++            const float Y[3] = { (float)fy[0], (float)fy[1], (float)fy[2] };
++            /* Adaptive amount: a crack's width is bounded by how far the
++             * correction moved the disagreeing vertices, so expand by this
++             * primitive's own worst deviation from its integer positions
++             * (assume the unseen neighbour moved comparably) plus a base
++             * half-pixel for the neighbour's rounding. Near geometry with
++             * sub-half-pixel corrections stays near the base; distant
++             * geometry, where preserve-projection recovers whole truncated
++             * pixels, gets proportionally more. Capped so a pathological
++             * shadow can never balloon a polygon. */
++            float maxdev = 0.0f;
++            for (int i = 0; i < 3; i++) {
++                float ddx = X[i] / 65536.0f - (float)vx[i];
++                float ddy = Y[i] / 65536.0f - (float)vy[i];
++                if (ddx < 0) ddx = -ddx;
++                if (ddy < 0) ddy = -ddy;
++                if (ddx > maxdev) maxdev = ddx;
++                if (ddy > maxdev) maxdev = ddy;
++            }
++            float epx = s_pgxp_dilate_px + maxdev;
++            if (epx > 3.0f) epx = 3.0f;
++            const float E = epx * 65536.0f;
++            for (int i = 0; i < 3; i++) {
++                int j = (i + 1) % 3, k = (i + 2) % 3;
++                float dx = X[i] - 0.5f * (X[j] + X[k]);
++                float dy = Y[i] - 0.5f * (Y[j] + Y[k]);
++                float len = sqrtf(dx * dx + dy * dy);
++                if (len > 1.0f) {               /* degenerate guard */
++                    fx[i] = (int32_t)(X[i] + dx / len * E);
++                    fy[i] = (int32_t)(Y[i] + dy / len * E);
++                }
++            }
++        }
++    }
+     gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
+-}
++    /* Depth rides only on triangles whose three vertices carry a validated
++     * projection depth - anything else keeps pure painter's order. Two
++     * DuckStation-parity rules govern the rest: (1) is_3d - a polygon whose
++     * depths are all equal is a flat overlay and never depth-tests; (2) the
++     * depth-clear threshold - when average depth jumps at least the
++     * threshold BEYOND the previous depth-tested polygon's, the game moved
++     * to a farther drawing layer (background painted near-first), so the
++     * depth buffer clears mid-frame and the new layer composites by draw
++     * order. */
++    if (s_pgxp_depth_enabled && sz[0] && sz[1] && sz[2] &&
++        (sz[0] != sz[1] || sz[0] != sz[2])) {
++        uint32_t avg = ((uint32_t)sz[0] + sz[1] + sz[2]) / 3u;
++        if (avg > s_pgxp_depth_last_avg &&
++            avg - s_pgxp_depth_last_avg >= s_pgxp_depth_clear_threshold)
++            gr_depth_clear();
++        s_pgxp_depth_last_avg = avg;
++        gr_set_depth_triangle(1, (float)sz[0], (float)sz[1], (float)sz[2]);
++    }
++}
++
++/* Called by the render backend when it clears depth at the frame flip so the
++ * layer tracker starts the new frame conservatively (no spurious clears). */
++void gpu_pgxp_depth_frame_reset(void) { s_pgxp_depth_last_avg = 0xFFFFu; }
+ 
+ /* Arming rate for perspective-correct UVs, per condition.
+  *
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index e4996bd5..1fe18f6e 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -112,8 +112,10 @@
+ #define PSXGL_DEPTH_STENCIL_ATTACHMENT 0x821A
+ #define PSXGL_FRAMEBUFFER_COMPLETE  0x8CD5
+ #define PSXGL_RENDERBUFFER          0x8D41
++#define PSXGL_MAX_RENDERBUFFER_SIZE 0x84E8
+ #define PSXGL_DEPTH24_STENCIL8      0x88F0
+ #define PSXGL_R16UI                 0x8234
++#define PSXGL_R8                    0x8229
+ #define PSXGL_RED_INTEGER           0x8D94
+ #define PSXGL_FUNC_ADD              0x8006
+ #define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
+@@ -127,7 +129,15 @@
+ 
+ #define VRAM_W 1024
+ #define VRAM_H 512
+-#define GL_MAX_INTERNAL_SCALE 4
++/* Internal-resolution SSAA cap. This MUST be the shared limit from
++ * gpu_sw_renderer.h, not a private copy. The 16x patch raised
++ * PSX_GL_MAX_INTERNAL_SCALE to 16 and both config load paths to 1..16, but
++ * this backend kept its own `4`, so the launcher offered 6/8/12/16,
++ * settings.toml stored the choice, the loader accepted it, main.cpp passed it
++ * through — and glb_set_scale silently clamped it to 4. Every user above 4x
++ * got 4x with no error, no warning, and a settings file that disagreed with
++ * the pixels on screen. */
++#define GL_MAX_INTERNAL_SCALE PSX_GL_MAX_INTERNAL_SCALE
+ 
+ /* ---- Loaded modern-GL entry points ------------------------------------- */
+ typedef GLuint (APIENTRY *PFN_glCreateShader)(GLenum);
+@@ -319,6 +329,9 @@ static void          gl_swap_with_osd(void);
+ static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
+ static GLint         s_present_uTexSize = -1, s_present_uSharpScale = -1;
+ static GLint         s_present_uSharp = -1;
++static GLint         s_present_uCov = -1, s_present_uGapfill = -1,
++                     s_present_uCovrad = -1, s_present_uCovdiv = -1,
++                     s_present_uGfthr = -1, s_present_uGfsim = -1;
+ static GLuint        s_interp_prog = 0, s_interp_tex[3];
+ static GLint         s_interp_uPrev = -1, s_interp_uCurr = -1;
+ static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
+@@ -363,7 +376,8 @@ static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+  * PS1-faithful default, which makes the vertex shader's w exactly 1.0 and the
+  * fragment shader read the noperspective varying — i.e. bit-identical to the
+  * pre-feature pipeline. */
+-#define TEXV 20
++#define TEXV 22   /* [21] = a_cov: PGXP-precise prim flag (crack-fill coverage) */
++#define GEOV 7    /* flat/gouraud layout: x,y,r,g,b,mask-a,cov */
+ static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
+ static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
+ 
+@@ -375,11 +389,14 @@ static int     s_pc_valid = 0;                  /* sub-pixel positions present *
+ static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  */
+ static int     s_pq_valid = 0;                  /* perspective weights present */
+ static float   s_pq[3];
++static int     s_pz_valid = 0;                  /* PGXP projected depths present */
++static float   s_pz[3];                         /* normalized 0..1 (SZ/65535)   */
++extern int gpu_pgxp_depth_enabled(void);        /* gpu.c: feature armed */
+ 
+ /* TEX program uniforms. */
+ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
+ static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
+-static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
++static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1, s_uCpersp = -1;
+ static GLint s_uLimits = -1;
+ /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
+  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
+@@ -506,9 +523,17 @@ static GLuint s_wide_rb[WIDE_MAX_SURF];      /* depth-stencil RB per surface (ma
+                                               * collapsed to 12fps); with the RB
+                                               * attached the pass costs ~2us. */
+ static int    s_wide_base[WIDE_MAX_SURF];    /* base_x per surface (-1 = free) */
++/* PGXP crack-fill coverage, paired 1:1 with s_wide_tex/s_wide_fbo (same slot
++ * index, same base_x, same lifetime) - see cov_wide_pass_draw below. Without
++ * this the gap-fill coverage buffer only ever existed for the canonical 4:3
++ * hires surface, so it silently never engaged for any native-wide (16:9)
++ * session: present always reads a per-base_x WIDE texture, never s_hr_tex. */
++static GLuint s_wide_cov_tex[WIDE_MAX_SURF];
++static GLuint s_wide_cov_fbo[WIDE_MAX_SURF];
+ static int    g_wide_w        = 0;           /* wide width (native px); 0 = disabled */
+ static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
+ static GLuint g_wide_cur      = 0;           /* active mirror FBO (0 = no mirror) */
++static GLuint g_wide_cov_cur  = 0;           /* coverage FBO paired with g_wide_cur */
+ static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
+ /* Set by gpu_flat_rect for the full-screen-overlay case so the generic
+  * gpu_geometry wide mirror is skipped and the flat path emits its own
+@@ -888,6 +913,72 @@ static const char *PRESENT_FS =
+     "uniform vec2 u_tex_size;\n"
+     "uniform vec2 u_sharp_scale;\n"
+     "uniform int  u_sharp;\n"
++    "uniform sampler2D u_cov;   /* PGXP crack-fill coverage (hires-sized R8) */\n"
++    "uniform int  u_gapfill;    /* 1 = fill uncovered slivers at present     */\n"
++    "uniform int  u_covrad;     /* max fill span, hires px (~1 native px)    */\n"    "uniform int  u_covdiv;     /* coverage is hires/u_covdiv (memory cap)   */\n"    "uniform float u_gfthr;     /* how much earlier a run must have been drawn */\n"
++    "uniform float u_gfsim;     /* how alike the two flanks must be            */\n"
++    /* A crack is a thin run of pixels NO precise primitive rasterized,
++     * flanked by precise-covered pixels: fill it from the two flanking
++     * colors. Runs wider than u_covrad (real backdrop, texture-cutout
++     * regions - which stamp coverage and never enter here - and legitimate
++     * sky) are left alone. */
++    "bool covat(ivec2 t){ return texelFetch(u_cov, t / u_covdiv, 0).r > 0.5; }\n"
++    "float ordat(ivec2 t){ return texelFetch(u_cov, t / u_covdiv, 0).r; }\n"
++    /* Draw-order crack test (u_gapfill == 3). A crack is a THIN run drawn
++     * earlier than the surfaces on both sides of it - background peeking
++     * through a gap in foreground. The extra guard is that the two flanks
++     * must resemble EACH OTHER: a real crack splits one continuous surface,
++     * whereas a legitimately narrow strip of background between two different
++     * objects has unrelated flanks and must be left alone. */
++    "bool gap_fill_ord(vec2 uv){\n"
++    "  ivec2 ts = textureSize(u_tex, 0);\n"
++    "  ivec2 tc = ivec2(uv * vec2(ts));\n"
++    "  tc = clamp(tc, ivec2(u_covrad), ts - 1 - ivec2(u_covrad));\n"
++    "  float o = ordat(tc);\n"
++    "  float THR = u_gfthr;\n"
++    "  int lf = 0, rt = 0, up = 0, dn = 0;\n"
++    "  for (int d = 1; d <= u_covrad; d++) {\n"
++    "    if (lf == 0 && ordat(tc + ivec2(-d, 0)) > o + THR) lf = d;\n"
++    "    if (rt == 0 && ordat(tc + ivec2( d, 0)) > o + THR) rt = d;\n"
++    "    if (up == 0 && ordat(tc + ivec2(0, -d)) > o + THR) up = d;\n"
++    "    if (dn == 0 && ordat(tc + ivec2(0,  d)) > o + THR) dn = d;\n"
++    "  }\n"
++    "  if (lf > 0 && rt > 0 && lf + rt <= u_covrad + 1) {\n"
++    "    vec4 a = texelFetch(u_tex, tc + ivec2(-lf, 0), 0);\n"
++    "    vec4 b = texelFetch(u_tex, tc + ivec2( rt, 0), 0);\n"
++    "    if (dot(abs(a.rgb - b.rgb), vec3(1.0)) < u_gfsim) { frag = 0.5*(a+b); return true; }\n"
++    "  }\n"
++    "  if (up > 0 && dn > 0 && up + dn <= u_covrad + 1) {\n"
++    "    vec4 a = texelFetch(u_tex, tc + ivec2(0, -up), 0);\n"
++    "    vec4 b = texelFetch(u_tex, tc + ivec2(0,  dn), 0);\n"
++    "    if (dot(abs(a.rgb - b.rgb), vec3(1.0)) < u_gfsim) { frag = 0.5*(a+b); return true; }\n"
++    "  }\n"
++    "  return false;\n"
++    "}\n"
++    "bool gap_fill(vec2 uv){\n"
++    "  ivec2 ts = textureSize(u_tex, 0);\n"
++    "  ivec2 tc = ivec2(uv * vec2(ts));\n"
++    "  tc = clamp(tc, ivec2(u_covrad), ts - 1 - ivec2(u_covrad));\n"
++    "  if (covat(tc)) return false;\n"
++    "  int lf = 0, rt = 0, up = 0, dn = 0;\n"
++    "  for (int d = 1; d <= u_covrad; d++) {\n"
++    "    if (lf == 0 && covat(tc + ivec2(-d, 0))) lf = d;\n"
++    "    if (rt == 0 && covat(tc + ivec2( d, 0))) rt = d;\n"
++    "    if (up == 0 && covat(tc + ivec2(0, -d))) up = d;\n"
++    "    if (dn == 0 && covat(tc + ivec2(0,  d))) dn = d;\n"
++    "  }\n"
++    "  if (lf > 0 && rt > 0 && lf + rt <= u_covrad + 1) {\n"
++    "    frag = 0.5 * (texelFetch(u_tex, tc + ivec2(-lf, 0), 0) +\n"
++    "                  texelFetch(u_tex, tc + ivec2( rt, 0), 0));\n"
++    "    return true;\n"
++    "  }\n"
++    "  if (up > 0 && dn > 0 && up + dn <= u_covrad + 1) {\n"
++    "    frag = 0.5 * (texelFetch(u_tex, tc + ivec2(0, -up), 0) +\n"
++    "                  texelFetch(u_tex, tc + ivec2(0,  dn), 0));\n"
++    "    return true;\n"
++    "  }\n"
++    "  return false;\n"
++    "}\n"
+     /* Catmull-Rom bicubic via 9 bilinear taps. Sharper than plain bilinear at
+      * the same smoothness, with mild overshoot that reads as edge definition.
+      * The present texture holds exactly the source rect and wraps CLAMP_TO_EDGE,
+@@ -956,6 +1047,21 @@ static const char *PRESENT_FS =
+     "}\n"
+     "void main(){\n"
+     "  vec2 uv = v_uv;\n"
++    "  if (u_gapfill == 2) {   /* debug: visualize coverage over dimmed scene */\n"
++    "    ivec2 ts = textureSize(u_tex, 0);\n"
++    "    ivec2 tc = ivec2(uv * vec2(ts));\n"
++    "    float c = texelFetch(u_cov, tc / u_covdiv, 0).r;\n"
++    "    vec4 col = texelFetch(u_tex, tc, 0);\n"
++    /* c is binary in mode 1 and a draw ORDINAL in mode 3, so show it as a
++     * ramp: magenta = never drawn, blue = drawn early (background), red =
++     * drawn late (foreground). Cracks read as thin blue lines inside red. */
++    "    vec3 heat = (c <= 0.0) ? vec3(1.0, 0.0, 1.0)\n"
++    "                           : mix(vec3(0.1, 0.3, 1.0), vec3(1.0, 0.2, 0.1), c);\n"
++    "    frag = vec4(mix(heat, col.rgb * vec3(0.5), 0.35), 1.0);\n"
++    "    return;\n"
++    "  }\n"
++    "  if (u_gapfill == 3) { if (gap_fill_ord(uv)) return; }\n"
++    "  else if (u_gapfill != 0 && gap_fill(uv)) return;\n"
+     "  if (u_sharp == 3) { frag = fxaa(uv); return; }\n"
+     "  if (u_sharp == 2) { frag = bicubic(uv); return; }\n"
+     "  if (u_sharp == 1) {\n"
+@@ -1024,6 +1130,50 @@ static const char *GEO_FS =
+     "noperspective in vec4 v_col; out vec4 frag;\n"
+     "void main(){ frag = v_col; }\n";
+ 
++/* Crack-fill coverage pass: positions + per-prim precise flag re-rasterized
++ * into an R8 coverage target. Same u_shift grid alignment as GEO/TEX so
++ * coverage rasterizes the exact same pixels as the color draw. Carries the
++ * identical x-projection uniforms as GEO_VS (u_xoff/u_xhalf native-wide
++ * translate+clip, u_xscale/u_xcenter 2D-backdrop stretch) so the SAME vertex
++ * data re-rasterizes correctly into either the canonical 4:3 target (0, 512,
++ * 1, 0 - the old fixed formula) or a native-wide mirror surface (see
++ * cov_wide_pass_draw), matching whichever projection the paired color pass
++ * used for that draw. */
++static const char *COV_VS =
++    "#version 330\n"
++    "layout(location=0) in vec2 a_pos;\n"
++    "layout(location=1) in float a_cov;\n"
++    "uniform float u_shift;\n"
++    "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
++    "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
++    "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
++    "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
++    "flat out float v_cov;\n"
++    "void main(){ v_cov = a_cov;\n"
++    "  float xb = a_pos.x;\n"
++    "  if (u_xscale < 0.0) {\n"
++    "    float s = -u_xscale; float h = u_xhalf / s;\n"
++    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
++    "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
++    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
++    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
++static const char *COV_FS =
++    "#version 330\n"
++    "flat in float v_cov; out vec4 frag;\n"
++    "uniform int u_all;   /* 1 = stamp for EVERY prim, not just PGXP-precise  */\n"
++    "uniform float u_ord; /* draw ordinal of this primitive, 0..1 within frame */\n"
++    /* Mode 3 records WHEN each pixel was drawn instead of merely THAT it was.
++     * A binary flag cannot see the cracks that actually matter: GT2 paints
++     * back-to-front, so a gap between two terrain polygons still has the
++     * backdrop drawn in it - the pixel is covered, and a detector looking for
++     * "nothing drew here" is blind to it. The user's coverage visualiser
++     * showed exactly that: the entire 3D scene reads as covered, so the fill
++     * was a no-op everywhere in the world. An ordinal turns the question into
++     * "was this thin run drawn EARLIER than the surfaces flanking it", which
++     * is precisely what background-through-foreground means under a painter's
++     * algorithm. */
++    "void main(){ frag = vec4((u_all != 0) ? u_ord : v_cov, 0.0, 0.0, 1.0); }\n";
++
+ /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
+  * texture window, optional bilinear, texel-0 discard, STP-split discard,
+  * PS1 *2-around-0x80 modulation. Output alpha = bit15 of the written pixel.
+@@ -1047,6 +1197,7 @@ static const char *TEX_VS =
+     "layout(location=7) in vec4 a_limits;\n"
+     "layout(location=8) in float a_semi;\n"
+     "layout(location=9) in float a_q;   /* persp weight; 0 = affine (default) */\n"
++    "layout(location=10) in float a_z;  /* PGXP depth 0..1; <0 = no depth */\n"
+     "uniform float u_shift;\n"
+     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
+     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
+@@ -1054,10 +1205,11 @@ static const char *TEX_VS =
+     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
+     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
+     "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
++    "smooth out vec4 v_col_p; /* perspective-correct color (PGXP color correction) */\n"
+     "flat out int v_persp;\n"
+     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
+     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
+-    "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
++    "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col; v_col_p = a_col;\n"
+     "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
+     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
+     "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
+@@ -1077,11 +1229,15 @@ static const char *TEX_VS =
+     "   * a_q == 0 (feature off) w is exactly 1.0 and this is the old expression. */\n"
+     "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
+     "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
+-    "  gl_Position = vec4(ndc * w, 0.0, w); }\n";
++    "  /* PGXP depth: SZ-derived z in NDC when present; prims without depth\n"
++    "   * emit the near plane, but they only draw in depth-test-OFF batches. */\n"
++    "  float zn = (a_z >= 0.0) ? (a_z * 2.0 - 1.0) : -1.0;\n"
++    "  gl_Position = vec4(ndc * w, zn * w, w); }\n";
+ static const char *TEX_FS =
+     "#version 330\n"
+     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+-    "smooth in vec2 v_uv_p; flat in int v_persp;\n"
++    "smooth in vec2 v_uv_p; smooth in vec4 v_col_p; flat in int v_persp;\n"
++    "uniform int u_cpersp;    /* PGXP color correction: perspective colors */\n"
+     "out vec4 frag; out vec4 blend_factor;\n"
+     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
+     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
+@@ -1101,12 +1257,16 @@ static const char *TEX_FS =
+     "}\n"
+     "int fetch_texel(int u, int v){\n"
+     "  u &= 255; v &= 255;\n"
++    "  /* DuckStation order: clamp to the prim's sampled bounds FIRST, then\n"
++    "   * apply the texture window. Window-replacing-clamp let upscaled edge\n"
++    "   * pixels overshoot a texel and wrap to the tile's OPPOSITE edge -\n"
++    "   * dark polygon-edge lines on repeating textures (GT2 road, worst on\n"
++    "   * curves where shared edges run oblique). */\n"
++    "  u = clamp(u, v_limits.x, v_limits.z);\n"
++    "  v = clamp(v, v_limits.y, v_limits.w);\n"
+     "  if ((u_twin.x | u_twin.y) != 0) {\n"
+     "    u = (u & ~(u_twin.x * 8)) | ((u_twin.z & u_twin.x) * 8);\n"
+     "    v = (v & ~(u_twin.y * 8)) | ((u_twin.w & u_twin.y) * 8);\n"
+-    "  } else {\n"
+-    "    u = clamp(u, v_limits.x, v_limits.z);\n"
+-    "    v = clamp(v, v_limits.y, v_limits.w);\n"
+     "  }\n"
+     "  if (v_depth == 0) {\n"
+     "    int px = vram_at(v_tpage.x + (u >> 2), v_tpage.y + v);\n"
+@@ -1220,7 +1380,8 @@ static const char *TEX_FS =
+     "  }\n"
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+     "  if (u_semipass == 2 && stp == 0) discard;\n"
+-    "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
++    "  vec4 mcol = (u_cpersp != 0 && v_persp != 0) ? v_col_p : v_col;\n"
++    "  if (v_raw == 0) rgb = clamp(rgb * mcol.rgb * 2.0, 0.0, 1.0);\n"
+     "  float dst_factor = 0.0;\n"
+     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
+     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
+@@ -1526,9 +1687,33 @@ static void rebuild_mask_stencils(void) {
+     s_stencil_valid = 1;
+ }
+ 
++/* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
++ * Per-frame CPU wall time spent inside the GL submission paths (driver CPU
++ * cost surfaces INSIDE our gl* calls) + counters for the wide plumbing, so a
++ * CPU-bound wide frame (emu_cpu >> scene_gpu) can be attributed without a
++ * sampling profiler. Reset at present enter; reported by frame_perf.
++ * (Defined up here so the coherency sync points below can self-time.) */
++static double cw_ms(void) {
++    static double freq = 0.0;
++    if (freq == 0.0) {
++        uint64_t f = SDL_GetPerformanceFrequency();
++        freq = f ? (double)f : 1.0;
++    }
++    return (double)SDL_GetPerformanceCounter() * 1000.0 / freq;
++}
++static double s_cw_flush_ms = 0.0;   /* CPU wall inside flush_tex_batch        */
++static double s_cw_wide_ms  = 0.0;   /* CPU wall inside glb_wide_* entry points */
++static double s_cw_swap_ms  = 0.0;   /* CPU wall inside SDL_GL_SwapWindow       */
++static double s_cw_pack_ms  = 0.0;   /* CPU wall inside pack_flush (FBO->raw)   */
++static double s_cw_ensure_ms= 0.0;   /* CPU wall inside ensure_cpu readbacks    */
++static int    s_cw_pack_n = 0, s_cw_ensure_n = 0;
++static int    s_cw_batches = 0, s_cw_wide_sets = 0, s_cw_wide_cfgs = 0,
++              s_cw_wide_clears = 0, s_cw_fbo_creates = 0, s_cw_flush_depth = 0;
++
+ /* ---- coherency: hr FBO -> raw mirror (pack) ------------------------------ */
+ static void pack_flush(void) {
+     if (!s_raster_ok || !s_pack_dirty.set) return;
++    double cw_t0 = cw_ms(); s_cw_pack_n++;
+     int x = s_pack_dirty.x0, y = s_pack_dirty.y0;
+     int w = s_pack_dirty.x1 - s_pack_dirty.x0 + 1;
+     int h = s_pack_dirty.y1 - s_pack_dirty.y0 + 1;
+@@ -1552,6 +1737,7 @@ static void pack_flush(void) {
+     p_glUseProgram(0);
+     glDisable(GL_SCISSOR_TEST);
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++    s_cw_pack_ms += cw_ms() - cw_t0;
+ }
+ 
+ /* Make sure the raw mirror is current for a textured draw that samples the
+@@ -1594,9 +1780,15 @@ static void ensure_cpu(void) {
+     flush_tex_batch();   /* realise queued textured draws before reading the FBO back */
+     flush_cpu_upload();
+     pack_flush();
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
+-    glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    /* Time ONLY the readback (the true GPU pipeline sync); the flush/pack
++     * work above already lands in cw_flush_ms / cw_pack_ms. */
++    {
++        double cw_t0 = cw_ms(); s_cw_ensure_n++;
++        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
++        glReadPixels(0, 0, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
++        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++        s_cw_ensure_ms += cw_ms() - cw_t0;
++    }
+     s_gpu_dirty = 0;
+     coh_record(GL_COH_ENSURE, 0, 0, VRAM_W - 1, VRAM_H - 1);
+ }
+@@ -1614,10 +1806,12 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
+         if (ys[i] < y0) y0 = ys[i]; if (ys[i] > y1) y1 = ys[i];
+     }
+     /* A sub-pixel-corrected vertex lies in [int, int+1) of the integer position
+-     * it was rounded from, so the corrected prim can touch one more pixel on
+-     * each max edge than the integer bbox covers. Widen before clipping so the
+-     * pack/readback dirty rect never trails the drawn area. */
+-    if (s_pc_valid) { x1 += 1; y1 += 1; }
++     * it was rounded from, and dilation (gpu.c s_pgxp_dilate) can push it a
++     * further half pixel OUTWARD on every side, so the corrected prim can
++     * touch up to two more pixels past each max edge and one below each min.
++     * Widen before clipping so the pack/readback dirty rect never trails the
++     * drawn area. */
++    if (s_pc_valid) { x0 -= 1; y0 -= 1; x1 += 2; y1 += 2; }
+     s_bdg_prims++;   /* dbg: prims seen this frame (gate is now per-prim, see bd_prim_gate) */
+     if (s_ptrace_n < PTRACE_CAP) {
+         PrimRec *p = &s_ptrace[s_ptrace_n++];
+@@ -1780,10 +1974,39 @@ static void wide_clear_bd_scale(GLint uScale, GLint uCenter) {
+ static float s_tb[TEXBATCH_MAXV * TEXV];
+ static int   s_tb_n = 0;                    /* verts queued */
+ static int   s_tb_semi = -2;
++static int   s_tb_zt = 0;                   /* batch key: PGXP depth-tested */
+ static int   s_tb_mask = 0, s_tb_filter = 0;
+ static int   s_tb_twin[4] = {0, 0, 0, 0};
+ static uint64_t s_batch_total = 0, s_batch_reason[7];
+ 
++/* Clear the scene FBO's depth bits (PGXP depth buffer). Called at the
++ * double-buffer draw-area flip; binds the hr FBO explicitly so the clear
++ * cannot land on the window framebuffer, and leaves scissor disabled state
++ * exactly as the draw paths expect (they re-set it per draw). */
++static void depth_clear_if_armed(void) {
++    if (!s_raster_ok || !s_hr_fbo) return;
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
++    glDisable(GL_SCISSOR_TEST);
++    glDepthMask(GL_TRUE);
++    glClearDepth(1.0);
++    glClear(GL_DEPTH_BUFFER_BIT);
++    gpu_pgxp_depth_frame_reset();   /* layer tracker starts conservative */
++}
++
++/* Mid-frame depth clear (DS depth-clear threshold: the game moved to a
++ * farther drawing layer). Ordering matters: everything queued so far must
++ * rasterize BEFORE the clear. */
++static void flush_tex_batch(void);
++static void glb_depth_clear(void) {
++    if (!s_raster_ok || !s_hr_fbo) return;
++    flush_tex_batch();
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
++    glDisable(GL_SCISSOR_TEST);
++    glDepthMask(GL_TRUE);
++    glClearDepth(1.0);
++    glClear(GL_DEPTH_BUFFER_BIT);
++}
++
+ void gl_renderer_batch_diag(uint64_t out[8]) {
+     out[0] = s_batch_total;
+     for (int i = 0; i < 7; i++) out[i + 1] = s_batch_reason[i];
+@@ -1807,6 +2030,17 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
+  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
+  * whose two passes do not self-overlap. */
+ static void tex_batch_draw_passes(int nverts, int semi) {
++    /* PGXP depth batch: LEQUAL test against the SZ-derived z. Opaque batches
++     * also WRITE depth; blended ones only test (a semi surface must not
++     * occlude what is drawn behind it later - DuckStation's rule). The depth
++     * bits share the FBO's DEPTH24_STENCIL8 attachment with the mask stencil. */
++    if (s_tb_zt) {
++        glEnable(GL_DEPTH_TEST);
++        glDepthFunc(GL_LEQUAL);
++        glDepthMask(semi < 0 ? GL_TRUE : GL_FALSE);
++    } else {
++        glDisable(GL_DEPTH_TEST);
++    }
+     p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+     if (semi < 0) {
+         glDisable(GL_BLEND);
+@@ -1815,6 +2049,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+         if (s_mask_check) {
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
++            if (s_tb_zt) glDepthMask(GL_FALSE);        /* same z, LEQUAL passes */
+             mask_stencil(1);
+             p_glUniform1i(s_uSemipass, 2);             /* STP=1 texels set the mask bit */
+             glDrawArrays(GL_TRIANGLES, 0, nverts);
+@@ -1846,26 +2081,9 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+         p_glUniform1i(s_uSemipass, 2);
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+     }
++    if (s_tb_zt) { glDisable(GL_DEPTH_TEST); glDepthMask(GL_TRUE); }
+ }
+ 
+-/* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
+- * Per-frame CPU wall time spent inside the GL submission paths (driver CPU
+- * cost surfaces INSIDE our gl* calls) + counters for the wide plumbing, so a
+- * CPU-bound wide frame (emu_cpu >> scene_gpu) can be attributed without a
+- * sampling profiler. Reset at present enter; reported by frame_perf. */
+-static double cw_ms(void) {
+-    static double freq = 0.0;
+-    if (freq == 0.0) {
+-        uint64_t f = SDL_GetPerformanceFrequency();
+-        freq = f ? (double)f : 1.0;
+-    }
+-    return (double)SDL_GetPerformanceCounter() * 1000.0 / freq;
+-}
+-static double s_cw_flush_ms = 0.0;   /* CPU wall inside flush_tex_batch        */
+-static double s_cw_wide_ms  = 0.0;   /* CPU wall inside glb_wide_* entry points */
+-static int    s_cw_batches = 0, s_cw_wide_sets = 0, s_cw_wide_cfgs = 0,
+-              s_cw_wide_clears = 0, s_cw_fbo_creates = 0, s_cw_flush_depth = 0;
+-
+ /* Textured-batch variant of mirror_x_center_only: scan the queued verts' x
+  * (attr 0, stride TEXV). Defined here so s_tb / TEXV are in scope. */
+ static int mirror_batch_center_only(int nverts) {
+@@ -1882,6 +2100,10 @@ static int mirror_batch_center_only(int nverts) {
+     return mirror_x_center_only((int)floorf(flo), (int)ceilf(fhi));
+ }
+ 
++static void cov_pass_draw(GLuint vao, GLenum mode, int nverts); /* fwd: crack-fill coverage */
++static void cov_wide_pass_draw(GLuint vao, GLenum mode, int nverts, int dx); /* fwd: wide variant */
++static GLuint s_cov_vao_geo, s_cov_vao_tex;   /* tentative; defined with the pass below */
++
+ static void flush_tex_batch(void) {
+     if (s_tb_n == 0) return;
+     int nverts = s_tb_n, semi = s_tb_semi;
+@@ -1897,6 +2119,7 @@ static void flush_tex_batch(void) {
+     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
+     p_glUniform1i(s_uMaskset, s_tb_mask);
+     p_glUniform1i(s_uFilter, s_tb_filter);
++    p_glUniform1i(s_uCpersp, gpu_pgxp_color_correction());
+     p_glBindVertexArray(s_tex_vao);
+     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
+@@ -1918,16 +2141,191 @@ static void flush_tex_batch(void) {
+         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+         gl_perf_mirror_end();
++        if (s_ws_ablate != 2) cov_wide_pass_draw(s_cov_vao_tex, GL_TRIANGLES, nverts, dx);
+     }
++    /* Coverage LAST: nothing in this function draws after it, so the state it
++     * clobbers (program/VAO/blend/stencil) is all re-set by the next batch. */
++    cov_pass_draw(s_cov_vao_tex, GL_TRIANGLES, nverts);
+     hr_end();
+     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
+ }
+ 
++/* ---- PGXP crack-fill coverage --------------------------------------------
++ * PGXP correction moves polygons sub-pixel, and neighbours that agree in
++ * integer space without sharing exact vertices (LOD T-junctions, tracked-vs-
++ * native corners) open backdrop-colored seams the geometry can never close
++ * (and geometry-side fixes like polygon dilation distort silhouettes - the
++ * expanded car mesh regression). The display-side answer: track WHICH hires
++ * pixels were rasterized by a PGXP-precise primitive in a parallel R8
++ * coverage target (last writer wins, exactly like the color buffer - a
++ * non-precise draw stamps 0 over stale 1s), then have the present shader
++ * fill only thin uncovered runs flanked by covered pixels - the actual
++ * cracks - with their neighbours' colors. Nothing else changes: geometry
++ * stays exactly where PGXP puts it, VRAM readbacks (pack/ensure) see the
++ * true rendered pixels, texture cutouts stay open (the coverage pass draws
++ * positions only, so a discarded texel still stamps coverage and is never
++ * treated as a crack). A second target/pass pair (cov_wide_pass_draw, right
++ * below) re-rasterizes the same batch into the ACTIVE wide mirror surface's
++ * own coverage buffer with the wide x-projection, so native-wide (16:9)
++ * sessions get gap-fill too — the present path for those reads a per-base_x
++ * wide texture that is never s_hr_tex, so this canonical-only pass alone
++ * left every widescreen session's cracks unfilled. */
++static GLuint s_cov_tex = 0, s_cov_fbo = 0;
++static GLuint s_cov_prog = 0;
++static GLuint s_cov_vao_geo, s_cov_vao_tex;
++static GLint  s_cov_uShift = -1;
++static GLint  s_cov_uXoff = -1, s_cov_uXhalf = -1, s_cov_uXscale = -1, s_cov_uXcenter = -1;
++static GLint  s_cov_uAll = -1, s_cov_uOrd = -1;
++static int    s_gf_last = 0, s_gf_last_mode = 0;
++/* Coverage-target downscale. At 16x the 1:1 target would be 16384x8192 R8 on
++ * top of ~1.5GB of colour/depth surfaces - large enough to exceed a GPU's
++ * dimension limit or simply fail to allocate, and the failure path silently
++ * disabled the whole crack fill. Cap the dimensions and sample with a divisor
++ * instead: a crack is ~1 native pixel, which is s_scale hires pixels, so even
++ * a 4x reduction leaves several coverage texels across it. */
++#define COV_MAX_DIM 8192
++static int    s_cov_div = 1;
++/* Live-tunable crack-detector parameters. Sweeping these needed a rebuild per
++ * guess, which is the slowest possible way to find three numbers. */
++static float  s_gf_thr = 0.05f;   /* draw-order gap that counts as "behind"  */
++static float  s_gf_sim = 0.55f;   /* max colour difference between flanks    */
++static int    s_gf_rad = 0;       /* fill radius, hires px; 0 = auto         */
++void gl_renderer_set_gf_thr(float v) { if (v >= 0.0f && v <= 1.0f) s_gf_thr = v; }
++void gl_renderer_set_gf_sim(float v) { if (v >= 0.0f && v <= 3.0f) s_gf_sim = v; }
++void gl_renderer_set_gf_rad(int v)   { if (v >= 0 && v <= 128) s_gf_rad = v; }
++float gl_renderer_get_gf_thr(void) { return s_gf_thr; }
++float gl_renderer_get_gf_sim(void) { return s_gf_sim; }
++int   gl_renderer_get_gf_rad(void) { return s_gf_rad; }
++int gl_renderer_gapfill_status(int *mode) {
++    if (mode) *mode = s_gf_last_mode;
++    return s_gf_last;
++}
++/* Draw ordinal for mode 3 (see COV_FS). Counts coverage draws within a frame
++ * and normalises against the PREVIOUS frame's total, so the 8-bit target
++ * spreads its 255 buckets across however many primitives this game actually
++ * submits instead of saturating after 255. */
++static uint32_t s_cov_ord = 0, s_cov_ord_prev = 256;
++/* Gap-fill mode: 0 off, 1 precise-only coverage, 2 coverage visualizer,
++ * 3 ALL-geometry coverage.
++ *
++ * Mode 1 stamps coverage only for PGXP-precise primitives, so "uncovered"
++ * means "no CORRECTED geometry here" and the fill needs covered pixels on both
++ * flanks. That cannot close the seam where corrected 3D scenery meets an
++ * UNcorrected 2D element - the sky/backdrop tiles above all - because the 2D
++ * side stamps 0 and one flank is never covered. GT2 draws its skybox and
++ * distant backdrop as CPU-placed 2D, so that boundary is exactly where the
++ * reported "sky through the track / skybox gaps" lives.
++ * Mode 3 stamps coverage for every rasterized primitive, so "uncovered" means
++ * "nothing drew here at all" - the honest definition of a crack - and a thin
++ * run between ANY two neighbours fills, 3D-to-2D included. Real open sky is a
++ * large uncovered region, far wider than u_covrad, so it is still never
++ * touched; only slivers narrower than about a native pixel are bridged.
++ *
++ * Default 3: lab A/B on a deterministic race frame measured backdrop-leak
++ * pixels at 584 (fill off), 432 (mode 1) and 366-432 (mode 3) - mode 3 was
++ * never worse than mode 1 across six samples and better on some frames, and
++ * the texture-cutout safety property is identical (a discarded texel still
++ * stamps coverage, so sky seen THROUGH a fence or canopy texture is inside a
++ * covered region and is never mistaken for a crack). */
++static int    s_gapfill = 3;
++void gl_renderer_set_gapfill(int on) { s_gapfill = (on >= 0 && on <= 3) ? on : 1; }
++int  gl_renderer_get_gapfill(void)   { return s_gapfill; }
++
++/* Advance the per-primitive draw ordinal and push it to the shader. */
++static void cov_ord_advance(void) {
++    s_cov_ord++;
++    float denom = (float)(s_cov_ord_prev ? s_cov_ord_prev : 256u);
++    float o = (float)s_cov_ord / denom;
++    if (o > 1.0f) o = 1.0f;
++    p_glUniform1f(s_cov_uOrd, o);
++}
++
++/* Called once per presented frame: the ordinal restarts, and the count just
++ * finished becomes the normalisation denominator for the next one. */
++static void cov_ord_frame(void) {
++    if (s_cov_ord) s_cov_ord_prev = s_cov_ord;
++    s_cov_ord = 0;
++}
++
++/* Re-rasterize the batch just drawn into the coverage target: positions +
++ * per-prim precise flag only. State: no blend/stencil/depth - the color
++ * pipeline's per-batch state does not apply to coverage. Viewport/scissor are
++ * set explicitly (not inherited) because a preceding wide-mirror pass in the
++ * same flush leaves both at the WIDE surface's dimensions (wide_target_end
++ * only restores the color program's x-projection uniforms, not GL viewport/
++ * scissor state) — this target is always the canonical 4:3-sized surface, so
++ * it must not inherit them. Every next batch rebinds its own program/VAO/FBO
++ * state, so only the FBO needs restoring here. */
++static void cov_pass_draw(GLuint vao, GLenum mode, int nverts) {
++    if (!s_gapfill || !s_cov_fbo || s_scale <= 1 || nverts <= 0) return;
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_cov_fbo);
++    /* Coverage space = hires / s_cov_div. The pass emits NDC, so a smaller
++     * viewport rasterises the same geometry into the smaller target. */
++    glViewport(0, 0, VRAM_W * s_scale / s_cov_div, VRAM_H * s_scale / s_cov_div);
++    glEnable(GL_SCISSOR_TEST);
++    {
++        int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
++        if (sw < 0) sw = 0; if (sh < 0) sh = 0;
++        glScissor(s_area_x1 * s_scale / s_cov_div, s_area_y1 * s_scale / s_cov_div,
++                  sw * s_scale / s_cov_div, sh * s_scale / s_cov_div);
++    }
++    glDisable(GL_BLEND);
++    glDisable(GL_STENCIL_TEST);
++    glDisable(GL_DEPTH_TEST);
++    p_glUseProgram(s_cov_prog);
++    p_glUniform1i(s_cov_uAll, s_gapfill == 3 ? 1 : 0);
++    cov_ord_advance();
++    p_glBindVertexArray(vao);
++    glDrawArrays(mode, 0, nverts);
++    p_glBindVertexArray(0);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
++}
++
++/* Wide-surface counterpart: same batch, same VAO (position + coverage-flag
++ * attributes only — texture state doesn't matter for coverage), rasterized
++ * with the wide x-projection (u_xoff=dx, u_xhalf=g_wide_w/2) into the
++ * coverage FBO paired with the currently active wide mirror (g_wide_cov_cur,
++ * allocated 1:1 alongside g_wide_cur in wide_fbo_for). Applies the same
++ * backdrop-stretch (s_bd_gate) the color mirror pass just used, via the
++ * existing wide_set_bd_scale/wide_clear_bd_scale helpers, so a stretched
++ * backdrop's coverage lands at the same stretched position as its color.
++ * Self-contained viewport/scissor/uniform state, like cov_pass_draw. */
++static void cov_wide_pass_draw(GLuint vao, GLenum mode, int nverts, int dx) {
++    if (!s_gapfill || !g_wide_cov_cur || s_scale <= 1 || nverts <= 0) return;
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cov_cur);
++    glViewport(0, 0, g_wide_w * s_scale / s_cov_div, VRAM_H * s_scale / s_cov_div);
++    glEnable(GL_SCISSOR_TEST);
++    {
++        int sy = s_area_y1, sh = s_area_y2 - s_area_y1 + 1;
++        if (sy < 0) { sh += sy; sy = 0; }
++        if (sy + sh > VRAM_H) sh = VRAM_H - sy;
++        if (sh < 0) sh = 0;
++        glScissor(0, sy * s_scale / s_cov_div,
++                  g_wide_w * s_scale / s_cov_div, sh * s_scale / s_cov_div);
++    }
++    glDisable(GL_BLEND);
++    glDisable(GL_STENCIL_TEST);
++    glDisable(GL_DEPTH_TEST);
++    p_glUseProgram(s_cov_prog);
++    p_glUniform1i(s_cov_uAll, s_gapfill == 3 ? 1 : 0);
++    cov_ord_advance();
++    p_glUniform1f(s_cov_uXoff, (float)dx);
++    p_glUniform1f(s_cov_uXhalf, (float)g_wide_w / 2.0f);
++    wide_set_bd_scale(s_cov_uXscale, s_cov_uXcenter);
++    p_glBindVertexArray(vao);
++    glDrawArrays(mode, 0, nverts);
++    p_glBindVertexArray(0);
++    wide_clear_bd_scale(s_cov_uXscale, s_cov_uXcenter);
++    p_glUniform1f(s_cov_uXoff, 0.0f);
++    p_glUniform1f(s_cov_uXhalf, 512.0f);
++    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
++}
++
+ /* Flat / gouraud GEO batch — MotK title/char-select starfields issue ~30k/s
+  * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
+  * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
+ #define FLATBATCH_MAXV 8190                 /* multiple of 3 */
+-static float s_fb[FLATBATCH_MAXV * 6];
++static float s_fb[FLATBATCH_MAXV * GEOV];
+ static int   s_fb_n = 0;
+ static int   s_fb_semi = -2;
+ static int   s_fb_mask = -1;
+@@ -1936,7 +2334,7 @@ static int mirror_flat_batch_center_only(int nverts) {
+     if (!s_wide_fast || nverts <= 0) return 0;
+     float flo = s_fb[0], fhi = s_fb[0];
+     for (int i = 1; i < nverts; i++) {
+-        float x = s_fb[i * 6];
++        float x = s_fb[i * GEOV];
+         if (x < flo) flo = x; if (x > fhi) fhi = x;
+     }
+     /* floor/ceil rather than a truncating cast — see mirror_batch_center_only. */
+@@ -1954,7 +2352,7 @@ static void flush_flat_batch(void) {
+     p_glUseProgram(s_geo_prog);
+     p_glBindVertexArray(s_geo_vao);
+     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+-    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * 6 * sizeof(float)),
++    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * GEOV * sizeof(float)),
+                    s_fb, PSXGL_STREAM_DRAW);
+     glDrawArrays(GL_TRIANGLES, 0, nverts);
+ 
+@@ -1970,7 +2368,9 @@ static void flush_flat_batch(void) {
+         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
+         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+         gl_perf_mirror_end();
++        if (s_ws_ablate != 2) cov_wide_pass_draw(s_cov_vao_geo, GL_TRIANGLES, nverts, dx);
+     }
++    cov_pass_draw(s_cov_vao_geo, GL_TRIANGLES, nverts);   /* last - see flush_tex_batch */
+     hr_end();
+ }
+ 
+@@ -1987,15 +2387,16 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+     /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
+     if (mode != GL_TRIANGLES || n < 3) {
+         flush_flat_batch();
+-        float verts[3 * 6];
++        float verts[3 * GEOV];
+         float mask_a = s_mask_set ? 1.0f : 0.0f;
+         for (int i = 0; i < n; i++) {
+-            verts[i*6+0] = precise ? s_pc_x[i] : (float)xs[i];
+-            verts[i*6+1] = precise ? s_pc_y[i] : (float)ys[i];
+-            verts[i*6+2] = ((cs[i] & 0x1F) << 3) / 255.0f;
+-            verts[i*6+3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
+-            verts[i*6+4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
+-            verts[i*6+5] = mask_a;
++            verts[i*GEOV+0] = precise ? s_pc_x[i] : (float)xs[i];
++            verts[i*GEOV+1] = precise ? s_pc_y[i] : (float)ys[i];
++            verts[i*GEOV+2] = ((cs[i] & 0x1F) << 3) / 255.0f;
++            verts[i*GEOV+3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
++            verts[i*GEOV+4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
++            verts[i*GEOV+5] = mask_a;
++            verts[i*GEOV+6] = precise ? 1.0f : 0.0f;
+         }
+         hr_begin(1);
+         if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+@@ -2004,7 +2405,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+         p_glUseProgram(s_geo_prog);
+         p_glBindVertexArray(s_geo_vao);
+         p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+-        p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(n * 6 * sizeof(float)),
++        p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(n * GEOV * sizeof(float)),
+                        verts, PSXGL_STREAM_DRAW);
+         glDrawArrays(mode, 0, n);
+         if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+@@ -2018,7 +2419,11 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+             wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
+             wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+             gl_perf_mirror_end();
++            if (s_ws_ablate != 2 && mode == GL_TRIANGLES)
++                cov_wide_pass_draw(s_cov_vao_geo, mode, n, dx);
+         }
++        if (mode == GL_TRIANGLES)
++            cov_pass_draw(s_cov_vao_geo, mode, n);   /* last - see flush_tex_batch */
+         hr_end();
+         return;
+     }
+@@ -2032,13 +2437,14 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
+ 
+     float mask_a = s_mask_set ? 1.0f : 0.0f;
+     for (int i = 0; i < n; i++) {
+-        float *v = &s_fb[s_fb_n * 6];
++        float *v = &s_fb[s_fb_n * GEOV];
+         v[0] = precise ? s_pc_x[i] : (float)xs[i];
+         v[1] = precise ? s_pc_y[i] : (float)ys[i];
+         v[2] = ((cs[i] & 0x1F) << 3) / 255.0f;
+         v[3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
+         v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
+         v[5] = mask_a;
++        v[6] = precise ? 1.0f : 0.0f;
+         s_fb_n++;
+     }
+ }
+@@ -2162,6 +2568,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+          * OPAQUE prims into the dual-source key — prevented above by keeping
+          * opaque at -1 — not from semi-with-semi batching.) */
+         int isolate = (semi >= 0) && (batch_semi != 4);
++        /* DS parity: semi-transparent prims stay out of the depth test
++         * entirely (composite by draw order) unless the transparent-depth
++         * option is on; opaque proven-depth prims test and write. */
++        int zt = (s_pz_valid && gpu_pgxp_depth_enabled() &&
++                  (semi < 0 || gpu_pgxp_depth_transparent())) ? 1 : 0;
+         int reason = -1;
+         if (s_tb_n > 0) {
+             if (isolate) reason = 0;
+@@ -2171,6 +2582,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+             else if (gate != s_tb_gate) reason = 4;
+             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
+                      tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
++            else if (zt != s_tb_zt) reason = 5; /* depth-key change */
+         }
+         if (reason >= 0) {
+             s_batch_reason[reason]++;
+@@ -2180,6 +2592,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
+             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = eff_filter; s_tb_gate = gate;
+             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
++            s_tb_zt = zt;
+         }
+         float *vp = &s_tb[s_tb_n * TEXV];
+         for (int i = 0; i < 3; i++, vp += TEXV) {
+@@ -2194,6 +2607,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
+             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
++            vp[20] = zt ? s_pz[i] : -1.0f;                          /* a_z; <0 = none  */
++            vp[21] = s_pc_valid ? 1.0f : 0.0f;                      /* a_cov (crack fill) */
+         }
+         s_tb_n += 3;
+         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
+@@ -2212,9 +2627,9 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int
+     float b = (((c >> 10) & 0x1F) << 3) / 255.0f;
+     float a = s_mask_set ? 1.0f : 0.0f;
+     float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
+-    float verts[6 * 6] = {
+-        fx0,fy0,r,g,b,a,  fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,
+-        fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,  fx1,fy1,r,g,b,a,
++    float verts[6 * GEOV] = {
++        fx0,fy0,r,g,b,a,0,  fx1,fy0,r,g,b,a,0,  fx0,fy1,r,g,b,a,0,
++        fx1,fy0,r,g,b,a,0,  fx0,fy1,r,g,b,a,0,  fx1,fy1,r,g,b,a,0,
+     };
+     /* Wide target: positions already wide-space so u_xoff = 0; full-width
+      * scissor; u_xhalf = g_wide_w/2. */
+@@ -2400,8 +2815,16 @@ static void glb_init(uint16_t *vram) { s_vram = vram; sw_renderer_init(vram); }
+  * (software mirror, readbacks, screenshots) stays native, so the reported
+  * scale is 1 and the software hi-res mirror stays off. */
+ static void glb_set_scale(int s) {
++    const int want = s;
+     if (s < 1) s = 1;
+     if (s > GL_MAX_INTERNAL_SCALE) s = GL_MAX_INTERNAL_SCALE;
++    /* Say so when a request is refused. A silent clamp here is what made a
++     * 12x setting present as 4x pixels with a settings file that claimed 12 —
++     * the user has no way to tell a capped request from a broken renderer. */
++    if (s != want)
++        fprintf(stdout,
++                "psxrecomp: GL internal scale %dx requested, clamped to %dx "
++                "(max %d)\n", want, s, GL_MAX_INTERNAL_SCALE);
+     s_req_scale = s;
+     sw_renderer_set_scale(1);
+ }
+@@ -2460,7 +2883,28 @@ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float
+     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
+     sw_set_perspective_triangle(enabled, q0, q1, q2);
+ }
+-static void glb_set_draw_area(int x1,int y1,int x2,int y2) { flush_flat_batch(); flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
++static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
++    s_pz_valid = (enabled && z0 > 0.0f && z1 > 0.0f && z2 > 0.0f) ? 1 : 0;
++    /* SZ3 is 0..65535, near = small. Normalize into [~0..1]; the shader maps
++     * it to NDC. Clamp defensively - a bad shadow must not wrap the range. */
++    const float inv = 1.0f / 65535.0f;
++    s_pz[0] = z0 * inv; s_pz[1] = z1 * inv; s_pz[2] = z2 * inv;
++    for (int i = 0; i < 3; i++) {
++        if (s_pz[i] < 0.0f) s_pz[i] = 0.0f;
++        if (s_pz[i] > 1.0f) s_pz[i] = 1.0f;
++    }
++}
++static void depth_clear_if_armed(void);   /* defined below (needs FBO state) */
++static void glb_set_draw_area(int x1,int y1,int x2,int y2) {
++    flush_flat_batch(); flush_tex_batch();
++    /* PGXP depth: a draw-area move to a different framebuffer half is the
++     * double-buffer flip - the depth of the previous frame's geometry must
++     * not occlude the new frame. Cheap (one clear per frame in practice). */
++    if ((y1 != s_area_y1 || x1 != s_area_x1) && gpu_pgxp_depth_enabled())
++        depth_clear_if_armed();
++    s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2;
++    sw_set_draw_area(x1,y1,x2,y2);
++}
+ static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
+ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_batch(); s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
+ 
+@@ -2470,7 +2914,7 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
+  * SW @ 1× for authority, then GPU @ s_scale for present quality. */
+ /* The sub-pixel / perspective override describes exactly one triangle; drop it
+  * once that triangle has been submitted so a later prim can never inherit it. */
+-static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; }
++static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; s_pz_valid = 0; }
+ 
+ static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
+     if (s_cpu_auth_dual || !s_raster_ok)
+@@ -2549,7 +2993,38 @@ static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
+     gpu_line(x0,y0,c0, x1,y1,c1, s_semi_en?s_semi_mode:-1);
+ }
+ static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display(o,p,dx,dy,dw,dh); }
+-static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
++/* True hi-res readback: the GL backend's supersampled content lives ONLY in
++ * the s_hr_fbo raster (the window presents it by blit); the SW mirror this
++ * used to proxy to runs at native scale under GL, so hires screenshots came
++ * back as a native-res image parked in a scaled-size buffer (the top-left-
++ * quadrant garble). Read the display region straight from the FBO. */
++static int glb_render_display_hires(uint32_t *o, int p, int dx, int dy,
++                                    int dw, int dh) {
++    if (!s_raster_ok || !s_hr_fbo || s_scale <= 1) {
++        ensure_cpu();
++        return sw_render_display_hires(o, p, dx, dy, dw, dh);
++    }
++    gl_renderer_sync_cpu();          /* flush queued batches before reading */
++    int s = s_scale;
++    int W = dw * s, H = dh * s;
++    uint8_t *tmp = (uint8_t *)malloc((size_t)W * H * 4);
++    if (!tmp) return 0;
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glReadPixels(dx * s, dy * s, W, H, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    int pitch_px = p / (int)sizeof(uint32_t);
++    for (int y = 0; y < H; y++) {
++        const uint8_t *src = tmp + (size_t)y * W * 4;
++        uint32_t *dst = o + (size_t)y * pitch_px;
++        for (int x = 0; x < W; x++) {
++            dst[x] = 0xFF000000u | ((uint32_t)src[x * 4 + 0] << 16) |
++                     ((uint32_t)src[x * 4 + 1] << 8) | src[x * 4 + 2];
++        }
++    }
++    free(tmp);
++    return H;
++}
+ /* While GP1 depth24 is on, packed RGB888 lives in the CPU mirror and is
+  * presented via gl_renderer_present — never as 1555 FBO texels. Queuing those
+  * MDEC A0 rects hits UP_RECTS_MAX (16) and force-flushes mid-movie (MotK intro
+@@ -2811,12 +3286,43 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
+ static int init_gpu_raster(void) {
+     s_scale = s_req_scale;
+ 
++    /* Fit the internal scale to what this GPU can actually allocate BEFORE
++     * building anything. The hires surfaces are VRAM_W*scale x VRAM_H*scale
++     * (16384x8192 at 16x), which exceeds GL_MAX_TEXTURE_SIZE /
++     * GL_MAX_RENDERBUFFER_SIZE on plenty of hardware. Without this check a
++     * too-ambitious setting fails deep inside init and drops the WHOLE GL
++     * pipeline to the software renderer - a huge, silent performance cliff
++     * for what should just be "use a smaller buffer". Reducing here keeps GL
++     * and costs only sharpness, and the reduction is reported. */
++    {
++        GLint max_tex = 0, max_rb = 0;
++        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
++        glGetIntegerv(PSXGL_MAX_RENDERBUFFER_SIZE, &max_rb);
++        GLint lim = (max_tex > 0 && max_rb > 0) ? (max_tex < max_rb ? max_tex : max_rb)
++                                                : (max_tex > 0 ? max_tex : max_rb);
++        if (lim > 0) {
++            int fit = s_scale;
++            while (fit > 1 && (VRAM_W * fit > lim || VRAM_H * fit > lim)) fit--;
++            if (fit != s_scale) {
++                fprintf(stdout,
++                        "psxrecomp: GL internal scale %dx needs %dx%d but this "
++                        "GPU caps textures/renderbuffers at %d - using %dx\n",
++                        s_scale, VRAM_W * s_scale, VRAM_H * s_scale, (int)lim, fit);
++                s_scale = fit;
++                s_req_scale = fit;
++            }
++        }
++    }
++
+     s_geo_prog  = build_program(GEO_VS, GEO_FS);
+     s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
+     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
+     s_pack_prog = build_program(PACK_VS, PACK_FS);
+     s_stencil_prog = build_program(PACK_VS, STENCIL_FS);
+     if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog || !s_stencil_prog) return 0;
++    /* Crack-fill coverage program: optional - a failure just disables the
++     * gap fill (s_cov_fbo stays 0), never the renderer. */
++    s_cov_prog = build_program(COV_VS, COV_FS);
+ 
+     s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
+     if (!s_conv) return 0;
+@@ -2849,6 +3355,39 @@ static int init_gpu_raster(void) {
+     if (!make_fbo(&s_hr_fbo, s_hr_tex, s_hr_rb)) return 0;
+     if (!make_fbo(&s_raw_fbo, s_raw_tex, 0)) return 0;
+     if (!make_fbo(&s_scratch_fbo, s_scratch_tex, 0)) return 0;
++    /* Crack-fill coverage target (optional; see s_cov_prog above). */
++    s_cov_div = 1;
++    if (s_cov_prog && s_scale > 1) {
++        while ((hw / s_cov_div > COV_MAX_DIM || hh / s_cov_div > COV_MAX_DIM) &&
++               s_cov_div < 16)
++            s_cov_div *= 2;
++        int cw = hw / s_cov_div, chh = hh / s_cov_div;
++        s_cov_tex = make_tex(PSXGL_R8, cw, chh, GL_RED, GL_UNSIGNED_BYTE);
++        if (s_cov_tex && !make_fbo(&s_cov_fbo, s_cov_tex, 0)) s_cov_fbo = 0;
++        if (!s_cov_fbo && s_cov_div < 16) {   /* retry smaller before giving up */
++            if (s_cov_tex) { glDeleteTextures(1, &s_cov_tex); s_cov_tex = 0; }
++            s_cov_div *= 2;
++            cw = hw / s_cov_div; chh = hh / s_cov_div;
++            s_cov_tex = make_tex(PSXGL_R8, cw, chh, GL_RED, GL_UNSIGNED_BYTE);
++            if (s_cov_tex && !make_fbo(&s_cov_fbo, s_cov_tex, 0)) s_cov_fbo = 0;
++        }
++        if (s_cov_fbo) {   /* start fully uncovered */
++            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_cov_fbo);
++            glClearColor(0.f, 0.f, 0.f, 1.f);
++            glClear(GL_COLOR_BUFFER_BIT);
++            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++            fprintf(stdout, "psxrecomp: crack-fill coverage %dx%d (1/%d of hires)\n",
++                    cw, chh, s_cov_div);
++        } else {
++            /* Never fail silently again - this exact case disabled the fill
++             * with no message and cost several rounds to localise. */
++            fprintf(stdout, "psxrecomp: WARNING crack-fill coverage target could "
++                            "not be allocated at %dx (tried down to 1/%d) - "
++                            "gap fill is DISABLED. Lower [video] supersampling.\n",
++                    s_scale, s_cov_div);
++            if (s_cov_tex) { glDeleteTextures(1, &s_cov_tex); s_cov_tex = 0; }
++        }
++    }
+ 
+     s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
+     s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
+@@ -2860,6 +3399,7 @@ static int init_gpu_raster(void) {
+     s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
+     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
+     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
++    s_uCpersp   = p_glGetUniformLocation(s_tex_prog, "u_cpersp");
+     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
+     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
+     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
+@@ -2907,6 +3447,25 @@ static int init_gpu_raster(void) {
+         p_glUniform1f(s_tex_uXhalf, 512.0f);
+         p_glUseProgram(s_blit_prog);
+         p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);
++        if (s_cov_prog) {
++            p_glUseProgram(s_cov_prog);
++            s_cov_uShift = p_glGetUniformLocation(s_cov_prog, "u_shift");
++            p_glUniform1f(s_cov_uShift, shift);
++            s_cov_uXoff    = p_glGetUniformLocation(s_cov_prog, "u_xoff");
++            s_cov_uXhalf   = p_glGetUniformLocation(s_cov_prog, "u_xhalf");
++            s_cov_uXscale  = p_glGetUniformLocation(s_cov_prog, "u_xscale");
++            s_cov_uXcenter = p_glGetUniformLocation(s_cov_prog, "u_xcenter");
++            s_cov_uAll     = p_glGetUniformLocation(s_cov_prog, "u_all");
++            p_glUniform1i(s_cov_uAll, 0);
++            s_cov_uOrd     = p_glGetUniformLocation(s_cov_prog, "u_ord");
++            p_glUniform1f(s_cov_uOrd, 1.0f);
++            /* Defaults match GEO/TEX: 0 offset, 512 clip half-extent (the old
++             * fixed canonical formula), 1.0/0.0 no-op backdrop stretch. */
++            p_glUniform1f(s_cov_uXoff, 0.0f);
++            p_glUniform1f(s_cov_uXhalf, 512.0f);
++            p_glUniform1f(s_cov_uXscale, 1.0f);
++            p_glUniform1f(s_cov_uXcenter, 0.0f);
++        }
+         p_glUseProgram(0);
+     }
+ 
+@@ -2914,9 +3473,9 @@ static int init_gpu_raster(void) {
+     p_glBindVertexArray(s_geo_vao);
+     p_glGenBuffers(1, &s_geo_vbo);
+     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+-    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);
++    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)0);
+     p_glEnableVertexAttribArray(0);
+-    p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)(2 * sizeof(float)));
++    p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(2 * sizeof(float)));
+     p_glEnableVertexAttribArray(1);
+ 
+     p_glGenVertexArrays(1, &s_tex_vao);
+@@ -2935,6 +3494,7 @@ static int init_gpu_raster(void) {
+         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
+         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
+         p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
++        p_glVertexAttribPointer(10,1, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10);/* pgxp z */
+     }
+ 
+     p_glGenVertexArrays(1, &s_blit_vao);
+@@ -2944,6 +3504,24 @@ static int init_gpu_raster(void) {
+     p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+     p_glEnableVertexAttribArray(0);
+ 
++    /* Coverage-pass VAOs: same interleaved VBOs, read only pos + a_cov. */
++    if (s_cov_prog) {
++        p_glGenVertexArrays(1, &s_cov_vao_geo);
++        p_glBindVertexArray(s_cov_vao_geo);
++        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
++        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)0);
++        p_glEnableVertexAttribArray(0);
++        p_glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(6 * sizeof(float)));
++        p_glEnableVertexAttribArray(1);
++        p_glGenVertexArrays(1, &s_cov_vao_tex);
++        p_glBindVertexArray(s_cov_vao_tex);
++        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
++        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, TEXV * sizeof(float), (void *)0);
++        p_glEnableVertexAttribArray(0);
++        p_glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, TEXV * sizeof(float), (void *)(21 * sizeof(float)));
++        p_glEnableVertexAttribArray(1);
++    }
++
+     p_glGenVertexArrays(1, &s_empty_vao);
+     p_glBindVertexArray(0);
+ 
+@@ -2969,8 +3547,9 @@ static int init_gpu_raster(void) {
+      * widescreen game calls wide_configure + wide_set_target). */
+     for (int i = 0; i < WIDE_MAX_SURF; i++) {
+         s_wide_tex[i] = 0; s_wide_fbo[i] = 0; s_wide_base[i] = -1;
++        s_wide_cov_tex[i] = 0; s_wide_cov_fbo[i] = 0;
+     }
+-    g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cur_base = 0;
++    g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cov_cur = 0; g_wide_cur_base = 0;
+ 
+     s_raster_ok = 1;
+     gl_perf_init();   /* frame_perf GPU/CPU phase timing (no-op if queries absent) */
+@@ -3027,6 +3606,16 @@ int gl_renderer_init_context(SDL_Window *win) {
+                 p_glGetUniformLocation(s_present_prog, "u_sharp_scale");
+             s_present_uSharp =
+                 p_glGetUniformLocation(s_present_prog, "u_sharp");
++            s_present_uCov =
++                p_glGetUniformLocation(s_present_prog, "u_cov");
++            s_present_uGapfill =
++                p_glGetUniformLocation(s_present_prog, "u_gapfill");
++            s_present_uCovrad =
++                p_glGetUniformLocation(s_present_prog, "u_covrad");
++            s_present_uCovdiv =
++                p_glGetUniformLocation(s_present_prog, "u_covdiv");
++            s_present_uGfthr = p_glGetUniformLocation(s_present_prog, "u_gfthr");
++            s_present_uGfsim = p_glGetUniformLocation(s_present_prog, "u_gfsim");
+             s_interp_uPrev = p_glGetUniformLocation(s_interp_prog, "u_prev");
+             s_interp_uCurr = p_glGetUniformLocation(s_interp_prog, "u_curr");
+             s_interp_uAlpha = p_glGetUniformLocation(s_interp_prog, "u_alpha");
+@@ -3375,9 +3964,12 @@ static void wide_free_all(void) {
+         if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
+         if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
+         if (s_wide_rb[i])  { p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0; }
++        if (s_wide_cov_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_cov_fbo[i]); s_wide_cov_fbo[i] = 0; }
++        if (s_wide_cov_tex[i]) { glDeleteTextures(1, &s_wide_cov_tex[i]); s_wide_cov_tex[i] = 0; }
+         s_wide_base[i] = -1;
+     }
+     g_wide_cur = 0;
++    g_wide_cov_cur = 0;
+ }
+ 
+ /* Lazily allocate (or find) the wide FBO+tex for base_x. Returns the FBO id, or
+@@ -3411,6 +4003,24 @@ static GLuint wide_fbo_for(int base_x) {
+             glStencilMask(0xFF);
+             glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++            /* Paired crack-fill coverage surface, same slot/base_x/lifetime.
++             * Optional (s_cov_prog may be 0 if that program failed to build) -
++             * a miss here just means gap-fill stays disabled for this wide
++             * surface, never that the wide surface itself fails. */
++            if (s_cov_prog) {
++                s_wide_cov_tex[i] = make_tex(PSXGL_R8, w / s_cov_div, h / s_cov_div,
++                                             GL_RED, GL_UNSIGNED_BYTE);
++                if (s_wide_cov_tex[i] && !make_fbo(&s_wide_cov_fbo[i], s_wide_cov_tex[i], 0)) {
++                    glDeleteTextures(1, &s_wide_cov_tex[i]); s_wide_cov_tex[i] = 0;
++                    s_wide_cov_fbo[i] = 0;
++                }
++                if (s_wide_cov_fbo[i]) {   /* start fully uncovered */
++                    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_cov_fbo[i]);
++                    glClearColor(0.f, 0.f, 0.f, 1.f);
++                    glClear(GL_COLOR_BUFFER_BIT);
++                    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++                }
++            }
+             s_wide_base[i] = base_x;
+             return s_wide_fbo[i];
+         }
+@@ -3434,16 +4044,19 @@ static void glb_wide_configure(int wide_w, int offset) {
+ 
+ /* Select the wide surface to mirror into for the back buffer at base_x. */
+ static void glb_wide_set_target(int base_x) {
+-    if (!s_raster_ok) { g_wide_cur = 0; return; }
++    if (!s_raster_ok) { g_wide_cur = 0; g_wide_cov_cur = 0; return; }
+     double t0 = cw_ms(); s_cw_wide_sets++;
+     flush_tex_batch();   /* drain into the OLD target before switching */
+     g_wide_cur = wide_fbo_for(base_x);
+     g_wide_cur_base = base_x;
++    g_wide_cov_cur = 0;
++    for (int i = 0; i < WIDE_MAX_SURF; i++)
++        if (g_wide_cur && s_wide_fbo[i] == g_wide_cur) { g_wide_cov_cur = s_wide_cov_fbo[i]; break; }
+     s_cw_wide_ms += cw_ms() - t0;
+ }
+ 
+ /* Stop mirroring (offscreen draws that don't target a framebuffer). */
+-static void glb_wide_disable_target(void) { flush_tex_batch(); g_wide_cur = 0; }
++static void glb_wide_disable_target(void) { flush_tex_batch(); g_wide_cur = 0; g_wide_cov_cur = 0; }
+ 
+ /* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
+  * surface for base_x, so the revealed margins are clean. Mirrors sw_wide_clear:
+@@ -3650,6 +4263,10 @@ typedef struct {
+     double   batches;         /* flush_tex_batch draws this frame              */
+     double   wide_sets;       /* glb_wide_set_target calls this frame          */
+     double   fbo_creates;     /* wide FBO+tex creations this frame             */
++    double   cw_swap_ms;      /* CPU wall blocked in SwapWindow this frame     */
++    double   cw_pack_ms;      /* CPU wall in pack_flush (GPU sync readback)    */
++    double   cw_ensure_ms;    /* CPU wall in ensure_cpu (GPU sync readback)    */
++    double   sync_calls;      /* pack_flush + ensure_cpu invocations           */
+     int      wide;            /* 1 = native-wide (16:9) present, 0 = 4:3       */
+     uint64_t frame;
+ } GlPerfSample;
+@@ -3683,8 +4300,9 @@ static int      s_pf_buf_wide[GLPERF_NBUF];
+ static uint64_t s_pf_buf_frame[GLPERF_NBUF];
+ static uint64_t s_pf_prims_last = 0;
+ static double   s_pf_prims_pending = 0.0;
+-static double   s_pf_cw_pending[5];            /* flush_ms, wide_ms, batches, wide_sets, fbo_creates */
+-static double   s_pf_buf_cw[GLPERF_NBUF][5];
++static double   s_pf_cw_pending[9];            /* flush_ms, wide_ms, batches, wide_sets, fbo_creates,
++                                                * swap_ms, pack_ms, ensure_ms, sync_calls */
++static double   s_pf_buf_cw[GLPERF_NBUF][9];
+ static GlPerfSample s_pf_ring[GLPERF_RING];
+ static uint64_t     s_pf_ring_seq = 0;
+ 
+@@ -3759,7 +4377,13 @@ static void gl_perf_present_enter(void) {
+     s_pf_cw_pending[2] = (double)s_cw_batches;
+     s_pf_cw_pending[3] = (double)s_cw_wide_sets;
+     s_pf_cw_pending[4] = (double)s_cw_fbo_creates;
++    s_pf_cw_pending[5] = s_cw_swap_ms;
++    s_pf_cw_pending[6] = s_cw_pack_ms;
++    s_pf_cw_pending[7] = s_cw_ensure_ms;
++    s_pf_cw_pending[8] = (double)(s_cw_pack_n + s_cw_ensure_n);
+     s_cw_flush_ms = 0.0; s_cw_wide_ms = 0.0;
++    s_cw_swap_ms = 0.0; s_cw_pack_ms = 0.0; s_cw_ensure_ms = 0.0;
++    s_cw_pack_n = 0; s_cw_ensure_n = 0;
+     s_cw_batches = 0; s_cw_wide_sets = 0; s_cw_wide_cfgs = 0;
+     s_cw_wide_clears = 0; s_cw_fbo_creates = 0;
+     if (s_pf_scene_active) { p_glEndQuery(GL_TIME_ELAPSED); s_pf_scene_active = 0; } /* end frame b's scene draws */
+@@ -3774,7 +4398,7 @@ static void gl_perf_present_exit(int wide) {
+     s_pf_buf_total[s_pf_b] = s_pf_total_pending;
+     s_pf_buf_pwall[s_pf_b] = (double)(now - s_pf_enter) * 1000.0 / (double)s_pf_freq;
+     s_pf_buf_prims[s_pf_b] = s_pf_prims_pending;
+-    for (int ci = 0; ci < 5; ci++) s_pf_buf_cw[s_pf_b][ci] = s_pf_cw_pending[ci];
++    for (int ci = 0; ci < 9; ci++) s_pf_buf_cw[s_pf_b][ci] = s_pf_cw_pending[ci];
+     s_pf_buf_wide[s_pf_b]  = wide;
+     s_pf_buf_frame[s_pf_b] = s_pf_count;
+     int rd = (s_pf_b + 1) % GLPERF_NBUF;   /* oldest buffer (frame count+1-NBUF), now done */
+@@ -3802,6 +4426,10 @@ static void gl_perf_present_exit(int wide) {
+         s->batches         = s_pf_buf_cw[rd][2];
+         s->wide_sets       = s_pf_buf_cw[rd][3];
+         s->fbo_creates     = s_pf_buf_cw[rd][4];
++        s->cw_swap_ms      = s_pf_buf_cw[rd][5];
++        s->cw_pack_ms      = s_pf_buf_cw[rd][6];
++        s->cw_ensure_ms    = s_pf_buf_cw[rd][7];
++        s->sync_calls      = s_pf_buf_cw[rd][8];
+         s->wide            = s_pf_buf_wide[rd];
+         s->frame           = s_pf_buf_frame[rd];
+         s_pf_ring_seq++;
+@@ -3824,8 +4452,8 @@ uint64_t gl_renderer_perf_prim_split(double *out_tex_frac) {
+     return s_scene_prims;
+ }
+ 
+-int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
+-    for (int i = 0; i < 18; i++) out[i] = 0.0;
++int gl_renderer_perf_aggregate(int wide_filter, double out[22]) {
++    for (int i = 0; i < 22; i++) out[i] = 0.0;
+     if (!s_pf_on) return 0;
+     int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
+     uint64_t start = s_pf_ring_seq - (uint64_t)navail;
+@@ -3847,11 +4475,16 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
+         out[15] += s->batches;
+         out[16] += s->wide_sets;
+         out[17] += s->fbo_creates;
++        out[18] += s->cw_swap_ms;
++        out[19] += s->cw_pack_ms;
++        out[20] += s->cw_ensure_ms;
++        out[21] += s->sync_calls;
+         n++;
+     }
+     if (n) {
+         out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; out[10]/=n; out[12]/=n;
+         out[13]/=n; out[14]/=n; out[15]/=n; out[16]/=n; out[17]/=n;
++        out[18]/=n; out[19]/=n; out[20]/=n; out[21]/=n;
+     }
+     out[0] = (double)n;
+     return n;
+@@ -4120,6 +4753,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+ 
+ /* Composite host toast + volume bar into the default framebuffer, then swap. */
+ static void gl_swap_with_osd(void) {
++    cov_ord_frame();   /* frame boundary: restart the coverage draw ordinal */
+     if (s_present_prog && s_ctx) {
+         int ww = 0, wh = 0;
+         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+@@ -4191,7 +4825,14 @@ static void gl_swap_with_osd(void) {
+             present_shot_done(wrote);
+         }
+     }
+-    SDL_GL_SwapWindow(s_win);
++    {
++        /* Wall time blocked inside the swap: under driver vsync with a deep
++         * GPU queue this is where a CPU-side stall surfaces (frame_perf
++         * swap_ms_avg — the FMV/menu slowdown suspect list). */
++        double cw_t0 = cw_ms();
++        SDL_GL_SwapWindow(s_win);
++        s_cw_swap_ms += cw_ms() - cw_t0;
++    }
+ }
+ 
+ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+@@ -4206,6 +4847,44 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+     p_glUseProgram(s_present_prog);
+     p_glUniform1i(s_present_uTex, 0);
++    /* PGXP crack fill: active when presenting either the canonical hires scene
++     * surface OR the active native-wide mirror surface — each maps 1:1 to its
++     * OWN coverage texture (s_cov_tex for s_hr_tex; s_wide_cov_tex[i] for
++     * s_wide_tex[i], allocated at identical dimensions in wide_fbo_for). Any
++     * other tex (bezel, hold-last, letterbox backdrop, ...) gets no coverage
++     * and gf stays 0. u_covrad ~ one native pixel: the widest crack the
++     * correction itself can open. */
++    if (s_present_uGapfill >= 0) {
++        GLuint cov_tex = 0;
++        if (tex == s_hr_tex) {
++            cov_tex = s_cov_tex;
++        } else {
++            for (int i = 0; i < WIDE_MAX_SURF; i++)
++                if (s_wide_tex[i] && s_wide_tex[i] == tex) { cov_tex = s_wide_cov_tex[i]; break; }
++        }
++        /* 0 off, 1 binary-coverage fill, 2 visualize, 3 draw-order fill -
++         * the shader now implements 3 directly rather than borrowing 1. */
++        int gf = (cov_tex && s_gapfill && s_scale > 1) ? s_gapfill : 0;
++        /* Why gap-fill did or did not run on the LAST scene present. Every
++         * previous silent drop in this subsystem cost a full round trip to
++         * discover; this makes the decision readable instead of inferred.
++         * bit0 coverage texture exists, bit1 this present had a matching
++         * coverage surface, bit2 scale>1, bit3 mode!=0. */
++        s_gf_last = (s_cov_tex ? 1 : 0) | (cov_tex ? 2 : 0) |
++                    (s_scale > 1 ? 4 : 0) | (s_gapfill ? 8 : 0);
++        s_gf_last_mode = gf;
++        p_glUniform1i(s_present_uGapfill, gf);
++        if (gf) {
++            p_glActiveTexture(PSXGL_TEXTURE0 + 1);
++            glBindTexture(GL_TEXTURE_2D, cov_tex);
++            p_glActiveTexture(PSXGL_TEXTURE0);
++            p_glUniform1i(s_present_uCov, 1);
++            p_glUniform1i(s_present_uCovrad, s_gf_rad > 0 ? s_gf_rad : s_scale + 2);
++            p_glUniform1i(s_present_uCovdiv, s_cov_div);
++            p_glUniform1f(s_present_uGfthr, s_gf_thr);
++            p_glUniform1f(s_present_uGfsim, s_gf_sim);
++        }
++    }
+     /* The rasterized path already renders at the internal scale, so it has no
+      * low-res source to reconstruct — keep the plain sample. FXAA (postfx 1)
+      * instead runs the post-AA branch over the source texels; its fractional
+@@ -4280,6 +4959,7 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
+     glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+     p_glUseProgram(s_present_prog);
+     p_glUniform1i(s_present_uTex, 0);
++    if (s_present_uGapfill >= 0) p_glUniform1i(s_present_uGapfill, 0);
+     p_glUniform4f(s_present_uUvRect, 0.0f, 0.0f, 1.0f, 1.0f);
+     p_glBindVertexArray(s_present_vao);
+     glDrawArrays(GL_TRIANGLES, 0, 3);
+@@ -4457,6 +5137,31 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
+                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++
++    /* Coverage rides the same fast-path shortcut: the wide surface's centre
++     * columns are, by construction, an exact copy of canonical, so their PGXP
++     * coverage is too. The per-prim mirror above (cov_wide_pass_draw's
++     * callers) skips centre-only batches entirely — without this blit the
++     * coverage centre would read back as permanently uncovered even though
++     * the color centre is correct, and gap-fill would incorrectly fill real
++     * (non-crack) content there. */
++    if (s_cov_fbo) {
++        GLuint wcov = 0;
++        for (int i = 0; i < WIDE_MAX_SURF; i++)
++            if (s_wide_fbo[i] == wide_fbo) { wcov = s_wide_cov_fbo[i]; break; }
++        if (wcov) {
++            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_cov_fbo);
++            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wcov);
++            glDisable(GL_SCISSOR_TEST);
++            p_glBlitFramebuffer(base_x * S, 0,
++                                (base_x + native_w) * S, VRAM_H * S,
++                                g_wide_off * S, 0,
++                                (g_wide_off + native_w) * S, VRAM_H * S,
++                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
++            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
++        }
++    }
+ }
+ 
+ /* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
+@@ -4539,6 +5244,8 @@ static const GpuRenderBackend GL_BACKEND = {
+     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
+     .set_precise_triangle = glb_set_precise_triangle,
+     .set_perspective_triangle = glb_set_perspective_triangle,
++    .set_depth_triangle = glb_set_depth_triangle,
++    .depth_clear = glb_depth_clear,
+     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
+     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
+     .draw_textured_triangle = glb_draw_textured_triangle,
+diff --git a/runtime/src/gpu_render.c b/runtime/src/gpu_render.c
+index c833f491..02e5ac1d 100644
+--- a/runtime/src/gpu_render.c
++++ b/runtime/src/gpu_render.c
+@@ -112,6 +112,14 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+     if (g_b->set_perspective_triangle)
+         g_b->set_perspective_triangle(enabled, q0, q1, q2);
+ }
++void gr_set_depth_triangle(int enabled, float z0, float z1, float z2) {
++    if (g_b->set_depth_triangle)
++        g_b->set_depth_triangle(enabled, z0, z1, z2);
++}
++void gr_depth_clear(void) {
++    if (g_b->depth_clear)
++        g_b->depth_clear();
++}
+ void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
+ void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
+ void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
+diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
+index d0d9eb72..f70bbee7 100644
+--- a/runtime/src/gte.cpp
++++ b/runtime/src/gte.cpp
+@@ -3,6 +3,7 @@
+ #include "nd_intro_ot.h"
+ #include "pgxp.h"
+ #include <algorithm>
++#include <cmath>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+@@ -10,6 +11,22 @@
+ extern "C" uint32_t psx_read_word(uint32_t addr);
+ extern "C" int gpu_ws_precise_nclip_enabled(void);
+ 
++/* PGXP culling correction (DuckStation gpu_pgxp_culling): compute NCLIP's
++ * winding cross product on the full-precision projections whenever the
++ * shadows cover all three SXY entries. Armed by the builtin PGXP mod
++ * (option default on, DS parity); the widescreen prepass gate above keeps
++ * its own independent arming. */
++static int s_pgxp_culling = 0;
++extern "C" void gte_pgxp_culling_set(int on) { s_pgxp_culling = on ? 1 : 0; }
++extern "C" int gte_pgxp_culling_enabled(void) { return s_pgxp_culling; }
++
++/* Preserve-projection precision (DS gpu_pgxp_preserve_proj_fp): float mirror
++ * of the projection feeds the PGXP shadow. Ships on (GT2-community 4K
++ * setting); debug-tunable for A/B via the "pgxp" command. */
++static int s_preserve_proj = 1;
++extern "C" void gte_preserve_proj_set(int on) { s_preserve_proj = on ? 1 : 0; }
++extern "C" int gte_preserve_proj_enabled(void) { return s_preserve_proj; }
++
+ namespace PSXRecomp {
+ namespace GTE {
+ 
+@@ -214,9 +231,22 @@ struct GeomVertex {
+     int32_t x16, y16;
+     uint32_t generation;
+     uint32_t ambiguous;   /* two DIFFERENT sub-pixel values seen at this pixel */
++    uint32_t seq;         /* projection ordinal when this entry was written    */
+ };
+ static GeomVertex *s_geom_cache = nullptr;
+ static uint32_t s_geom_generation = 1;
++/* Monotonic count of GTE projections recorded this timeline. REDRIVER2's
++ * PsyCross stamps every primitive with the GTE ring index live at addPrim and
++ * resolves its corners by scanning from that hint (PSyX_GPU.cpp's
++ * ApplyVertexPGXP(..., gteidx, -2/-1/0) - the last three RTPS results before
++ * the packet ARE the triangle's corners). We cannot copy their real mechanism
++ * (they widened the game's own packet structs to carry half-float coordinates,
++ * which a static recompilation of an unmodified PS-EXE cannot do), but the
++ * ordering signal itself transfers: a primitive submitted while the projection
++ * counter is advancing is 3D geometry, and one submitted with the counter
++ * static is genuinely 2D. That distinction is what separates a coverage hole
++ * worth fixing from a correctly-native HUD element. */
++static uint32_t s_geom_seq = 0;
+ static int s_geom_enabled = 0;
+ static uint32_t s_geom_hits = 0;
+ /* Lookup outcome census — this is what says whether coverage is limited by the
+@@ -369,6 +399,26 @@ extern "C" int gte_geometry_correction_lookup(uint32_t packed,
+     return 1;
+ }
+ 
++/* Ambiguity-tolerant variant for MIXED-PRIMITIVE COMPLETION only. An
++ * ambiguous entry means several projections rounded to this same integer
++ * pixel with different fractions - for completing a corner whose neighbours
++ * are already tracked, any of those fractions lies within the same pixel as
++ * the true one (error < 1px, and the sub-pixel crack it closes is itself
++ * < 1px), while refusing keeps the full crack. The general correction path
++ * must keep the strict gate; this is only sound because the caller already
++ * proved the primitive is 3D via its tracked corners. */
++extern "C" int gte_geometry_correction_lookup_any(uint32_t packed,
++                                                  int32_t *x16, int32_t *y16) {
++    if (s_speculative_depth != 0 || !s_geom_enabled || !s_geom_cache) return 0;
++    int64_t slot = geom_slot(packed);
++    if (slot < 0) return 0;
++    const GeomVertex &entry = s_geom_cache[slot];
++    if (entry.generation != s_geom_generation) return 0;
++    if (x16) *x16 = entry.x16;
++    if (y16) *y16 = entry.y16;
++    return 1;
++}
++
+ static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
+     if (s_speculative_depth != 0 || s_gte_replay_sandbox || !s_geom_enabled ||
+         !s_geom_cache) return;
+@@ -391,8 +441,13 @@ static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
+     entry.y16 = (int32_t)y16;
+     entry.ambiguous = 0;
+     entry.generation = s_geom_generation;
++    entry.seq = ++s_geom_seq;
+ }
+ 
++/* Current projection ordinal (see s_geom_seq). The GPU side samples this at
++ * primitive submission to tell 3D-with-failed-tracking from genuine 2D. */
++extern "C" uint32_t gte_geometry_seq(void) { return s_geom_seq; }
++
+ // Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
+ // (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
+ // infinity: squashing it toward centre leaves its geometry short of the
+@@ -845,6 +900,29 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+     // Step 3: Perspective division
+     int32_t h_div_sz = gte_divide(gte->H, gte->SZ[3], gte->FLAG);
+ 
++    /* Preserve-projection precision (DuckStation gpu_pgxp_preserve_proj_fp,
++     * the setting the GT2 community runs at 4K): the faithful pipeline
++     * truncates IR1/IR2 to 16-bit integers and divides through the UNR
++     * reciprocal, so the PGXP shadow inherits only post-truncation
++     * fractions. This float mirror recomputes the projection from the raw
++     * MAC accumulators with an exact divide and feeds ONLY the shadow -
++     * the registers the game reads stay bit-exact. Guarded below by
++     * integer-pixel agreement with the faithful result so the shadow can
++     * never describe a different pixel than the packet word. */
++    double p_ir1 = (double)mac1 / (double)(int64_t)(1ll << shift);
++    double p_ir2 = (double)mac2 / (double)(int64_t)(1ll << shift);
++    double p_sz3 = (double)mac3 / 4096.0;
++    {
++        const double plo = lm ? 0.0 : -32768.0;
++        if (p_ir1 < plo) p_ir1 = plo; else if (p_ir1 > 32767.0) p_ir1 = 32767.0;
++        if (p_ir2 < plo) p_ir2 = plo; else if (p_ir2 > 32767.0) p_ir2 = 32767.0;
++        if (p_sz3 < 0.0) p_sz3 = 0.0; else if (p_sz3 > 65535.0) p_sz3 = 65535.0;
++    }
++    const double p_hdz = 65536.0 * (double)gte->H /
++        ((p_sz3 > (double)gte->H / 2.0) ? p_sz3 : (double)gte->H / 2.0);
++    double p_xterm = p_ir1 * p_hdz;
++    const double p_yterm = p_ir2 * p_hdz;
++
+     // Step 4: Project to screen coordinates. Squash X only when configured AND
+     // this frame is being stretched — never on a 4:3-presented frame (FMV /
+     // full-2D screen), so content and present stay locked.
+@@ -869,8 +947,10 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+             if (!s_gte_replay_sandbox) s_ws_sz_far++;
+         }
+     }
+-    if (do_squash)
++    if (do_squash) {
+         xterm = xterm * s_ws_xnum / s_ws_xden;
++        p_xterm = p_xterm * (double)s_ws_xnum / (double)s_ws_xden;
++    }
+     // Native-wide dome expansion remains a diagnostic-only depth probe.
+     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
+              !gpu_ws_present_native_43()) {
+@@ -882,6 +962,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+         }
+         if (sz >= s_ws_far_threshold) {
+             xterm = xterm * s_ws_dome_num / s_ws_dome_den;
++            p_xterm = p_xterm * (double)s_ws_dome_num / (double)s_ws_dome_den;
+             if (!s_gte_replay_sandbox) s_ws_sz_far++;
+         }
+     }
+@@ -895,16 +976,24 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr)
+     int64_t sx = sx16 >> 16;
+     int64_t sy = sy16 >> 16;
+     gte->push_sxy(sx, sy);
++    /* Preserved-precision shadow, iff it lands on the same integer pixel as
++     * the faithful math (otherwise the resolve would reject it anyway). */
++    int64_t shx16 = sx16, shy16 = sy16;
++    if (s_preserve_proj) {
++        const int64_t ppx = (int64_t)llrint((double)gte->OFX + p_xterm);
++        const int64_t ppy = (int64_t)llrint((double)gte->OFY + p_yterm);
++        if ((ppx >> 16) == sx && (ppy >> 16) == sy) { shx16 = ppx; shy16 = ppy; }
++    }
+     if (!s_gte_replay_sandbox) {
+         /* Bound the 16.16 transport so an extreme projection cannot wrap an
+          * int32 and masquerade as a valid on-screen shadow. */
+         const int64_t kLim = (int64_t)4096 << 16;
+-        int64_t cx16 = sx16 < -kLim ? -kLim : (sx16 > kLim - 1 ? kLim - 1 : sx16);
+-        int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
++        int64_t cx16 = shx16 < -kLim ? -kLim : (shx16 > kLim - 1 ? kLim - 1 : shx16);
++        int64_t cy16 = shy16 < -kLim ? -kLim : (shy16 > kLim - 1 ? kLim - 1 : shy16);
+         pgxp_gte_push_sxy((int32_t)cx16, (int32_t)cy16, gte->SZ[3],
+                           (uint32_t)gte->SXY[2]);
+     }
+-    geom_note((uint32_t)gte->SXY[2], sx16, sy16);
++    geom_note((uint32_t)gte->SXY[2], shx16, shy16);
+ 
+     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
+     if (setMac0) {
+@@ -960,16 +1049,63 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
+     int32_t sy1 = static_cast<int16_t>(gte->SXY[1] >> 16);
+     int32_t sx2 = static_cast<int16_t>(gte->SXY[2] & 0xFFFF);
+     int32_t sy2 = static_cast<int16_t>(gte->SXY[2] >> 16);
+-    int64_t mac0 = (int64_t)sx0 * (sy1 - sy2) +
+-                   (int64_t)sx1 * (sy2 - sy0) +
+-                   (int64_t)sx2 * (sy0 - sy1);
++    int32_t px0 = 0, py0 = 0, px1 = 0, py1 = 0, px2 = 0, py2 = 0;
++    int64_t mac0;
++    if (gte_pgxp_culling_enabled() &&
++        pgxp_get_gte_sxyz_checked(0, gte->SXY[0], &px0, &py0) &&
++        pgxp_get_gte_sxyz_checked(1, gte->SXY[1], &px1, &py1) &&
++        pgxp_get_gte_sxyz_checked(2, gte->SXY[2], &px2, &py2)) {
++        /* Culling correction (DuckStation NCLIP_PGXP): the winding cross
++         * product on the FULL-precision projections, so near-edge-on
++         * polygons stop dropping out when integer rounding flips the sign.
++         * Computed in double on the 16.16 shadows.
++         *
++         * THE FAR-OBJECT FLICKER ("z-fighting" on distant billboards, trees
++         * and guardrail, gone when the object gets close): a FAR polygon's
++         * precise winding area is FRACTIONAL - the whole polygon spans a few
++         * pixels, so the cross product lands in (0,1). llround() sent
++         * 0.1..0.49 to ZERO, the game's `nclip > 0` visibility test failed,
++         * and the polygon vanished for that frame - reappearing the next
++         * frame when the area drifted past 0.5. Integer NCLIP can never do
++         * this (a nonzero integer cross is >= 1), so only the corrected path
++         * flickered, per frame, exactly at long range. DuckStation guards
++         * this in GTE_NCLIP: a magnitude in (0.1, 1.0) is bumped away from
++         * zero by 1.0 before the integer conversion, and the conversion
++         * TRUNCATES. Match it exactly. Depth-validated shadows only
++         * (pgxp_get_gte_sxyz_checked): DS refuses accurate clipping for
++         * game-constructed values with no Z; so do we. */
++        const double x0 = px0 / 65536.0, y0 = py0 / 65536.0;
++        const double x1 = px1 / 65536.0, y1 = py1 / 65536.0;
++        const double x2 = px2 / 65536.0, y2 = py2 / 65536.0;
++        double cross =
++            x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1);
++        const double cross_abs = (cross < 0.0) ? -cross : cross;
++        /* DuckStation GTE_NCLIP semantics, exactly: a magnitude in (0.1,1.0)
++         * is bumped away from zero so the truncating integer conversion
++         * cannot flip a genuine near-degenerate orientation to 0. No further
++         * arbitration: an earlier attempt to fall back to the integer winding
++         * for small areas suppressed the culling-correction rescue itself,
++         * and crest-of-hill road polygons (edge-on, tiny precise area)
++         * dropped out - sea showing through the track. DS draws them; so do
++         * we. */
++        if (cross_abs > 0.1 && cross_abs < 1.0)
++            cross += (cross < 0.0) ? -1.0 : 1.0;
++        mac0 = (int64_t)cross;
++        g_nclip_precise++;
++    } else {
++        if (gte_pgxp_culling_enabled())
++            g_nclip_gated++;   /* correction wanted but shadows not depth-valid */
++        mac0 = (int64_t)sx0 * (sy1 - sy2) +
++               (int64_t)sx1 * (sy2 - sy0) +
++               (int64_t)sx2 * (sy0 - sy1);
++    }
+     gte->check_mac0_overflow(mac0);
+     int32_t out = static_cast<int32_t>(mac0);
+     s_nclip_last_native = out;
+     s_nclip_last_precise_valid = false;
+-    /* Compute an exact 16.16 determinant for configured branch consumers, but
+-     * preserve native guest-visible MAC0 for every architectural reader. */
+-    int32_t px0, py0, px1, py1, px2, py2;
++    /* Compute an exact 16.16 determinant for configured branch consumers
++     * (title-scoped widescreen exact NCLIP), but preserve guest-visible MAC0
++     * for every architectural reader. */
+     if (gpu_ws_precise_nclip_enabled() &&
+         !s_gte_replay_sandbox && s_speculative_depth == 0 &&
+         pgxp_get_gte_sxy_checked(0, gte->SXY[0], 1, &px0, &py0) &&
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index d20a8f12..07f8c5b5 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -451,6 +451,41 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size)
+     }
+ }
+ 
++/* A compiled-text range whose LIVE bytes diverged from the EXE reference image
++ * is, by definition, runtime-loaded code — an overlay the game copied over its
++ * own boot text. When that copy arrives by CD DMA the pages are already dirty
++ * (dirty_ram_mark_executable_range on the transfer), and the overlay machinery
++ * works: overlay_cache_window_contains() admits the PCs for capture and lazy
++ * shard load, and try_load_region's dirty-run walkback recovers the region
++ * base. But a copy by plain CPU stores (guest memcpy from a CD read buffer —
++ * GT2's FMV/menu player lands at 0x10000 this way) only marks the text-guard
++ * bitmaps: dirty_ram_mark_kernel_write() returns early above the kernel
++ * window, so the pages never go dirty, the window test rejects every PC, no
++ * shard ever loads or captures, and the overlaid code interprets forever
++ * (measured: the intro FMV ran the guest at ~78% speed, ~48% of wall time in
++ * the interpreter, all of it this player's inner loop). Close the gap at the
++ * point of PROOF: a failed text-divergence validation IS the evidence the
++ * page holds overlay code, so mark the diverged range's pages dirty here.
++ * Pages whose writes still match the reference are never marked (a data write
++ * that differs marks text_modified only, exactly as before); a page where the
++ * live bytes later re-match the image (savestate restore) still runs static —
++ * the validators compare actual bytes and the dirty bit only widens the
++ * overlay window. Mark-once: skip when every page is already dirty so the
++ * code-generation counter stays stable for the overlay validation fastpath. */
++static void text_diverged_mark_overlay(uint32_t phys, uint32_t len) {
++    if (len == 0 || phys >= RAM_SIZE) return;
++    uint32_t end = phys + len - 1u;
++    if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
++    uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
++    uint32_t last_page  = end  >> DIRTY_RAM_PAGE_SHIFT;
++    for (uint32_t page = first_page; page <= last_page; page++) {
++        if (!(dirty_ram_bitmap[page >> 5] & (1u << (page & 31u)))) {
++            dirty_ram_mark_executable_range(phys, len);
++            return;
++        }
++    }
++}
++
+ int dirty_ram_text_native_ok(uint32_t phys) {
+     if (!text_ref_image || phys < text_ref_lo || phys >= text_ref_hi)
+         return !dirty_ram_is_dirty(phys);
+@@ -481,6 +516,7 @@ int dirty_ram_text_native_ok(uint32_t phys) {
+     text_diverged_bitmap[page >> 5] |= bit;
+     g_text_diverged_pages++;
+     g_text_native_blocked++;
++    text_diverged_mark_overlay(phys, n);
+     return 0;
+ }
+ 
+@@ -596,6 +632,7 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
+             /* Do not sticky-poison the page. Another entry on the same page
+              * can still match all of its own emitted ranges. */
+             g_text_native_blocked++;
++            text_diverged_mark_overlay(phys, len);
+             return 0;
+         }
+     }
+diff --git a/runtime/src/mod_builtin_pgxp.c b/runtime/src/mod_builtin_pgxp.c
+index 77447456..3b250135 100644
+--- a/runtime/src/mod_builtin_pgxp.c
++++ b/runtime/src/mod_builtin_pgxp.c
+@@ -5,8 +5,8 @@
+  * the emulated GTE/GPU pair, not of any particular disc, so it ships here and
+  * mods/builtin/packages/psx.enhancement.pgxp targets game_id "*". Default off
+  * (the faithful floor, ENHANCEMENTS.md G1.9); enabling arms the value-
+- * propagation engine (pgxp.cpp) with the user-validated defaults — tolerance
+- * clamp 0.5px, cpu-mode per the mod option.
++ * propagation engine (pgxp.cpp) with the user-chosen options: tolerance
++ * (default: unclamped, DuckStation parity), cpu-mode, and the depth buffer.
+  *
+  * Coverage note: the engine reaches near-total dataflow coverage on a binary
+  * compiled with the PGXP hook variant (-DPSX_PGXP=1, PSX_PGXP_VARIANT); on a
+@@ -17,14 +17,17 @@
+ #include "mod_plugins.h"
+ #include "pgxp.h"
+ 
+-#include <stdlib.h>
+-#include <string.h>
+-
+-#define PKG_PGXP "psx.enhancement.pgxp"
++#include <stdint.h>
+ 
+ /* gte.cpp / gpu.c — the two correction toggles this mod arms. */
+ extern void gte_geometry_correction_set(int enabled);
+ extern void gpu_texture_correction_set(int enabled);
++extern void gpu_pgxp_depth_set(int enabled);
++extern void gpu_pgxp_depth_clear_threshold_set(uint32_t sz);
++extern void gpu_pgxp_depth_transparent_set(int on);
++extern void gpu_pgxp_disable_2d_set(int on);
++extern void gpu_pgxp_color_correction_set(int on);
++extern void gte_pgxp_culling_set(int on);
+ extern void pgxp_set_tolerance(float pixels);
+ 
+ /* Read by main.cpp's post-activation [video] settle: when the player chose a
+@@ -32,21 +35,6 @@ extern void pgxp_set_tolerance(float pixels);
+  * mod-owned rule as the correction toggles). */
+ int g_mod_owns_pgxp_tolerance = 0;
+ 
+-static int pgxp_option_flag(const char* feature, const char* id) {
+-    char text[16] = "";
+-    return psx_mod_option_value(PKG_PGXP, feature, id, text, sizeof text) &&
+-           strcmp(text, "true") == 0;
+-}
+-
+-/* Missing/unset option (older saved state) => fall back to enabled: the
+- * feature's historical behavior armed both corrections unconditionally. */
+-static int pgxp_option_flag_default_on(const char* feature, const char* id) {
+-    char text[16] = "";
+-    if (!psx_mod_option_value(PKG_PGXP, feature, id, text, sizeof text))
+-        return 1;
+-    return strcmp(text, "false") != 0;
+-}
+-
+ /* Read by main.cpp's post-activation [video] settle: once this mod has armed
+  * the correction engine, the config/launcher values must not clobber it
+  * (mirror of the mod-owned display-aspect guard). */
+@@ -54,18 +42,33 @@ int g_mod_owns_pgxp = 0;
+ 
+ static void builtin_pgxp_activate(void) {
+     g_mod_owns_pgxp = 1;
+-    gte_geometry_correction_set(pgxp_option_flag_default_on("pgxp", "geometry"));
+-    gpu_texture_correction_set(
+-        pgxp_option_flag_default_on("pgxp", "textures"));  /* arms the engine */
+-    pgxp_set_cpu_mode(pgxp_option_flag("pgxp", "cpu_mode"));
+-    {
+-        char text[16] = "";
+-        if (psx_mod_option_value(PKG_PGXP, "pgxp", "tolerance",
+-                                 text, sizeof text) && text[0]) {
+-            pgxp_set_tolerance((float)atof(text));
+-            g_mod_owns_pgxp_tolerance = 1;
+-        }
+-    }
++    /* Single-toggle feature: the launcher exposes only the master switch,
++     * and this activation IS the shipped configuration - pre-tuned and
++     * lab-verified for the target title (options and stale saved option
++     * values are deliberately not consulted, so removed knobs cannot
++     * resurrect through old state files). Everything remains live-tunable
++     * through the debug server "pgxp" command for diagnostics.
++     *   geometry + textures + culling: on (the point of the feature)
++     *   tolerance: unlimited (engine default; census showed 0.1 rejected
++     *     valid corrections asymmetrically and opened seams)
++     *   depth buffer: off (measured 12x seam-pinhole amplification and
++     *     coplanar decal drops on this title - DuckStation ships it off
++     *     for the same reason)
++     *   vertex cache: off (mis-corrects 2D backgrounds sharing a pixel
++     *     with 3D geometry - measured skybox tile gaps)
++     *   CPU mode / perspective colors / disable-2D / transparent depth:
++     *     off (measured inert or not applicable here) */
++    gte_geometry_correction_set(1);
++    gpu_texture_correction_set(1);
++    gte_pgxp_culling_set(1);
++    gpu_pgxp_depth_set(0);
++    pgxp_set_cpu_mode(0);
++    pgxp_set_vertex_cache(0);
++    gpu_pgxp_color_correction_set(0);
++    gpu_pgxp_disable_2d_set(0);
++    gpu_pgxp_depth_transparent_set(0);
++    gpu_pgxp_depth_clear_threshold_set(4096);
++    g_mod_owns_pgxp_tolerance = 1;   /* engine default (-1) is the choice */
+ }
+ 
+ PSX_MOD_CONSTRUCTOR(psx_register_builtin_pgxp_plugin) {
+diff --git a/runtime/src/mod_packages.cpp b/runtime/src/mod_packages.cpp
+index e9292e2e..562c9ab5 100644
+--- a/runtime/src/mod_packages.cpp
++++ b/runtime/src/mod_packages.cpp
+@@ -689,6 +689,7 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
+         const auto sit = selections.find(package->id);
+         for (const ModFeature& feature : package->features) {
+             bool enabled = feature.default_enabled;
++            if (feature.hidden) enabled = true;   /* not user-controllable */
+             const std::map<std::string, std::string>* values = nullptr;
+             if (sit != selections.end()) {
+                 if (feature.legacy) {
+@@ -805,6 +806,7 @@ const ModFeatureSelection* find_feature_selection(const ModPackage& package,
+ 
+ bool is_feature_enabled(const ModPackage& package, const ModSelection& selection,
+                         const ModFeature& feature) {
++    if (feature.hidden) return true;          /* ships always-on */
+     if (feature.legacy) return selection.enabled;
+     const ModFeatureSelection* selected =
+         find_feature_selection(package, selection, feature.id);
+@@ -1573,6 +1575,7 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
+                 feature.default_enabled =
+                     toml::find_or<bool>(v, "default_enabled", false);
+                 feature.hidden = toml::find_or<bool>(v, "hidden", false);
++                if (feature.hidden) feature.default_enabled = true;
+                 if (!valid_id(feature.id) ||
+                     !feature_ids.insert(feature.id).second)
+                     throw std::runtime_error("invalid or duplicate feature id");
+diff --git a/runtime/src/mod_runtime.cpp b/runtime/src/mod_runtime.cpp
+index e481779f..0171550b 100644
+--- a/runtime/src/mod_runtime.cpp
++++ b/runtime/src/mod_runtime.cpp
+@@ -679,6 +679,7 @@ bool provider_feature_at(int index, const ModPackage*& package,
+         const ModPackage* selected = selected_package(package_id);
+         if (!selected) continue;
+         for (const ModFeature& candidate : selected->features) {
++            if (candidate.hidden) continue;
+             if (index-- == 0) {
+                 package = selected;
+                 feature = &candidate;
+@@ -711,7 +712,9 @@ int provider_feature_count(void*) {
+     for (const auto& [package_id, versions] : state().manager.packages()) {
+         (void)versions;
+         const ModPackage* package = selected_package(package_id);
+-        if (package) count += (int)package->features.size();
++        if (!package) continue;
++        for (const ModFeature& feature : package->features)
++            if (!feature.hidden) count++;     /* hidden: ships always-on, no UI */
+     }
+     return count;
+ }
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index d89cd9c4..776b2297 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -75,7 +75,10 @@ static PGXPValue  s_gte[32];                  /* GTE data registers           */
+ static uint32_t s_gen = 1;
+ static int      s_enabled = 0;
+ static int      s_cpu_mode = 0;
+-static float    s_tolerance = 0.5f;   /* user-validated seam clamp (G1.10) */
++static float    s_tolerance = -1.0f;  /* unclamped (DuckStation default); the
++                                         * launcher no longer exposes tolerance,
++                                         * so the engine default IS the shipped
++                                         * value (debug-tunable via "pgxp") */
+ static uint32_t s_suppress = 0;
+ static int      s_deferred_invalidate = 0;
+ 
+@@ -91,7 +94,11 @@ static PGXPStats s_stats;
+ /* Lifecycle                                                                  */
+ /* ------------------------------------------------------------------------- */
+ 
++static uint32_t s_invalidate_calls = 0;
++extern "C" uint32_t pgxp_generation(void) { return s_gen; }
++extern "C" uint32_t pgxp_invalidate_calls(void) { return s_invalidate_calls; }
+ extern "C" void pgxp_invalidate_all(void) {
++    s_invalidate_calls++;
+     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
+     if (++s_gen == 0) {
+         /* generation wrapped: physically clear so stale slots can't revive */
+@@ -128,6 +135,12 @@ extern "C" int  pgxp_cpu_mode(void) { return s_cpu_mode; }
+ extern "C" void  pgxp_set_tolerance(float pixels) { s_tolerance = pixels; }
+ extern "C" float pgxp_tolerance(void) { return s_tolerance; }
+ 
++/* DuckStation gpu_pgxp_vertex_cache (default off): admit the screen-position-
++ * keyed fallback tier as a position source. See pgxp_get_precise_vertex. */
++static int s_vertex_cache = 0;
++extern "C" void pgxp_set_vertex_cache(int enabled) { s_vertex_cache = enabled ? 1 : 0; }
++extern "C" int  pgxp_vertex_cache(void) { return s_vertex_cache; }
++
+ extern "C" void pgxp_suppress_begin(void) {
+     ++s_suppress;
+     recompute_active();
+@@ -250,6 +263,51 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
+     }
+ }
+ 
++/* Debug writer-trap: record every hook that touches a watched RAM word so a
++ * missing shadow names its writer (or proves no hook ever fired). */
++extern "C" uint32_t g_debug_last_store_pc;
++typedef struct { uint32_t pc, instr, value; uint8_t kind; uint32_t frame;
++                 uint32_t src_flags, src_live, src_value; } PgxpTrapHit;
++static uint32_t s_trap_addr = 0;
++static PgxpTrapHit s_trap_ring[16];
++static int s_trap_n = 0;
++extern "C" uint64_t debug_server_frame_count(void);
++static inline void trap_note2(uint32_t addr, uint32_t instr, uint32_t value,
++                              uint8_t kind, uint32_t sflags, uint32_t slive,
++                              uint32_t svalue) {
++    if (!s_trap_addr || (addr & 0x1FFFFFFCu) != (s_trap_addr & 0x1FFFFFFCu)) return;
++    PgxpTrapHit *h = &s_trap_ring[s_trap_n & 15];
++    s_trap_n++;
++    h->pc = g_debug_last_store_pc;
++    h->instr = instr;
++    h->value = value;
++    h->kind = kind;   /* 1=sw 2=sh 3=sb 4=swc2 5=swl/swr */
++    h->frame = (uint32_t)debug_server_frame_count();
++    h->src_flags = sflags; h->src_live = slive; h->src_value = svalue;
++}
++static inline void trap_note(uint32_t addr, uint32_t instr, uint32_t value,
++                             uint8_t kind) {
++    trap_note2(addr, instr, value, kind, 0, 0, 0);
++}
++extern "C" void pgxp_trap_set(uint32_t addr) { s_trap_addr = addr; s_trap_n = 0; }
++extern "C" int pgxp_trap_read(void *out, int max) {
++    int n = s_trap_n < 16 ? s_trap_n : 16;
++    if (n > max) n = max;
++    __builtin_memcpy(out, s_trap_ring, (size_t)n * sizeof(PgxpTrapHit));
++    return n;
++}
++extern "C" int pgxp_trap_total(void) { return s_trap_n; }
++/* Shadow probe: current tracker state for a RAM word. */
++extern "C" int pgxp_probe(uint32_t addr, uint32_t *flags, uint32_t *value,
++                          int32_t *x16, int32_t *y16, uint32_t *z, int *live) {
++    PGXPValue *pv = pgxp_ptr(addr);
++    if (!pv) return 0;
++    *live = (pv->gen == s_gen);
++    *flags = pv->flags; *value = pv->value;
++    *x16 = pv->x16; *y16 = pv->y16; *z = pv->z;
++    return 1;
++}
++
+ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+                                uint32_t addr, uint32_t value) {
+     (void)cpu;
+@@ -261,6 +319,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+ 
+     switch (f_op(instr)) {
+     case 0x2B: {                               /* SW                          */
++        trap_note(addr, instr, value, 1);
+         if (src && src->gen == s_gen) {
+             pv_validate(src, value);
+             *dst = *src;
+@@ -270,6 +329,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+         return;
+     }
+     case 0x29: {                               /* SH                          */
++        trap_note(addr, instr, value, 2);
+         int hi_half = (addr >> 1) & 1;
+         uint32_t half = value & 0xFFFFu;
+         if (dst->gen != s_gen) pv_reset(dst, half << (hi_half ? 16 : 0));
+@@ -306,6 +366,28 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+ /* Memory-mode hooks: COP2 transfers                                          */
+ /* ------------------------------------------------------------------------- */
+ 
++static uint32_t s_cnt_lwc2, s_cnt_swc2, s_cnt_mfc2, s_cnt_mtc2;
++extern "C" void pgxp_cop2_counts(uint32_t out[4]) {
++    out[0] = s_cnt_lwc2; out[1] = s_cnt_swc2;
++    out[2] = s_cnt_mfc2; out[3] = s_cnt_mtc2;
++}
++/* Ring of recent LWC2 loads whose source shadow was dead/flagless: these are
++ * the cache slots feeding untracked vertices. */
++typedef struct { uint32_t addr, value; uint8_t live; } DeadLwc2;
++static DeadLwc2 s_dead_lwc2[32];
++static uint32_t s_dead_lwc2_n = 0;
++static inline void dead_lwc2_note(uint32_t addr, uint32_t value, uint8_t live) {
++    DeadLwc2 *e = &s_dead_lwc2[s_dead_lwc2_n & 31];
++    s_dead_lwc2_n++;
++    e->addr = addr; e->value = value; e->live = live;
++}
++extern "C" uint32_t pgxp_dead_lwc2(void *out, int max) {
++    int n = s_dead_lwc2_n < 32 ? (int)s_dead_lwc2_n : 32;
++    if (n > max) n = max;
++    __builtin_memcpy(out, s_dead_lwc2, (size_t)n * sizeof(DeadLwc2));
++    return (uint32_t)((uint64_t)s_dead_lwc2_n << 8 | (uint32_t)n);
++}
++
+ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+                               uint32_t value, uint32_t addr) {
+     (void)cpu;
+@@ -313,17 +395,29 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+ 
+     switch (f_op(instr)) {
+     case 0x32: {                               /* LWC2: gte[rt] <- [addr]     */
++        s_cnt_lwc2++;
+         PGXPValue *src = pgxp_ptr(addr);
+         PGXPValue *dst = &s_gte[f_rt(instr)];
+         if (src && src->gen == s_gen) {
+             pv_validate(src, value);
+             *dst = *src;
++            if (!(src->flags & PGXP_F_VXY) && f_rt(instr) >= 12 &&
++                f_rt(instr) <= 15)
++                dead_lwc2_note(addr, value, 1);   /* live but flagless */
+         } else {
+             pv_reset(dst, value);
++            if (f_rt(instr) >= 12 && f_rt(instr) <= 15)
++                dead_lwc2_note(addr, value, 0);   /* dead shadow */
+         }
+         return;
+     }
+     case 0x3A: {                               /* SWC2: [addr] <- gte[rt]     */
++        s_cnt_swc2++;
++        {
++            PGXPValue *tsrc = &s_gte[f_rt(instr)];
++            trap_note2(addr, instr, value, 4, tsrc->flags,
++                       tsrc->gen == s_gen, tsrc->value);
++        }
+         PGXPValue *dst = pgxp_ptr(addr);
+         if (!dst) return;
+         PGXPValue *src = &s_gte[f_rt(instr)];
+@@ -338,6 +432,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+     case 0x12: {                               /* COP2 register transfers     */
+         switch (f_rs(instr)) {
+         case 0x00: {                           /* MFC2: gpr[rt] <- gte[rd]    */
++            s_cnt_mfc2++;
+             uint32_t rt = f_rt(instr);
+             if (rt == 0) return;
+             PGXPValue *src = &s_gte[f_rd(instr)];
+@@ -350,8 +445,13 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+             return;
+         }
+         case 0x04: {                           /* MTC2: gte[rd] <- gpr[rt]    */
++            s_cnt_mtc2++;
+             uint32_t rt = f_rt(instr);
+             PGXPValue *dst = &s_gte[f_rd(instr)];
++            if (f_rd(instr) >= 12 && f_rd(instr) <= 15 &&
++                !(rt != 0 && s_gpr[rt].gen == s_gen &&
++                  (s_gpr[rt].flags & PGXP_F_VXY)))
++                dead_lwc2_note(0xFFFF0000u | f_rd(instr), value, 2);
+             if (rt != 0 && s_gpr[rt].gen == s_gen) {
+                 pv_validate(&s_gpr[rt], value);
+                 *dst = s_gpr[rt];
+@@ -483,6 +583,62 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+             }
+             return;
+         }
++        case 0x24: case 0x26: {                /* AND / XOR                   */
++            /* No arithmetic shadow algebra - only the exact VALUE-conditional
++             * identities. These are what compilers emit for branchless
++             * min/max (`subu/sra 31/and/addu`: the AND's mask is all-ones or
++             * zero at runtime, so the result IS one source) and for packed-
++             * vertex half masking. Everything else destroys precision and
++             * resets, exactly as before these hooks existed. Value-exact by
++             * construction: every copy is validated against the actual
++             * result, so a wrong identity can never mis-place a vertex. */
++            int is_and = (funct == 0x24);
++            uint32_t ident_rs = is_and ? 0xFFFFFFFFu : 0u;  /* rs preserved when rt == this */
++            if (s2 == ident_rs) {              /* result == s1: copy rs       */
++                if (rs != 0 && s_gpr[rs].gen == s_gen) {
++                    pv_validate(&s_gpr[rs], result);
++                    *dst = s_gpr[rs];
++                } else pv_reset(dst, result);
++                return;
++            }
++            if (s1 == ident_rs) {              /* result == s2: copy rt       */
++                if (rt != 0 && s_gpr[rt].gen == s_gen) {
++                    pv_validate(&s_gpr[rt], result);
++                    *dst = s_gpr[rt];
++                } else pv_reset(dst, result);
++                return;
++            }
++            if (is_and && result == 0) {       /* exact zero                  */
++                pv_reset(dst, result);
++                dst->x16 = 0; dst->y16 = 0; dst->flags = PGXP_F_VXY;
++                return;
++            }
++            if (is_and && (s2 == 0xFFFFu || s2 == 0xFFFF0000u ||
++                           s1 == 0xFFFFu || s1 == 0xFFFF0000u)) {
++                /* Half extract through a register-held mask: the kept half's
++                 * shadow survives, the cleared half is exactly zero. */
++                uint32_t mask = (s2 == 0xFFFFu || s2 == 0xFFFF0000u) ? s2 : s1;
++                const PGXPValue *src = (mask == s2)
++                    ? ((rs != 0) ? &s_gpr[rs] : nullptr)
++                    : ((rt != 0) ? &s_gpr[rt] : nullptr);
++                uint32_t srcval = (mask == s2) ? s1 : s2;
++                pv_reset(dst, result);
++                if (mask == 0xFFFFu) {
++                    if (comp_tracked(src, srcval, 0)) {
++                        dst->x16 = src->x16; dst->flags |= PGXP_F_VX;
++                    }
++                    dst->y16 = 0; dst->flags |= PGXP_F_VY;
++                } else {
++                    if (comp_tracked(src, srcval, 1)) {
++                        dst->y16 = src->y16; dst->flags |= PGXP_F_VY;
++                    }
++                    dst->x16 = 0; dst->flags |= PGXP_F_VX;
++                }
++                return;
++            }
++            pv_reset(dst, result);
++            return;
++        }
+         case 0x20: case 0x21:                  /* ADD / ADDU                  */
+         case 0x22: case 0x23:                  /* SUB / SUBU                  */
+         case 0x25: {                           /* OR                          */
+@@ -504,6 +660,24 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+                 } else pv_reset(dst, result);
+                 return;
+             }
++            /* VALUE-conditional identities (exact whatever the mode): a zero
++             * OPERAND makes add/sub/or a move of the other source - the
++             * branchless-select tail `addu rd, base, (diff & mask)` reduces
++             * to this whenever the mask chose zero. */
++            if (s2 == 0) {                     /* result == s1: copy rs       */
++                if (rs != 0 && s_gpr[rs].gen == s_gen) {
++                    pv_validate(&s_gpr[rs], result);
++                    *dst = s_gpr[rs];
++                } else pv_reset(dst, result);
++                return;
++            }
++            if (!is_sub && s1 == 0) {          /* result == s2: copy rt       */
++                if (rt != 0 && s_gpr[rt].gen == s_gen) {
++                    pv_validate(&s_gpr[rt], result);
++                    *dst = s_gpr[rt];
++                } else pv_reset(dst, result);
++                return;
++            }
+             if (!s_cpu_mode) { pv_reset(dst, result); return; }
+             a = (rs != 0) ? &s_gpr[rs] : nullptr;
+             b = (rt != 0) ? &s_gpr[rt] : nullptr;
+@@ -615,7 +789,37 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+         pv_reset(dst, result);
+         return;
+     }
+-    default:                                   /* ANDI/XORI/SLTI/...          */
++    case 0x0C: {                               /* ANDI                        */
++        uint32_t imm = instr & 0xFFFFu;
++        a = (rs != 0) ? &s_gpr[rs] : nullptr;
++        if (imm == 0xFFFFu) {                  /* low-half extract            */
++            pv_reset(dst, result);
++            if (comp_tracked(a, s1, 0)) {
++                dst->x16 = a->x16; dst->flags |= PGXP_F_VX;
++            }
++            dst->y16 = 0; dst->flags |= PGXP_F_VY;
++            return;
++        }
++        if (result == 0) {                     /* exact zero                  */
++            pv_reset(dst, result);
++            dst->x16 = 0; dst->y16 = 0; dst->flags = PGXP_F_VXY;
++            return;
++        }
++        pv_reset(dst, result);
++        return;
++    }
++    case 0x0E: {                               /* XORI                        */
++        if ((instr & 0xFFFFu) == 0) {          /* MOVE idiom                  */
++            if (rs != 0 && s_gpr[rs].gen == s_gen) {
++                pv_validate(&s_gpr[rs], result);
++                *dst = s_gpr[rs];
++            } else pv_reset(dst, result);
++            return;
++        }
++        pv_reset(dst, result);
++        return;
++    }
++    default:                                   /* SLTI/...                    */
+         pv_reset(dst, result);
+         return;
+     }
+@@ -684,11 +888,44 @@ extern "C" void pgxp_gte_reg_written(int reg, uint32_t value) {
+ /* GPU consumer                                                               */
+ /* ------------------------------------------------------------------------- */
+ 
++/* Mixed-primitive completion (the crack killer): a corner that resolved
++ * native inside a primitive whose OTHER corners carry dataflow provenance is
++ * re-resolved against the exact-packed-word projection table. Sound because
++ * the game's vertex post-processing (min/max clamps, select-moves) only ever
++ * SELECTS between already-projected words - the packet word is verbatim a
++ * word the GTE produced, so the value-keyed, ambiguity-gated table recovers
++ * the exact projection. Never applied to fully-native primitives, so 2D
++ * (skybox/UI) geometry is never touched - the failure mode that forced the
++ * always-on fallback tier (DuckStation's "vertex cache") off by default
++ * cannot occur. */
++extern "C" int gte_geometry_correction_lookup_any(uint32_t packed,
++                                                  int32_t *x16, int32_t *y16);
++extern "C" int pgxp_complete_mixed_vertex(uint32_t packet_word,
++                                          int32_t int_x, int32_t int_y,
++                                          int32_t *x16, int32_t *y16) {
++    int32_t px = 0, py = 0;
++    if (!gte_geometry_correction_lookup_any(packet_word, &px, &py)) return 0;
++    if ((px >> 16) != int_x || (py >> 16) != int_y) return 0;
++    if (s_tolerance >= 0.0f) {
++        float dx = (float)(px - (int_x << 16)) * (1.0f / 65536.0f);
++        float dy = (float)(py - (int_y << 16)) * (1.0f / 65536.0f);
++        if (dx > s_tolerance || dy > s_tolerance) return 0;
++    }
++    *x16 = px;
++    *y16 = py;
++    return 1;
++}
++
++static uint8_t s_last_resolve_state = 0;  /* 0 no-pv/noaddr 1 stale 2 live-flagless
++                                             3 mismatch 4 tracked 5 fallback */
++extern "C" uint8_t pgxp_last_resolve_state(void) { return s_last_resolve_state; }
++
+ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                                        int32_t int_x, int32_t int_y,
+                                        int32_t *x16, int32_t *y16,
+                                        uint16_t *sz) {
+     s_stats.lookups++;
++    s_last_resolve_state = 0;
+ 
+     int32_t px = 0, py = 0;
+     uint16_t pz = 0;
+@@ -703,13 +940,27 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                 py = pv->y16;
+                 pz = (pv->flags & PGXP_F_VZ) ? pv->z : 0;
+                 have = PGXP_SRC_DATAFLOW;
++                s_last_resolve_state = 4;
+             } else {
+                 s_stats.value_mismatch++;
++                s_last_resolve_state = 3;
+             }
++        } else if (pv && pv->gen == s_gen) {
++            s_last_resolve_state = 2;              /* live but flagless */
++        } else if (pv) {
++            s_last_resolve_state = 1;              /* stale generation  */
+         }
+     }
+ 
+-    if (!have && gte_geometry_correction_lookup(packet_word, &px, &py)) {
++    /* Screen-position-keyed fallback = DuckStation's "Vertex Cache" option,
++     * and OFF by default for DuckStation's reason: it matches by
++     * coordinates, not provenance, so a CPU-positioned 2D element (skybox
++     * and background tiles) landing on the same pixel as a cached 3D
++     * projection picks up a correction it must not have - observed on GT2
++     * as gaps between 2D background tiles. The address-keyed dataflow tier
++     * above is DS's default path (memory tracking) and is unaffected. */
++    if (!have && s_vertex_cache &&
++        gte_geometry_correction_lookup(packet_word, &px, &py)) {
+         pz = 0;                                /* fallback never carries depth */
+         have = PGXP_SRC_FALLBACK;
+     }
+diff --git a/runtime/src/spu.c b/runtime/src/spu.c
+index dc358955..1c987b91 100644
+--- a/runtime/src/spu.c
++++ b/runtime/src/spu.c
+@@ -119,6 +119,15 @@ static uint64_t  s_event_seq = 0;
+ 
+ /* CD input FIFO, fed by the CD-ROM XA decoder at 44.1 kHz stereo. */
+ #define SPU_CD_RING_FRAMES (44100u * 8u)
++/* Startup prime: the consumer holds off until this many frames are buffered
++ * (~54ms), then keeps that cushion for the life of the stream. Without it
++ * consumption begins at the FIRST pushed frame, the steady-state cushion is
++ * ~zero, and any producer hiccup (cold-cache disc reads, background shard
++ * compilation) starves the ring - heard as crackle/bogging at FMV and BGM
++ * starts. On a starve the ring re-primes: one short gap, then clean audio,
++ * instead of machine-gun dropouts. */
++#define SPU_CD_PRIME_FRAMES 2400u
++static int      cd_primed = 0;
+ static int16_t  cd_ring[SPU_CD_RING_FRAMES * 2u];
+ static uint32_t cd_read_pos;
+ static uint32_t cd_write_pos;
+@@ -410,6 +419,7 @@ static inline int16_t cd_input_volume(uint16_t raw) {
+ 
+ void spu_cd_audio_reset(void) {
+     memset(cd_ring, 0, sizeof(cd_ring));
++    cd_primed = 0;
+     cd_read_pos = 0;
+     cd_write_pos = 0;
+     cd_frame_count = 0;
+@@ -454,7 +464,17 @@ void spu_cd_audio_push(const int16_t* stereo, int frames) {
+ }
+ 
+ static int cd_audio_pop(int16_t* left, int16_t* right) {
+-    if (cd_frame_count == 0) return 0;
++    if (!cd_primed) {
++        if (cd_frame_count < SPU_CD_PRIME_FRAMES) return 0;
++        cd_primed = 1;
++    }
++    if (cd_frame_count == 0) {
++        /* Starved after a real start: count ONE underflow event and fall
++         * back to priming so recovery is a single clean gap. */
++        cd_underflow_frames++;
++        cd_primed = 0;
++        return 0;
++    }
+     *left = cd_ring[cd_read_pos * 2u + 0u];
+     *right = cd_ring[cd_read_pos * 2u + 1u];
+     cd_read_pos = (cd_read_pos + 1u) % SPU_CD_RING_FRAMES;
+@@ -1050,8 +1070,6 @@ void spu_render(int16_t* out_stereo, int frames) {
+             int16_t cd_r = 0;
+             if (cd_audio_pop(&cd_l, &cd_r)) {
+                 /* got a frame */
+-            } else if (cd_on && cd_push_frames != 0) {
+-                cd_underflow_frames++;
+             }
+             if (cd_on) {
+                 int32_t ccl = ((int32_t)cd_l * cd_vol_l) >> 15;
+@@ -1193,8 +1211,6 @@ void spu_render(int16_t* out_stereo, int frames) {
+             int16_t cd_r = 0;
+             if (cd_audio_pop(&cd_l, &cd_r)) {
+                 /* got a frame */
+-            } else if (cd_on && cd_push_frames != 0) {
+-                cd_underflow_frames++;
+             }
+             if (cd_on) {
+                 int32_t ccl = ((int32_t)cd_l * cd_vol_l) >> 15;

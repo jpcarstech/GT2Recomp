@@ -1,0 +1,147 @@
+From 4315f48e102dcf32187f261a40acd356508bbad7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 07:26:06 +0000
+Subject: [PATCH] pgxp: mixed-primitive census - sample the seam mechanism, not
+ the HUD
+
+The flagless hunt landed on 0x8006B738: a 2D rectangle builder (lhu x/y/w/h
+from a struct, sh into a POLY_G4). Those corners have no shadow because they
+never touched the GTE - that is PGXP correctly leaving HUD alone, and the
+sample addresses were all in the tachometer's screen region. A census that
+samples every native vertex is dominated by 2D and says nothing about seams.
+
+A seam is one shared corner drawn in two places: precise in one triangle,
+integer in its neighbour - so it can only originate inside a MIXED triangle
+(1 or 2 of 3 corners precise). Count triangles by pattern (all-precise /
+mixed / all-native) and sample only the native corner of mixed ones. Every
+address this yields is track data by construction, and the mixed count alone
+says whether the mechanism is even present.
+---
+ runtime/src/debug_server.c | 29 +++++++++++++++++++++++++++++
+ runtime/src/gpu.c          | 23 +++++++++++++++++++++++
+ runtime/src/pgxp.cpp       | 31 +++++++++++++++++++++++++++++++
+ 3 files changed, 83 insertions(+)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 3f646c60..e9bde475 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -6461,6 +6461,34 @@ static void handle_pgxp_trap(int id, const char *json)
+     send_fmt("%s", buf);
+ }
+ 
++/* pgxp_mixed - triangles by resolve pattern, and the native corners of MIXED
++ * triangles (the seam mechanism). See pgxp_mixed_note. */
++static void handle_pgxp_mixed(int id, const char *json)
++{
++    (void)json;
++    typedef struct { uint32_t addr, word, src; uint8_t state, n_precise; } Hit;
++    extern void pgxp_mixed_stats(uint64_t *, uint64_t *, uint64_t *);
++    extern int  pgxp_mixed_samples(void *out, int max);
++    uint64_t a3 = 0, mx = 0, no = 0;
++    pgxp_mixed_stats(&a3, &mx, &no);
++    Hit h[32];
++    int n = pgxp_mixed_samples(h, 32);
++    static const char *sn[6] = {"noaddr","stale","flagless","mismatch","tracked","fallback"};
++    char buf[4096];
++    int pos = snprintf(buf, sizeof(buf),
++        "{\"id\":%d,\"ok\":true,\"tri_all_precise\":%llu,\"tri_mixed\":%llu,"
++        "\"tri_all_native\":%llu,\"samples\":[",
++        id, (unsigned long long)a3, (unsigned long long)mx, (unsigned long long)no);
++    for (int i = 0; i < n && pos < (int)sizeof(buf) - 160; i++)
++        pos += snprintf(buf + pos, sizeof(buf) - pos,
++            "%s{\"addr\":\"0x%08X\",\"word\":\"0x%08X\",\"src\":\"0x%08X\","
++            "\"state\":\"%s\",\"n_precise\":%u}",
++            i ? "," : "", h[i].addr, h[i].word, h[i].src,
++            sn[h[i].state < 6 ? h[i].state : 0], (unsigned)h[i].n_precise);
++    snprintf(buf + pos, sizeof(buf) - pos, "]}");
++    send_fmt("%s", buf);
++}
++
+ /* pgxp_flagless - the addresses whose shadow slot is live but has no position.
+  * Feed one to pgxp_trap to name the instruction that wrote it unflagged. */
+ static void handle_pgxp_flagless(int id, const char *json)
+@@ -14247,6 +14275,7 @@ static const CmdEntry s_commands[] = {
+     { "wide_full",         handle_wide_full },
+     { "wide_shot",         handle_wide_shot },
+     { "pgxp_trap",         handle_pgxp_trap },
++    { "pgxp_mixed",        handle_pgxp_mixed },
+     { "pgxp_flagless",     handle_pgxp_flagless },
+     { "gpu_opcodes",       handle_gpu_opcodes },
+     { "gpu_ring_stats",    handle_gpu_ring_stats },
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index ec8ba7a3..e3f830a3 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3586,6 +3586,29 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+         fx[i] = (int32_t)((int64_t)px + (int64_t)(vx[i] - raw_x) * 65536);
+         fy[i] = (int32_t)((int64_t)py + (int64_t)(vy[i] - raw_y) * 65536);
+     }
++    /* MIXED-primitive census - the seam mechanism, measured directly.
++     *
++     * A seam is one shared corner drawn in two places: the copy in one
++     * triangle resolved to a sub-pixel position and the copy in its neighbour
++     * fell back to the integer one. That can only happen inside a triangle
++     * that is itself MIXED (1 or 2 of 3 corners precise). All-native triangles
++     * are 2D (HUD, sky gradient, menus) and resolve native correctly - a census
++     * that samples every native vertex is swamped by the tachometer, which is
++     * what the first flagless hunt landed on. This one counts triangles by
++     * pattern and samples only the native corner of a mixed one, so the
++     * addresses it yields are track data by construction. */
++    {
++        extern void pgxp_mixed_note(int n_precise, uint32_t addr, uint32_t word,
++                                    uint8_t state, uint32_t src_addr);
++        if (n_precise > 0 && n_precise < 3) {
++            for (int i = 0; i < 3; i++)
++                if (tier[i] == PGXP_SRC_NATIVE)
++                    pgxp_mixed_note(n_precise, vaddr[i], gp0_cmd_buf[idx[i]],
++                                    rst[i], gp0_cmd_source_addr);
++        } else {
++            pgxp_mixed_note(n_precise, 0, 0, 0, 0);   /* count only */
++        }
++    }
+     /* Mixed-primitive completion: corners that resolved native inside a
+      * primitive with dataflow-tracked corners are re-resolved against the
+      * exact-packed-word projection table (see pgxp_complete_mixed_vertex).
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 7f1d436f..186cdb3d 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -1013,6 +1013,37 @@ static inline void flagless_note(uint32_t addr, uint32_t packet,
+     s_flagless_w++;
+     h->addr = addr; h->packet = packet; h->flags = flags; h->value = value;
+ }
++/* Mixed-primitive census (fed from gpu.c prepare_precise_triangle). */
++typedef struct { uint32_t addr, word, src; uint8_t state, n_precise; } PgxpMixedHit;
++static PgxpMixedHit s_mixed_ring[32];
++static uint32_t s_mixed_w = 0;
++static uint64_t s_tri_all3 = 0, s_tri_mixed = 0, s_tri_none = 0;
++extern "C" void pgxp_mixed_note(int n_precise, uint32_t addr, uint32_t word,
++                                uint8_t state, uint32_t src_addr) {
++    if (n_precise >= 3)      { s_tri_all3++; return; }
++    if (n_precise <= 0)      { s_tri_none++; return; }
++    /* called once per native corner of a mixed triangle; count the triangle
++     * on its first corner only (n_precise==2 -> 1 native corner, ==1 -> 2) */
++    static uint32_t last_src = 0xFFFFFFFFu; static int corners_left = 0;
++    if (src_addr != last_src || corners_left <= 0) {
++        s_tri_mixed++; last_src = src_addr; corners_left = 3 - n_precise;
++    }
++    corners_left--;
++    PgxpMixedHit *h = &s_mixed_ring[s_mixed_w & 31];
++    s_mixed_w++;
++    h->addr = addr; h->word = word; h->src = src_addr;
++    h->state = state; h->n_precise = (uint8_t)n_precise;
++}
++extern "C" void pgxp_mixed_stats(uint64_t *all3, uint64_t *mixed, uint64_t *none) {
++    if (all3) *all3 = s_tri_all3; if (mixed) *mixed = s_tri_mixed; if (none) *none = s_tri_none;
++}
++extern "C" int pgxp_mixed_samples(void *out, int max) {
++    int n = s_mixed_w < 32 ? (int)s_mixed_w : 32;
++    if (n > max) n = max;
++    __builtin_memcpy(out, s_mixed_ring, (size_t)n * sizeof(PgxpMixedHit));
++    return n;
++}
++
+ extern "C" int pgxp_flagless_samples(void *out, int max) {
+     int n = s_flagless_w < 32 ? (int)s_flagless_w : 32;
+     if (n > max) n = max;

@@ -1,0 +1,32 @@
+From e66f87e60bf176b4394b14c4769e75a09e0e65a2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 16:34:56 +0000
+Subject: [PATCH] sio: feed starvation watchdog from serial activity (BIOS
+ memcard load in IRQ handler)
+
+---
+ runtime/src/sio.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/runtime/src/sio.c b/runtime/src/sio.c
+index 08dcadd0..362f0842 100644
+--- a/runtime/src/sio.c
++++ b/runtime/src/sio.c
+@@ -667,7 +667,14 @@ static uint64_t s_pace_ack_fires;
+ /* ---- Starvation-ring helper -------------------------------------------
+  * Fill in current SIO state at every recorded event. */
+ #include "starvation_ring.h"
++void starvation_watchdog_heartbeat(void);
+ static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
++    /* A progressing serial transaction is not starvation. The BIOS reads a
++     * memory card from inside its interrupt handler; a large save (GT2's
++     * boot-time load) keeps the guest in that handler for tens of seconds
++     * with no frontend heartbeat, and the 4 s watchdog killed a healthy
++     * boot at the "Loading Save Data" screen. Feed it from SIO activity. */
++    starvation_watchdog_heartbeat();
+ #if SIO_MODEL_CYCLE_PACED
+     starvation_ring_record(kind, tx, rx,
+                            sio_ctrl, sio_stat,
+-- 
+2.43.0
+

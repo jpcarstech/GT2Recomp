@@ -1,0 +1,64 @@
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index a3279388..5519d5b0 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -4960,6 +4960,25 @@ int gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out) {
+     return n_out;
+ }
+ 
++/* Log the newest `n` ring entries to stderr — forensic context for the
++ * unknown-GP0 diagnostic in gpu_write_gp0_body (what the command stream
++ * looked like right before a stray word arrived). */
++static void gp0_ring_log_tail(int n) {
++    if (!gp0_ring) return;
++    uint32_t avail = (gp0_ring_seq < GP0_RING_CAP)
++                   ? (uint32_t)gp0_ring_seq : GP0_RING_CAP;
++    if ((uint32_t)n > avail) n = (int)avail;
++    for (int i = n; i >= 1; i--) {
++        uint32_t idx = (gp0_ring_head + GP0_RING_CAP - (uint32_t)i) % GP0_RING_CAP;
++        const GpuGp0RingEntry *e = &gp0_ring[idx];
++        fprintf(stderr,
++                "[gpu]   -%d: frame %u op 0x%02X n%u w0 0x%08X src 0x%08X"
++                " func 0x%08X ra 0x%08X\n",
++                i, e->frame, e->opcode, e->n_words, e->cmd[0], e->src_addr,
++                e->func, e->ra);
++    }
++}
++
+ /* Report the frame range currently held in the ring (oldest..newest). */
+ void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
+     if (out_oldest) *out_oldest = 0;
+@@ -5473,11 +5492,28 @@ static void gpu_write_gp0_body(uint32_t val) {
+     int word_count = gp0_command_word_count(opcode);
+ 
+     if (word_count == 0) {
+-        /* Unknown command — fatal halt with rings queryable post-mortem */
+-        static char reason[96];
+-        snprintf(reason, sizeof(reason),
+-                 "GPU GP0 unknown command 0x%02X (word 0x%08X)", opcode, val);
+-        psx_fatal_halt(reason);
++        /* Unknown/undocumented GP0 opcode. Real hardware ignores these words
++         * (psx-spx: the unused opcodes act as NOPs), and DuckStation and
++         * Beetle skip them the same way — hard-halting here turns a single
++         * stray word into a crash-to-desktop (seen in the field: GT2 race
++         * intro flew one 0xF9 word at the GPU and the run died at a point
++         * the console shrugs off). A stray word CAN still mean an upstream
++         * display-list problem (a mis-sized command or bad DMA chain link —
++         * see the Tomba2 polyline de-phasing note above), so keep a loud
++         * breadcrumb: log the first few occurrences with the recent GP0
++         * ring, then consume the word exactly like the console does. */
++        static int unk_gp0_logged = 0;
++        if (unk_gp0_logged < 8) {
++            unk_gp0_logged++;
++            fprintf(stderr,
++                    "[gpu] GP0 unknown command 0x%02X (word 0x%08X) at frame %u"
++                    " src 0x%08X — ignored (hardware NOP) [%d/8]\n",
++                    opcode, val, (uint32_t)s_frame_count, gp0_next_source_addr,
++                    unk_gp0_logged);
++            gp0_ring_log_tail(8);
++        }
++        gp0_nop_count++;
++        return;
+     }
+ 
+     if (word_count < 0) {

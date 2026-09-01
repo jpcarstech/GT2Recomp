@@ -1,0 +1,210 @@
+From 56a7d13358db259a59a6fe78cd6558aa7e574083 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 13:05:02 +0000
+Subject: [PATCH 1/2] runtime menu: PGXP tuning page (DuckStation knob set,
+ paused, pad/keyboard)
+
+Adds a PGXP section to the in-game Runtime settings menu (F1): geometry,
+perspective textures, culling, preserve projection, color, tolerance
+(0.1/0.25/0.5/1/2/unlimited), disable-on-2D, vertex cache, CPU mode, depth
+buffer (+transparent). Same setters as the debug-port pgxp command;
+live-only, not persisted. The runtime's own extra mechanisms (completion,
+dilation, gap fill, no-Z culling) stay debug-port-only. The pgxp debug reply
+now reports completion.
+---
+ runtime/src/debug_server.c |   3 +-
+ runtime/src/main.cpp       | 132 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 133 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index e87b1a0c..d64c98cc 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5427,7 +5427,7 @@ static void handle_pgxp(int id, const char *json)
+              "\"depth\":%d,\"depth_clear\":%u,"
+              "\"transparent_depth\":%d,\"culling\":%d,\"color\":%d,"
+              "\"disable_2d\":%d,\"vertex_cache\":%d,\"preserve\":%d,"
+-             "\"dilate\":%d,\"texture\":%d,\"gapfill\":%d,\"whole\":%d,"
++             "\"dilate\":%d,\"texture\":%d,\"gapfill\":%d,\"whole\":%d,\"completion\":%d,"
+              "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d,"
+              "\"framewipe\":%d,\"invalidations\":%u,"
+              "\"nclip_precise\":%llu,\"nclip_gated\":%llu,"
+@@ -5453,6 +5453,7 @@ static void handle_pgxp(int id, const char *json)
+              ({ extern int gl_renderer_get_gapfill(void);
+                 gl_renderer_get_gapfill(); }),
+              ({ extern int gpu_pgxp_whole_get(void); gpu_pgxp_whole_get(); }),
++             ({ extern int gpu_pgxp_completion_enabled_flag; gpu_pgxp_completion_enabled_flag; }),
+              ({ extern int gr_scale(void); gr_scale(); }),
+              ({ extern int gl_renderer_gapfill_status(int *);
+                 gl_renderer_gapfill_status(NULL); }),
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 4bb6f517..a6937a3d 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6125,6 +6125,97 @@ static const char kRuntimeDiscChange[] = "psx.disc_change";
+ static const char kRuntimeDiscReinsert[] = "psx.disc_reinsert";
+ static const char *const kControllerRouteChoices[] = { "Port 1", "Port 2" };
+ 
++/* ---- PGXP tuning (in-game, live) ------------------------------------------
++ * Every PGXP mechanism the runtime has, flippable while paused so a scene
++ * can be judged by eye with ONE knob changed (the debug-port "pgxp" command
++ * exposes the same setters; this is the pad/keyboard front end for them).
++ * Live-only: nothing here is written to settings.toml -- the launcher's PGXP
++ * Precision mod remains the persistent choice. */
++extern "C" {
++    int  gte_geometry_correction_enabled(void);
++    void gte_geometry_correction_set(int on);
++    int  gpu_texture_correction_enabled(void);
++    void gpu_texture_correction_set(int on);
++    int  gte_pgxp_culling_enabled(void);
++    void gte_pgxp_culling_set(int on);
++    int  gte_preserve_proj_enabled(void);
++    void gte_preserve_proj_set(int on);
++    int  gpu_pgxp_color_correction(void);
++    void gpu_pgxp_color_correction_set(int on);
++    int  gpu_pgxp_disable_2d(void);
++    void gpu_pgxp_disable_2d_set(int on);
++    int  pgxp_vertex_cache(void);
++    void pgxp_set_vertex_cache(int on);
++    int  pgxp_cpu_mode(void);
++    void pgxp_set_cpu_mode(int on);
++    int  gpu_pgxp_depth_enabled(void);
++    void gpu_pgxp_depth_set(int on);
++    int  gpu_pgxp_depth_transparent(void);
++    void gpu_pgxp_depth_transparent_set(int on);
++    float pgxp_tolerance(void);
++    void pgxp_set_tolerance(float t);
++}
++static const char kPgxpGeometry[]    = "pgxp.geometry";
++static const char kPgxpTexture[]     = "pgxp.texture";
++static const char kPgxpCulling[]     = "pgxp.culling";
++static const char kPgxpPreserve[]    = "pgxp.preserve";
++static const char kPgxpColor[]       = "pgxp.color";
++static const char kPgxpTolerance[]   = "pgxp.tolerance";
++static const char kPgxpDisable2d[]   = "pgxp.disable_2d";
++static const char kPgxpVertexCache[] = "pgxp.vertex_cache";
++static const char kPgxpCpuMode[]     = "pgxp.cpu_mode";
++static const char kPgxpDepth[]       = "pgxp.depth";
++static const char kPgxpTransDepth[]  = "pgxp.transparent_depth";
++static const char *const kPgxpToleranceChoices[] = {
++    "0.1 px", "0.25 px", "0.5 px", "1.0 px", "2.0 px", "Unlimited (-1)" };
++static const float kPgxpToleranceValues[] = { 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, -1.0f };
++static int pgxp_tolerance_index(void) {
++    const float t = pgxp_tolerance();
++    if (t < 0.0f) return 5;
++    int best = 0; float bd = 1e9f;
++    for (int i = 0; i < 5; i++) {
++        const float d = std::fabs(kPgxpToleranceValues[i] - t);
++        if (d < bd) { bd = d; best = i; }
++    }
++    return best;
++}
++static int pgxp_ui_get(const char *key, int *out) {
++    if (std::strcmp(key, kPgxpGeometry) == 0)    *out = gte_geometry_correction_enabled() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpTexture) == 0)     *out = gpu_texture_correction_enabled() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpCulling) == 0)     *out = gte_pgxp_culling_enabled() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpPreserve) == 0)    *out = gte_preserve_proj_enabled() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpColor) == 0)       *out = gpu_pgxp_color_correction() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpTolerance) == 0)   *out = pgxp_tolerance_index();
++    else if (std::strcmp(key, kPgxpDisable2d) == 0)   *out = gpu_pgxp_disable_2d() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpVertexCache) == 0) *out = pgxp_vertex_cache() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpCpuMode) == 0)     *out = pgxp_cpu_mode() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpDepth) == 0)       *out = gpu_pgxp_depth_enabled() ? 1 : 0;
++    else if (std::strcmp(key, kPgxpTransDepth) == 0)  *out = gpu_pgxp_depth_transparent() ? 1 : 0;
++    else return 0;
++    return 1;
++}
++static int pgxp_ui_set(const char *key, int v) {
++    if (std::strcmp(key, kPgxpGeometry) == 0) {
++        gte_geometry_correction_set(v != 0);
++        gpu_texture_correction_set(gpu_texture_correction_enabled()); /* keep engine armed consistently */
++    }
++    else if (std::strcmp(key, kPgxpTexture) == 0)     gpu_texture_correction_set(v != 0);
++    else if (std::strcmp(key, kPgxpCulling) == 0)     gte_pgxp_culling_set(v != 0);
++    else if (std::strcmp(key, kPgxpPreserve) == 0)    gte_preserve_proj_set(v != 0);
++    else if (std::strcmp(key, kPgxpColor) == 0)       gpu_pgxp_color_correction_set(v != 0);
++    else if (std::strcmp(key, kPgxpTolerance) == 0) {
++        if (v < 0 || v > 5) return 0;
++        pgxp_set_tolerance(kPgxpToleranceValues[v]);
++    }
++    else if (std::strcmp(key, kPgxpDisable2d) == 0)   gpu_pgxp_disable_2d_set(v != 0);
++    else if (std::strcmp(key, kPgxpVertexCache) == 0) pgxp_set_vertex_cache(v != 0);
++    else if (std::strcmp(key, kPgxpCpuMode) == 0)     pgxp_set_cpu_mode(v != 0);
++    else if (std::strcmp(key, kPgxpDepth) == 0)       gpu_pgxp_depth_set(v != 0);
++    else if (std::strcmp(key, kPgxpTransDepth) == 0)  gpu_pgxp_depth_transparent_set(v != 0);
++    else return 0;
++    return 1;
++}
++
+ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+                                 int *value_out) {
+     if (!item || !item->key || !value_out) return 0;
+@@ -6140,6 +6231,8 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+         *value_out = host_volume_get();
+     else if (std::strcmp(item->key, kRuntimeControllerRoute) == 0)
+         *value_out = g_controller_ports_swapped ? 1 : 0;
++    else if (std::strncmp(item->key, "pgxp.", 5) == 0)
++        return pgxp_ui_get(item->key, value_out);
+     else
+         return 0;
+     return 1;
+@@ -6181,6 +6274,8 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+         const int requested = value ? 1 : 0;
+         if (requested != (g_controller_ports_swapped ? 1 : 0))
+             controller_port_route_toggle();
++    } else if (std::strncmp(item->key, "pgxp.", 5) == 0) {
++        if (!pgxp_ui_set(item->key, value)) return 0;
+     } else {
+         return 0;
+     }
+@@ -6307,11 +6402,46 @@ static void runtime_settings_ui_ensure_created(void) {
+         { kRuntimeDiscReinsert, "Disc", "Reinsert current disc",
+           "Signal a tray-open/close cycle without changing the mounted image.",
+           RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
++        /* PGXP tuning - live, not persisted. The DuckStation knob set only:
++         * the runtime's own extra mechanisms stay debug-port-only (pgxp cmd). */
++        { kPgxpGeometry, "PGXP", "Geometry correction",
++          "Sub-pixel vertices from the GTE shadow (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpTexture, "PGXP", "Perspective-correct textures",
++          "Per-vertex W from GTE depth (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpCulling, "PGXP", "Culling correction",
++          "NCLIP on full-precision projections (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpPreserve, "PGXP", "Preserve projection precision",
++          "Keep unrounded GTE projection (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpColor, "PGXP", "Color correction",
++          "Perspective-correct Gouraud colours (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpTolerance, "PGXP", "Geometry tolerance",
++          "Max precise-vs-native distance (DS knob)",
++          RECOMP_RUNTIME_UI_CHOICE, 0, 5, 1, kPgxpToleranceChoices, 6, nullptr },
++        { kPgxpDisable2d, "PGXP", "Disable on 2D polygons",
++          "Any untracked corner -> whole poly native (DS)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpVertexCache, "PGXP", "Vertex cache",
++          "Precise lookup by packed word (DS, inaccurate)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpCpuMode, "PGXP", "CPU mode",
++          "Track precision through CPU arithmetic (DS)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpDepth, "PGXP", "Depth buffer",
++          "Z-test proven-depth triangles (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        { kPgxpTransDepth, "PGXP", "Depth buffer: transparent",
++          "Also Z-test semi-transparent polys (DS knob)",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+     };
+ 
+     RecompRuntimeUiStandardConfig config{};
+     config.menu.title = "Runtime settings";
+-    config.menu.subtitle = "Paused - live settings and session tools";
++    config.menu.subtitle = "Paused - live settings + PGXP tuning";
+     config.menu.theme = "psx";
+     config.menu.accept_label = "Enter / Cross";
+     config.menu.back_label = "Esc / Circle";
+-- 
+2.43.0
+

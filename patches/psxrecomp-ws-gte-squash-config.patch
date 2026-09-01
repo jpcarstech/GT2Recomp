@@ -1,0 +1,103 @@
+From 50c98724790e22bacc39617b80ffe4f7166a97a0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 28 Aug 2026 01:22:09 +0000
+Subject: [PATCH] GT2Recomp carried: [widescreen] gte_squash=false for
+ game-native anamorphic patches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A game-side widescreen patch (e.g. Silent's GT2 16:9 patch) renders the
+wider FOV itself; the framework's GTE X-squash then applies the widening
+a second time and everything shows squashed. gte_squash=false keeps the
+squash-mode present path (stretch + game-mode classification + engage)
+but pins gte_set_display_aspect to identity. Default true — existing
+configs unchanged.
+---
+ recompiler/src/config_loader.cpp |  7 +++++++
+ recompiler/src/config_loader.h   |  1 +
+ runtime/src/main.cpp             | 13 +++++++++++--
+ 3 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index bc17f280..f6d7e7a9 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -1444,6 +1444,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+     bool ws_auto_ui_squash = false;
+     bool ws_full_2d = false;
+     bool ws_gte_game_mode = false;
++    bool ws_gte_squash = true;
+     bool ws_precise_nclip = false;
+     uint32_t ws_gameplay_state_addr = 0;
+     std::vector<uint32_t> ws_gameplay_state_values;
+@@ -1592,6 +1593,11 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+             ws_full_2d = toml::find<bool>(ws, "full_2d");
+         if (ws.contains("gte_game_mode"))
+             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
++        // gte_squash = false: the game renders anamorphic natively (a game-side
++        // widescreen patch); present/classification behave as squash mode but
++        // the GTE X-squash stays identity so the patch is not double-applied.
++        if (ws.contains("gte_squash"))
++            ws_gte_squash = toml::find<bool>(ws, "gte_squash");
+         if (ws.contains("precise_nclip"))
+             ws_precise_nclip = toml::find<bool>(ws, "precise_nclip");
+         const bool has_gameplay_state_addr = ws.contains("gameplay_state_addr");
+@@ -2180,6 +2186,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
+         /*ws_full_2d*/            ws_full_2d,
+         /*ws_gte_game_mode*/      ws_gte_game_mode,
++        /*ws_gte_squash*/         ws_gte_squash,
+         /*ws_precise_nclip*/      ws_precise_nclip,
+         /*ws_gameplay_state_addr*/ ws_gameplay_state_addr,
+         /*ws_gameplay_state_values*/ ws_gameplay_state_values,
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index daf5d226..61c4af29 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1039,6 +1039,7 @@ struct GameConfig {
+     // (native-wide engages); genuine full-2D screens (save/options) still
+     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
+     bool ws_gte_game_mode = false;
++    bool ws_gte_squash = true;
+ 
+     // [widescreen] precise_nclip — use the runtime's unsaturated GTE projection
+     // provenance for NCLIP/backface tests while classic adaptive widescreen is
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 20841058..02e7ca05 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1602,6 +1602,11 @@ extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*
+  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
+  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
+ static bool          g_ws_engaged = true;
++/* [widescreen] gte_squash: false = the game renders anamorphic natively (a
++ * game-side widescreen patch is installed); the present path still stretches
++ * and classifies exactly as squash mode, but gte_set_display_aspect stays at
++ * identity so the widening is not applied twice. */
++static bool          g_ws_gte_squash = true;
+ /* Wide-aspect strategy: native-wide (render the wider FOV into a wider frame,
+  * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
+  * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
+@@ -1715,8 +1720,8 @@ static void refresh_widescreen_projection() {
+     g_ws_projection_mode = mode;
+     g_ws_projection_num = proj_num;
+     g_ws_projection_den = proj_den;
+-    gte_set_display_aspect(mode == 1 ? proj_num : 4,
+-                           mode == 1 ? proj_den : 3);
++    gte_set_display_aspect((mode == 1 && g_ws_gte_squash) ? proj_num : 4,
++                           (mode == 1 && g_ws_gte_squash) ? proj_den : 3);
+     gpu_ws_configure(proj_num, proj_den, g_ws_anchor_addr,
+                      g_ws_hud_sprt ? 1 : 0, mode);
+ }
+@@ -11923,6 +11928,10 @@ int main(int argc, char** argv) {
+                                   gc.ws_bg2d_packet_cap);
+             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
+             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
++            /* [widescreen] gte_squash=false — game-native anamorphic source
++             * (a game-side widescreen patch): keep present/classification but
++             * leave the GTE X-squash at identity. */
++            g_ws_gte_squash = gc.ws_gte_squash;
+             gpu_ws_set_precise_nclip(gc.ws_precise_nclip ? 1 : 0);
+             gpu_ws_set_gameplay_state_gate(
+                 gc.ws_gameplay_state_addr,

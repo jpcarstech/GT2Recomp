@@ -1,0 +1,46 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index b9d5f2bd..2cc7409a 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1347,6 +1347,13 @@ static int g_netplay_local_viewport = 0; /* 0 off, 1 vertical split */
+  * activation, but remains game.toml opt-in so normal netplay stays vanilla. */
+ static int g_netplay_local_viewport_aspect = 0; /* 0 off, 1 16:9, 2 21:9, 3 adaptive */
+ 
++/* Set when a trusted mod selected the display aspect this launch. The
++ * post-activation settings settle must then leave the aspect alone — same
++ * stale-snapshot clobber class as turbo_loads/skip_fmv (see the comment at
++ * that site): the launcher snapshot predates mod_runtime_activate_plugins().
++ * Candidate for upstreaming. */
++static bool g_mod_owns_display_aspect = false;
++
+ extern "C" int psx_mod_set_fixed_display_aspect(
+     uint32_t numerator, uint32_t denominator) {
+     if (numerator == 0 || denominator == 0 ||
+@@ -1361,6 +1368,7 @@ extern "C" int psx_mod_set_fixed_display_aspect(
+     g_video_aspect_num = (int)numerator;
+     g_video_aspect_den = (int)denominator;
+     g_ws_adaptive_view = false;
++    g_mod_owns_display_aspect = true;
+     std::fprintf(stdout, "psxrecomp: mod selected fixed display aspect %u:%u\n",
+                  (unsigned)numerator, (unsigned)denominator);
+     return 1;
+@@ -1380,6 +1388,7 @@ extern "C" int psx_mod_set_adaptive_display_aspect(
+     g_ws_adaptive_view = true;
+     g_ws_adaptive_max_num = (int)max_numerator;
+     g_ws_adaptive_max_den = (int)max_denominator;
++    g_mod_owns_display_aspect = true;
+     std::fprintf(stdout,
+         "psxrecomp: mod selected adaptive display aspect "
+         "(initial %d:%d, range 4:3 through %u:%u)\n",
+@@ -15277,7 +15286,10 @@ soft_return_lobby:
+             g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
+                 ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
+                 PSX_HOTKEY_PAD_SELECT_R1);
+-            switch (ls.aspect_index) {
++            /* Display aspect is mod-owned when a trusted mod selected it
++             * (see g_mod_owns_display_aspect): this snapshot predates plugin
++             * activation, so applying it would clobber the mod's choice. */
++            if (!g_mod_owns_display_aspect) switch (ls.aspect_index) {
+                 case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
+                 case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;
+                 default: g_video_aspect_num = 4;  g_video_aspect_den = 3; break;

@@ -1,0 +1,20 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index d1965247..a437567b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -11405,7 +11405,14 @@ namespace {
+         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
+         gi->has_skip_fmv = skip_fmv_offered_b ? 1 : 0;
+         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
+-        gi->has_geometry_precision = 1;
++        /* PGXP is owned by the builtin "PGXP Precision" mod, whose launcher
++         * options (geometry correction, perspective-correct textures,
++         * tolerance) live on the Mods tab. Don't ALSO expose the generic
++         * Settings "Perspective textures" row: two controls for one switch
++         * confuse, and the mod-owned guard deliberately ignores this one
++         * whenever the mod is active anyway. Same pattern as
++         * widescreen_supported above (display view owned by trusted mods). */
++        gi->has_geometry_precision = 0;
+         gi->has_rewind_depth = 1;
+         if (language_labels && num_languages > 0) {
+             gi->language_labels = language_labels;

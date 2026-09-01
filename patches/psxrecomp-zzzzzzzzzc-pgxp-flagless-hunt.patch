@@ -1,0 +1,137 @@
+From a08404e7dcc1cd48163775adf4f663c3033eaf1a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 06:32:56 +0000
+Subject: [PATCH] pgxp: sample flagless addresses and expose the writer trap
+
+The census says 92% of unresolved vertices hit a shadow slot that is live but
+carries no position, and CPU mode barely moves it (31830 -> 31676 per 2s), so
+the loss is not CPU arithmetic. What is missing is WHICH store puts an
+unflagged value at a display-list address.
+
+pgxp_flagless samples the addresses observed resolving flagless; pgxp_trap
+arms the existing writer trap on one of them and reports every store hook that
+touches it with the guest PC, the store kind, and the source register's shadow
+state. Three outcomes, all diagnostic: no hits at all means the word reaches
+RAM by a path with no hook (DMA, or a compiled store that never calls
+psx_pgxp_store); src_live=0 means the writing register had no shadow;
+src_flags=0 with src_live=1 means provenance died upstream of the store.
+---
+ runtime/src/debug_server.c | 59 ++++++++++++++++++++++++++++++++++++++
+ runtime/src/pgxp.cpp       | 20 +++++++++++++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 8a4223b6..3f646c60 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -6426,6 +6426,63 @@ static void handle_c0_history(int id, const char *json)
+     send_fmt("%s", buf);
+ }
+ 
++/* pgxp_trap - watch one RAM word and record every store hook that touches it,
++ * with the guest PC. {"cmd":"pgxp_trap","addr":"0x..."} arms; no addr reads. */
++static void handle_pgxp_trap(int id, const char *json)
++{
++    typedef struct { uint32_t pc, instr, value; uint8_t kind; uint32_t frame;
++                     uint32_t src_flags, src_live, src_value; } Hit;
++    extern void pgxp_trap_set(uint32_t addr);
++    extern int  pgxp_trap_read(void *out, int max);
++    extern int  pgxp_trap_total(void);
++    char a[32];
++    if (json_get_str(json, "addr", a, sizeof(a))) {
++        pgxp_trap_set((uint32_t)strtoul(a, NULL, 0));
++        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":\"%s\"}", id, a);
++        return;
++    }
++    Hit h[16];
++    int n = pgxp_trap_read(h, 16);
++    static const char *kn[6] = {"?","sw","sh","sb","swc2","swl/swr"};
++    char buf[2560];
++    int pos = snprintf(buf, sizeof(buf),
++                       "{\"id\":%d,\"ok\":true,\"total\":%d,\"hits\":[",
++                       id, pgxp_trap_total());
++    for (int i = 0; i < n && pos < (int)sizeof(buf) - 160; i++)
++        pos += snprintf(buf + pos, sizeof(buf) - pos,
++                        "%s{\"pc\":\"0x%08X\",\"instr\":\"0x%08X\","
++                        "\"value\":\"0x%08X\",\"kind\":\"%s\",\"frame\":%u,"
++                        "\"src_flags\":%u,\"src_live\":%u,\"src_value\":\"0x%08X\"}",
++                        i ? "," : "", h[i].pc, h[i].instr, h[i].value,
++                        kn[h[i].kind < 6 ? h[i].kind : 0], h[i].frame,
++                        (unsigned)h[i].src_flags, (unsigned)h[i].src_live,
++                        h[i].src_value);
++    snprintf(buf + pos, sizeof(buf) - pos, "]}");
++    send_fmt("%s", buf);
++}
++
++/* pgxp_flagless - the addresses whose shadow slot is live but has no position.
++ * Feed one to pgxp_trap to name the instruction that wrote it unflagged. */
++static void handle_pgxp_flagless(int id, const char *json)
++{
++    (void)json;
++    typedef struct { uint32_t addr, packet, flags, value; } Hit;
++    extern int pgxp_flagless_samples(void *out, int max);
++    Hit h[32];
++    int n = pgxp_flagless_samples(h, 32);
++    char buf[3072];
++    int pos = snprintf(buf, sizeof(buf),
++                       "{\"id\":%d,\"ok\":true,\"count\":%d,\"samples\":[", id, n);
++    for (int i = 0; i < n && pos < (int)sizeof(buf) - 128; i++)
++        pos += snprintf(buf + pos, sizeof(buf) - pos,
++                        "%s{\"addr\":\"0x%08X\",\"packet\":\"0x%08X\","
++                        "\"flags\":%u,\"value\":\"0x%08X\"}",
++                        i ? "," : "", h[i].addr, h[i].packet,
++                        (unsigned)h[i].flags, h[i].value);
++    snprintf(buf + pos, sizeof(buf) - pos, "]}");
++    send_fmt("%s", buf);
++}
++
+ static void handle_gpu_opcodes(int id, const char *json)
+ {
+     (void)json;
+@@ -14189,6 +14246,8 @@ static const CmdEntry s_commands[] = {
+     { "dump_buffer",       handle_dump_buffer },
+     { "wide_full",         handle_wide_full },
+     { "wide_shot",         handle_wide_shot },
++    { "pgxp_trap",         handle_pgxp_trap },
++    { "pgxp_flagless",     handle_pgxp_flagless },
+     { "gpu_opcodes",       handle_gpu_opcodes },
+     { "gpu_ring_stats",    handle_gpu_ring_stats },
+     { "gpu_frame_dump",    handle_gpu_frame_dump },
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 432cefaf..7f1d436f 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -1000,6 +1000,25 @@ extern "C" uint8_t pgxp_last_resolve_state(void) { return s_last_resolve_state;
+  * 2 is the interesting one: it means provenance is being LOST in transit
+  * rather than never recorded, which is a bug with an address to hunt. */
+ static uint64_t s_resolve_state_n[6] = {0,0,0,0,0,0};
++/* Sample the ADDRESSES that resolve flagless. The census says the shadow slot
++ * exists and is live but carries no position; naming the addresses lets the
++ * writer trap (pgxp_trap_set) identify the instruction that put an unflagged
++ * value there, which is the last unknown in the seam chain. */
++typedef struct { uint32_t addr, packet, flags, value; } PgxpFlaglessHit;
++static PgxpFlaglessHit s_flagless_ring[32];
++static uint32_t s_flagless_w = 0;
++static inline void flagless_note(uint32_t addr, uint32_t packet,
++                                 uint32_t flags, uint32_t value) {
++    PgxpFlaglessHit *h = &s_flagless_ring[s_flagless_w & 31];
++    s_flagless_w++;
++    h->addr = addr; h->packet = packet; h->flags = flags; h->value = value;
++}
++extern "C" int pgxp_flagless_samples(void *out, int max) {
++    int n = s_flagless_w < 32 ? (int)s_flagless_w : 32;
++    if (n > max) n = max;
++    __builtin_memcpy(out, s_flagless_ring, (size_t)n * sizeof(PgxpFlaglessHit));
++    return n;
++}
+ extern "C" void pgxp_resolve_state_census(uint64_t out[6]) {
+     for (int i = 0; i < 6; i++) out[i] = s_resolve_state_n[i];
+ }
+@@ -1034,6 +1053,7 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+             }
+         } else if (pv && gen_live(pv->gen)) {
+             s_last_resolve_state = 2;              /* live but flagless */
++            flagless_note(addr, packet_word, pv->flags, pv->value);
+         } else if (pv) {
+             s_last_resolve_state = 1;              /* stale generation  */
+         }

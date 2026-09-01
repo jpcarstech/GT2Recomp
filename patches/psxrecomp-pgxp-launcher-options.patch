@@ -1,0 +1,151 @@
+From d00fc6f209be290fba218bbcbf66176dbb795b81 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 28 Aug 2026 03:06:16 +0000
+Subject: [PATCH] GT2Recomp carried: PGXP options in the launcher Mods UI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The builtin PGXP Precision mod grows the settings players actually
+tune: Geometry correction and Perspective-correct textures as separate
+toggles (missing/legacy state defaults both on, the feature's
+historical behavior), and Geometry tolerance as a choice — 0.1 px
+(stable default), 0.5 px, Unlimited (DuckStation's -1; strongest, can
+open seams where the tracker can't fully prove vertices). A
+mod-provided tolerance is mod-owned: the [video] settle no longer
+clobbers it (g_mod_owns_pgxp_tolerance, same rule as the toggles).
+---
+ .../psx.enhancement.pgxp/1.0.0/manifest.toml  | 39 +++++++++++++++++++
+ runtime/src/main.cpp                          |  6 ++-
+ runtime/src/mod_builtin_pgxp.c                | 29 +++++++++++++-
+ 3 files changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml b/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml
+index 8f0e2952..58c601e1 100644
+--- a/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml
++++ b/mods/builtin/packages/psx.enhancement.pgxp/1.0.0/manifest.toml
+@@ -19,6 +19,45 @@ description = "Disabled by default (the faithful floor). Corrections are validat
+ group = "Visual"
+ default_enabled = false
+ 
++[[option]]
++feature = "pgxp"
++id = "geometry"
++label = "Geometry correction"
++description = "Sub-pixel vertex positions: 3D polygons stop wobbling between whole pixels. The core PGXP effect."
++group = "Visual"
++type = "boolean"
++default = "true"
++
++[[option]]
++feature = "pgxp"
++id = "textures"
++label = "Perspective-correct textures"
++description = "Interpolate texture coordinates with perspective instead of the PS1's affine mapping: large floor/wall textures stop warping."
++group = "Visual"
++type = "boolean"
++default = "true"
++
++[[option]]
++feature = "pgxp"
++id = "tolerance"
++label = "Geometry tolerance"
++description = "How large a correction is accepted, in pixels. 0.1 applies only near-exact refinements (stable everywhere - the validated default). 0.5 accepts more correction but can flicker where corrections cross the boundary. Unlimited matches DuckStation's -1 setting and gives the strongest correction, but games whose vertices the tracker cannot fully prove can open thin seams between polygons."
++group = "Visual"
++type = "choice"
++default = "0.1"
++
++[[option.choice]]
++value = "0.1"
++label = "0.1 px (stable)"
++
++[[option.choice]]
++value = "0.5"
++label = "0.5 px"
++
++[[option.choice]]
++value = "-1"
++label = "Unlimited (DuckStation)"
++
+ [[option]]
+ feature = "pgxp"
+ id = "cpu_mode"
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index f1455e82..d1965247 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -13804,7 +13804,11 @@ session_reboot:
+             pgxp_set_cpu_mode(g_video_pgxp_cpu_mode);
+         }
+     }
+-    pgxp_set_tolerance(g_video_pgxp_tolerance);
++    {
++        extern int g_mod_owns_pgxp_tolerance;
++        if (!g_mod_owns_pgxp_tolerance)
++            pgxp_set_tolerance(g_video_pgxp_tolerance);
++    }
+     if (g_video_geometry_correction || g_video_perspective_texturing) {
+         std::fprintf(stdout,
+                      "psxrecomp: geometry correction %s, perspective texturing %s%s\n",
+diff --git a/runtime/src/mod_builtin_pgxp.c b/runtime/src/mod_builtin_pgxp.c
+index 3ea51953..77447456 100644
+--- a/runtime/src/mod_builtin_pgxp.c
++++ b/runtime/src/mod_builtin_pgxp.c
+@@ -17,6 +17,7 @@
+ #include "mod_plugins.h"
+ #include "pgxp.h"
+ 
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #define PKG_PGXP "psx.enhancement.pgxp"
+@@ -24,6 +25,12 @@
+ /* gte.cpp / gpu.c — the two correction toggles this mod arms. */
+ extern void gte_geometry_correction_set(int enabled);
+ extern void gpu_texture_correction_set(int enabled);
++extern void pgxp_set_tolerance(float pixels);
++
++/* Read by main.cpp's post-activation [video] settle: when the player chose a
++ * tolerance through this mod, the config value must not clobber it (same
++ * mod-owned rule as the correction toggles). */
++int g_mod_owns_pgxp_tolerance = 0;
+ 
+ static int pgxp_option_flag(const char* feature, const char* id) {
+     char text[16] = "";
+@@ -31,6 +38,15 @@ static int pgxp_option_flag(const char* feature, const char* id) {
+            strcmp(text, "true") == 0;
+ }
+ 
++/* Missing/unset option (older saved state) => fall back to enabled: the
++ * feature's historical behavior armed both corrections unconditionally. */
++static int pgxp_option_flag_default_on(const char* feature, const char* id) {
++    char text[16] = "";
++    if (!psx_mod_option_value(PKG_PGXP, feature, id, text, sizeof text))
++        return 1;
++    return strcmp(text, "false") != 0;
++}
++
+ /* Read by main.cpp's post-activation [video] settle: once this mod has armed
+  * the correction engine, the config/launcher values must not clobber it
+  * (mirror of the mod-owned display-aspect guard). */
+@@ -38,9 +54,18 @@ int g_mod_owns_pgxp = 0;
+ 
+ static void builtin_pgxp_activate(void) {
+     g_mod_owns_pgxp = 1;
+-    gte_geometry_correction_set(1);
+-    gpu_texture_correction_set(1);   /* also arms the shadow engine */
++    gte_geometry_correction_set(pgxp_option_flag_default_on("pgxp", "geometry"));
++    gpu_texture_correction_set(
++        pgxp_option_flag_default_on("pgxp", "textures"));  /* arms the engine */
+     pgxp_set_cpu_mode(pgxp_option_flag("pgxp", "cpu_mode"));
++    {
++        char text[16] = "";
++        if (psx_mod_option_value(PKG_PGXP, "pgxp", "tolerance",
++                                 text, sizeof text) && text[0]) {
++            pgxp_set_tolerance((float)atof(text));
++            g_mod_owns_pgxp_tolerance = 1;
++        }
++    }
+ }
+ 
+ PSX_MOD_CONSTRUCTOR(psx_register_builtin_pgxp_plugin) {

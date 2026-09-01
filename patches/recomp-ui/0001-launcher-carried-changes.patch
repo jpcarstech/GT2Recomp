@@ -1,0 +1,803 @@
+From 318b995c025af277074e687e2ac225cf0cca61af Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 16:05:41 +0000
+Subject: [PATCH] launcher: GT2Recomp carried changes (rebased onto 4eda6543)
+
+Carried launcher changes: texture-filter modes/2D exclude, post-processing,
+PGXP options, event-loop brace fix, and Display scaling / FMV overscan crop
+rows (RECOMP_LAUNCHER_HAS_DISPLAY_SCALING).
+---
+ src/common/backends/imgui/launcher_imgui.cpp | 221 ++++++++++++++++---
+ src/common/launcher_model.c                  | 106 +++++++--
+ src/common/launcher_model.h                  |  14 ++
+ src/common/launcher_ng_capi.c                |   7 +
+ src/common/launcher_platform.h               |   4 +
+ src/common/launcher_platform_sdl2.c          |  38 ++++
+ src/common/launcher_platform_sdl3.c          |  35 +++
+ src/consoles/psx/psx_profile.h               |   2 +
+ src/recomp_launcher.h                        |  30 ++-
+ 9 files changed, 417 insertions(+), 40 deletions(-)
+
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 57d2690..43022ab 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -2627,6 +2627,12 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         row_label("Texture filtering", th);
+         if (ImGui::Button(ui_text(launcher_model_texture_filter_label(m)), ImVec2(px(120), px(30))))
+             launcher_model_toggle_texture_filter(m);
++        row_label("Filter 2D elements", th);
++        ImGui::PushID("texfilter2d");
++        bool f2d = m->s.texture_filter_2d != 0;
++        if (ImGui::Checkbox("##texfilter2d", &f2d))
++            launcher_model_toggle_texture_filter_2d(m);
++        ImGui::PopID();
+     } else {
+         row_label("Linear filtering", th);
+         bool filter = m->s.linear_filter != 0;
+@@ -2634,10 +2640,48 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+     }
+ 
+     if (m->has_antialiasing) {
+-        row_label("Antialiasing", th);
+-        ImGui::PushID("antialiasing");
+-        if (ImGui::Button(ui_text(launcher_model_aa_label(m)), ImVec2(px(90), px(30))))
+-            launcher_model_cycle_aa(m);
++        /* The "Antialiasing" switch was really the present filter; when the
++         * console exposes Display scaling that row supersedes it. */
++        if (!m->has_display_scaling) {
++            row_label("Antialiasing", th);
++            ImGui::PushID("antialiasing");
++            if (ImGui::Button(ui_text(launcher_model_aa_label(m)), ImVec2(px(90), px(30))))
++                launcher_model_cycle_aa(m);
++            ImGui::PopID();
++        }
++        row_label("Post-processing", th);
++        ImGui::PushID("postfx");
++        if (ImGui::Button(launcher_model_post_processing_label(m), ImVec2(px(90), px(30))))
++            launcher_model_cycle_post_processing(m);
++        ImGui::PopID();
++    }
++
++    /* Display scaling: how the finished frame is fitted to the window
++     * (DuckStation: Nearest / Bilinear (Smooth) / Bilinear (Sharp)). */
++    if (m->has_display_scaling) {
++        row_label("Display scaling", th);
++        ImGui::PushID("display_scaling");
++        if (ImGui::Button(ui_text(launcher_model_display_scaling_label(m)), ImVec2(px(140), px(30))))
++            launcher_model_cycle_display_scaling(m);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Nearest: hard pixels (sharp-bilinear kicks in at a non-integer\n"
++                              "window ratio so pixels stay even). Bilinear: smooth. Sharp\n"
++                              "bilinear: crisp pixels, one-pixel blend at the edges.");
++        ImGui::PopID();
++    }
++
++    /* Crop FMVs: drop the letterbox rows inside the movie frame + CRT overscan. */
++    if (m->has_fmv_crop) {
++        row_label("Crop FMVs", th);
++        ImGui::PushID("fmv_crop");
++        if (ImGui::Button(ui_text(launcher_model_fmv_crop_label(m)), ImVec2(px(90), px(30))))
++            launcher_model_cycle_fmv_crop(m);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Removes the black bars a movie carries inside its own\n"
++                              "frame (and the border a CRT never showed) so it fills\n"
++                              "the window height at any resolution. Pixel aspect is\n"
++                              "kept: a widescreen movie gets narrow side pillars, never\n"
++                              "a stretch.");
+         ImGui::PopID();
+     }
+ 
+@@ -2648,7 +2692,9 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+     if (m->has_fmv_filter) {
+         row_label("FMV filtering", th);
+         ImGui::PushID("fmv_filter");
+-        const bool aa_off = m->has_antialiasing && m->s.antialiasing == 0;
++        const bool aa_off = m->has_display_scaling
++                                ? (m->s.display_scaling == RECOMP_LAUNCHER_DISPLAY_SCALING_NEAREST)
++                                : (m->has_antialiasing && m->s.antialiasing == 0);
+         if (aa_off) ImGui::BeginDisabled();
+         if (ImGui::Button(ui_text(aa_off ? "Nearest"
+                                          : launcher_model_fmv_filter_label(m)),
+@@ -6509,6 +6555,41 @@ static bool mod_feature_text_matches(const char* search,
+     return haystack.find(needle) != std::string::npos;
+ }
+ 
++/* "Cheats" is a reserved feature-group name: when any installed feature uses
++ * it, the dashboard splits the single Mods entry into "Patches" (every other
++ * group — enhancements, fixes, performance) and "Cheats" (this group), so
++ * gameplay-altering unlocks are never mixed in between enhancement patches.
++ * Group matching is case-insensitive. */
++static bool mod_feature_is_cheat(const RecompLauncherCModFeature& feature) {
++    static const char kCheats[] = "cheats";
++    const char* g = feature.group;
++    size_t i = 0;
++    for (; g[i] && kCheats[i]; ++i) {
++        if ((char)std::tolower((unsigned char)g[i]) != kCheats[i]) return false;
++    }
++    return !g[i] && !kCheats[i];
++}
++
++static bool mod_feature_in_scope(const LauncherModel* m,
++                                 const RecompLauncherCModFeature& feature) {
++    if (m->mod_group_filter == 1) return !mod_feature_is_cheat(feature);
++    if (m->mod_group_filter == 2) return mod_feature_is_cheat(feature);
++    return true;
++}
++
++static bool mods_have_cheat_features(const LauncherModel* m) {
++    const auto* mods = m ? m->mods : nullptr;
++    if (!mods || !mods->feature_count || !mods->feature_get) return false;
++    const int count = mods->feature_count(mods->ctx);
++    for (int index = 0; index < count; ++index) {
++        RecompLauncherCModFeature feature{};
++        if (!mods->feature_get(mods->ctx, index, &feature)) continue;
++        if (feature.hidden && !feature.enabled) continue;
++        if (mod_feature_is_cheat(feature)) return true;
++    }
++    return false;
++}
++
+ static void mod_note_error(LauncherModel* m) {
+     const auto* mods = m ? m->mods : nullptr;
+     const char* error = mods && mods->last_error ? mods->last_error(mods->ctx) : nullptr;
+@@ -7039,6 +7120,9 @@ static bool set_all_mod_features(LauncherModel* m, bool enabled) {
+     changed.reserve(features.size());
+     for (size_t index = 0; index < features.size(); ++index) {
+         const RecompLauncherCModFeature& feature = features[index];
++        /* Bulk actions act on the page the player is looking at: the Cheats
++         * entry's buttons never touch patches and vice versa. */
++        if (!mod_feature_in_scope(m, feature)) continue;
+         if ((feature.enabled != 0) == enabled) continue;
+         if (!mods->feature_enable(mods->ctx, feature.package_id, feature.id,
+                                   enabled ? 1 : 0)) {
+@@ -7065,9 +7149,11 @@ static bool set_all_mod_features(LauncherModel* m, bool enabled) {
+         }
+         changed.push_back(index);
+     }
++    const char* what = m->mod_group_filter == 2 ? "cheats"
++                     : m->mod_group_filter == 1 ? "patches" : "mod features";
+     std::snprintf(m->mod_status, sizeof(m->mod_status),
+-                  enabled ? "All mod features enabled. Changes apply on PLAY."
+-                          : "All mod features disabled. Changes apply on PLAY.");
++                  "All %s %s. Changes apply on PLAY.", what,
++                  enabled ? "enabled" : "disabled");
+     return true;
+ }
+ 
+@@ -7093,20 +7179,25 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+                   "Install %s", archive_extension);
+     std::snprintf(archive_pattern, sizeof(archive_pattern),
+                   "*%s", archive_extension);
+-    if (ImGui::Button(install_label)) {
+-        const char* patterns[] = { archive_pattern };
+-        char path[1024];
+-        if (launcher_pick_file("Install Mod Package", patterns, 1,
+-                               archive_description,
+-                               path, sizeof(path))) {
+-            if (!mods->install_archive ||
+-                !mods->install_archive(mods->ctx, path)) {
+-                mod_note_error(m);
+-            } else {
+-                std::snprintf(m->mod_status, sizeof(m->mod_status),
+-                              "%s", ui_text("Package installed. Changes apply when you press PLAY."));
++    /* Package installation lives with the patches; the Cheats page only
++     * toggles what is already installed. */
++    if (m->mod_group_filter != 2) {
++        if (ImGui::Button(install_label)) {
++            const char* patterns[] = { archive_pattern };
++            char path[1024];
++            if (launcher_pick_file("Install Mod Package", patterns, 1,
++                                   archive_description,
++                                   path, sizeof(path))) {
++                if (!mods->install_archive ||
++                    !mods->install_archive(mods->ctx, path)) {
++                    mod_note_error(m);
++                } else {
++                    std::snprintf(m->mod_status, sizeof(m->mod_status),
++                                  ui_text("Package installed. Changes apply when you press PLAY."));
++                }
+             }
+         }
++        ImGui::SameLine();
+     }
+     ImGui::SameLine();
+     if (ImGui::Button(ui_text("Enable all")))
+@@ -7142,6 +7233,7 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+         item.index = index;
+         if (!mods->feature_get(mods->ctx, index, &item.feature) ||
+             (item.feature.hidden && !item.feature.enabled) ||
++            !mod_feature_in_scope(m, item.feature) ||
+             !mod_feature_text_matches(m->mod_search, item.feature)) {
+             continue;
+         }
+@@ -7150,6 +7242,18 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+     std::stable_sort(visible_features.begin(), visible_features.end(),
+                      mod_feature_less);
+ 
++    /* The detail pane indexes the FULL feature list; when the page scope
++     * excludes the current selection (entered Cheats with a patch selected,
++     * or vice versa), snap to the first feature this page shows so the
++     * detail pane never describes a feature the list hides. */
++    if (m->mod_group_filter != 0 && feature_count > 0) {
++        RecompLauncherCModFeature sel{};
++        if (mods->feature_get(mods->ctx, m->mod_selected, &sel) &&
++            !mod_feature_in_scope(m, sel) && !visible_features.empty()) {
++            m->mod_selected = visible_features[0].index;
++        }
++    }
++
+     const float list_w = px(330);
+     if (ImGui::BeginChild("##mod_feature_list", ImVec2(list_w, 0),
+                           ImGuiChildFlags_Borders)) {
+@@ -7229,7 +7333,8 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+                           ImGuiChildFlags_Borders)) {
+         RecompLauncherCModFeature feature{};
+         if (feature_count > 0 &&
+-            mods->feature_get(mods->ctx, m->mod_selected, &feature)) {
++            mods->feature_get(mods->ctx, m->mod_selected, &feature) &&
++            mod_feature_in_scope(m, feature)) {
+             ImGui::TextColored(col(th.accent2), "%s", feature.name);
+             if (feature.group[0]) {
+                 ImGui::SameLine();
+@@ -7452,8 +7557,11 @@ void draw_mods(LauncherModel* m, const LauncherTheme& th) {
+         mods->feature_option_get && mods->feature_enable &&
+         mods->feature_set_option;
+     if (!feature_provider) m->mod_show_packages = true;
++    /* The Cheats page is a plain toggle list: no package management view. */
++    if (feature_provider && m->mod_group_filter == 2)
++        m->mod_show_packages = false;
+ 
+-    if (feature_provider) {
++    if (feature_provider && m->mod_group_filter != 2) {
+         if (ImGui::RadioButton(ui_text("Features"), !m->mod_show_packages))
+             m->mod_show_packages = false;
+         ImGui::SameLine();
+@@ -8820,18 +8928,39 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
+         const float right = ImGui::GetWindowContentRegionMax().x;
+         const float y = hdr_top + px(6.0f);
+         if (m->view == LNG_VIEW_DASHBOARD) {
+-            const int count = 1 + (m->mods ? 1 : 0) +
++            /* With a "Cheats" feature group installed the Mods entry splits:
++             * "Patches" (enhancements/fixes) and "Cheats" (gameplay unlocks)
++             * — the names say what is inside. Without one, the single legacy
++             * "Mods" entry stays, unchanged for every other game. */
++            const bool mods_split = m->mods && mods_have_cheat_features(m);
++            const int count = 1 + (m->mods ? (mods_split ? 2 : 1) : 0) +
+                               (m->has_assist_tools ? 1 : 0) +
+                               ((m->credits_text && m->credits_text[0]) ? 1 : 0);
+-            const float w = px(110.0f);
++            const float w = px(count >= 5 ? 96.0f : 110.0f);
+             const float total = w * count + gap * (count - 1);
+             ImGui::SetCursorPos(ImVec2(right - total, y));
+             if (ImGui::Button(ui_text("Settings"), ImVec2(w, px(34))))
+                 launcher_model_set_view(m, LNG_VIEW_SETTINGS);
+             if (m->mods) {
+                 ImGui::SameLine(0, gap);
+-                if (ImGui::Button(ui_text("Mods"), ImVec2(w, px(34))))
++                if (ImGui::Button(mods_split ? ui_text("Patches") : ui_text("Mods"),
++                                  ImVec2(w, px(34)))) {
++                    m->mod_group_filter = mods_split ? 1 : 0;
+                     launcher_model_set_view(m, LNG_VIEW_MODS);
++                }
++                if (mods_split &&
++                    ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
++                    ImGui::SetTooltip(
++                        "Enhancement and fix patches for this game");
++                if (mods_split) {
++                    ImGui::SameLine(0, gap);
++                    if (ImGui::Button("Cheats", ImVec2(w, px(34)))) {
++                        m->mod_group_filter = 2;
++                        launcher_model_set_view(m, LNG_VIEW_MODS);
++                    }
++                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
++                        ImGui::SetTooltip("Gameplay-altering cheats");
++                }
+             }
+             if (m->has_assist_tools) {
+                 ImGui::SameLine(0, gap);
+@@ -9437,6 +9566,20 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
+             default:
+                 break;
+             }
++            // Synthetic-scale displays (Windows DPI / resolution fallback /
++            // LNG_FORCE_SCALE): events carry pixel coordinates while ImGui
++            // lays out in logical units — de-scale mouse positions to match.
++            if ((force_dpi || p->synthetic_scale) && p->display_scale > 1.001f) {
++                const float inv = 1.0f / p->display_scale;
++                if (ev.type == SDL_EVENT_MOUSE_MOTION) {
++                    ev.motion.x = (decltype(ev.motion.x))(ev.motion.x * inv);
++                    ev.motion.y = (decltype(ev.motion.y))(ev.motion.y * inv);
++                } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
++                           ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
++                    ev.button.x = (decltype(ev.button.x))(ev.button.x * inv);
++                    ev.button.y = (decltype(ev.button.y))(ev.button.y * inv);
++                }
++            }
+             LNG_ImplSDL_ProcessEvent(&ev);
+         } while (SDL_PollEvent(&ev));
+ 
+@@ -9526,10 +9669,38 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
+                 nav_io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+         }
+         LNG_ImplSDL_NewFrame();
+-        if (force_dpi) {   // Windows has no native point/pixel split — inject it
++        if (force_dpi || p->synthetic_scale) {   // no native point/pixel split — inject it
+             ImGuiIO& io = ImGui::GetIO();
+             io.DisplaySize = ImVec2((float)p->logical_w, (float)p->logical_h);
+             io.DisplayFramebufferScale = ImVec2(p->display_scale, p->display_scale);
++            // The SDL backend's focused-window fallback (UpdateMouseData, run
++            // by the backend NewFrame above) queues the GLOBAL mouse position
++            // in raw pixels every frame, overriding the de-scaled motion
++            // events — every click landed offset by the scale factor. Queue
++            // the corrected position after it: ImGui merges consecutive
++            // mouse-position events, so the logical one wins. Skip while a
++            // button is held — the backend skips its fallback then too, and
++            // the (already de-scaled) motion events drive the drag.
++            if (p->display_scale > 1.001f) {
++                bool any_down = false;
++                for (int b = 0; b < IM_ARRAYSIZE(io.MouseDown); ++b)
++                    if (io.MouseDown[b]) { any_down = true; break; }
++                if (!any_down &&
++                    (SDL_GetWindowFlags(p->window) & SDL_WINDOW_INPUT_FOCUS)) {
++                    int wx = 0, wy = 0;
++                    SDL_GetWindowPosition(p->window, &wx, &wy);
++#if defined(LNG_SDL3)
++                    float gmx = 0.0f, gmy = 0.0f;
++                    SDL_GetGlobalMouseState(&gmx, &gmy);
++#else
++                    int gmx_i = 0, gmy_i = 0;
++                    SDL_GetGlobalMouseState(&gmx_i, &gmy_i);
++                    const float gmx = (float)gmx_i, gmy = (float)gmy_i;
++#endif
++                    io.AddMousePosEvent((gmx - (float)wx) / p->display_scale,
++                                        (gmy - (float)wy) / p->display_scale);
++                }
++            }
+         }
+         ImGui::NewFrame();
+         draw_ui(m, *th, p->logical_w, p->logical_h);
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index bffa759..2c5ed2e 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -267,6 +267,8 @@ void launcher_model_init(LauncherModel* m,
+         m->has_antialiasing     = game->has_antialiasing != 0;
+         m->has_texture_filter   = game->has_texture_filter != 0;
+         m->has_fmv_filter       = game->has_fmv_filter != 0;
++        m->has_display_scaling  = game->has_display_scaling != 0;
++        m->has_fmv_crop         = game->has_fmv_crop != 0;
+         m->has_screen_kind      = game->has_screen_kind != 0;
+         m->has_frame_interp     = game->has_frame_interp != 0;
+         m->has_spu_hq           = game->has_spu_hq != 0;
+@@ -593,7 +595,13 @@ void launcher_model_init(LauncherModel* m,
+             if (kWindowWidths[i] == m->s.window_width) { ok = 1; break; }
+         if (!ok) m->s.window_width = kWindowWidths[0];
+     }
+-    if (m->has_supersampling) m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 4);
++    /* Range must match the cycle/label functions below (1..16) and the
++     * runtime's PSX_GL_MAX_INTERNAL_SCALE. This load-normalisation clamp was
++     * left at the pre-16x limit of 4, so a settings.toml carrying 6/8/12/16 -
++     * a value this same launcher can select and save - was silently reduced
++     * to 4 on load and handed to the game as 4. The user saw their choice
++     * persisted in the file and in the UI, and rendered at 4x regardless. */
++    if (m->has_supersampling) m->s.supersampling = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 16);
+     if (m->has_screen_kind) {
+         // Clamp against the active profile's screen-model vocabulary (GBA has
+         // 5 LCD models; the legacy PSX-era set has 4) — see screen_kind_vocab.
+@@ -602,13 +610,28 @@ void launcher_model_init(LauncherModel* m,
+                      ? sk_prof->screen_kind_count : 4;
+         m->s.screen_kind = clampi(m->s.screen_kind, 0, sk_n - 1);
+     }
+-    if (m->has_texture_filter) m->s.texture_filter = m->s.texture_filter ? 1 : 0;
++    if (m->has_texture_filter) m->s.texture_filter = clampi(m->s.texture_filter, 0, 2);
++    if (m->has_texture_filter) m->s.texture_filter_2d = m->s.texture_filter_2d ? 1 : 0;
++    if (m->has_antialiasing) m->s.post_processing = (m->s.post_processing == 1) ? 1 : 0;
+     /* 0 = unset (a host predating the field): seed the default rather than
+      * letting a memset pin the least useful value. */
+     if (m->has_fmv_filter) {
+         if (m->s.fmv_filter < 1 || m->s.fmv_filter > RECOMP_LAUNCHER_FMV_FILTER_COUNT)
+             m->s.fmv_filter = RECOMP_LAUNCHER_FMV_FILTER_BICUBIC;
+     }
++    /* Unset display scaling follows the legacy antialiasing switch. */
++    if (m->has_display_scaling) {
++        if (m->s.display_scaling < 1 || m->s.display_scaling > RECOMP_LAUNCHER_DISPLAY_SCALING_COUNT)
++            m->s.display_scaling = (m->has_antialiasing && m->s.antialiasing == 0)
++                                       ? RECOMP_LAUNCHER_DISPLAY_SCALING_NEAREST
++                                       : RECOMP_LAUNCHER_DISPLAY_SCALING_BILINEAR;
++    }
++    if (m->has_fmv_crop) {
++        if (m->s.fmv_crop > RECOMP_LAUNCHER_FMV_CROP_COUNT)
++            m->s.fmv_crop = RECOMP_LAUNCHER_FMV_CROP_ON;   /* older 8/12/16 px values */
++        if (m->s.fmv_crop < 1)
++            m->s.fmv_crop = RECOMP_LAUNCHER_FMV_CROP_OFF;
++    }
+     if (m->has_renderer) {
+         if (m->renderer_labels && m->num_renderers > 0) {
+             /* Multi-label cycle (Software / OpenGL / Vulkan). Prefer OpenGL
+@@ -1467,19 +1490,22 @@ const char* launcher_model_renderer_label(const LauncherModel* m) {
+ }
+ 
+ void launcher_model_cycle_supersampling(LauncherModel* m) {
+-    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 4);
+-    m->s.supersampling = (v % 4) + 1;
++    /* Every integer step 1..16 (DuckStation internal-resolution parity). */
++    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 16);
++    m->s.supersampling = (v % 16) + 1;
+ }
+ 
+ const char* launcher_model_supersampling_label(const LauncherModel* m) {
+     /* Settings SSAA: offline full SW/GL path; netplay dual-raster uses this
+-     * for OpenGL present quality while SW authority stays 1×. */
+-    static char buf[24];
+-    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 4);
+-    if (v <= 1)
+-        snprintf(buf, sizeof(buf), "1x");
+-    else
+-        snprintf(buf, sizeof(buf), "%dx", v);
++     * for OpenGL present quality while SW authority stays 1×. DuckStation's
++     * resolution hints mark the common display targets. */
++    static char buf[32];
++    int v = clampi(m->s.supersampling ? m->s.supersampling : 1, 1, 16);
++    const char* hint = v == 3 ? " (720p)"
++                     : v == 5 ? " (1080p)"
++                     : v == 6 ? " (1440p)"
++                     : v == 9 ? " (4K)" : "";
++    snprintf(buf, sizeof(buf), "%dx%s", v, hint);
+     return buf;
+ }
+ 
+@@ -1506,11 +1532,37 @@ const char* launcher_model_aa_label(const LauncherModel* m) {
+ }
+ 
+ void launcher_model_toggle_texture_filter(LauncherModel* m) {
+-    m->s.texture_filter = !m->s.texture_filter;
++    /* 0=nearest 1=bilinear 2=3-point(N64). (The renderer also implements an
++     * approximate trilinear as mode 3, dropped from the cycle by user choice
++     * — on PS1 content it read as a blurrier bilinear.) */
++    int v = m->s.texture_filter;
++    if (v < 0 || v > 2) v = v ? 1 : 0;
++    m->s.texture_filter = (v + 1) % 3;
++}
++
++void launcher_model_cycle_post_processing(LauncherModel* m) {
++    /* Present-time post-process AA: far cheaper than MSAA (one shader pass
++     * over the final frame). Off <-> FXAA. */
++    m->s.post_processing = (m->s.post_processing == 1) ? 0 : 1;
++}
++
++const char* launcher_model_post_processing_label(const LauncherModel* m) {
++    return (m->s.post_processing == 1) ? "FXAA" : "Off";
++}
++
++void launcher_model_toggle_texture_filter_2d(LauncherModel* m) {
++    /* Whether the texture filter also applies to 2D elements (sprites,
++     * HUD, fonts). Off keeps them pixel-perfect nearest while 3D world
++     * textures use the mode above. */
++    m->s.texture_filter_2d = !m->s.texture_filter_2d;
+ }
+ 
+ const char* launcher_model_texture_filter_label(const LauncherModel* m) {
+-    return m->s.texture_filter ? "Bilinear" : "Nearest";
++    static const char* k_names[3] =
++        { "Nearest", "Bilinear", "3-Point (N64)" };
++    int v = m->s.texture_filter;
++    if (v < 0 || v > 2) v = v ? 1 : 0;
++    return k_names[v];
+ }
+ 
+ void launcher_model_cycle_fmv_filter(LauncherModel* m) {
+@@ -1530,6 +1582,34 @@ const char* launcher_model_fmv_filter_label(const LauncherModel* m) {
+     }
+ }
+ 
++void launcher_model_cycle_display_scaling(LauncherModel* m) {
++    if (!m || !m->has_display_scaling) return;
++    int v = m->s.display_scaling;
++    if (v < 1 || v > RECOMP_LAUNCHER_DISPLAY_SCALING_COUNT) v = RECOMP_LAUNCHER_DISPLAY_SCALING_BILINEAR;
++    m->s.display_scaling = (v % RECOMP_LAUNCHER_DISPLAY_SCALING_COUNT) + 1;
++    /* Keep the legacy switch coherent for hosts/rows that still read it. */
++    if (m->has_antialiasing)
++        m->s.antialiasing = (m->s.display_scaling != RECOMP_LAUNCHER_DISPLAY_SCALING_NEAREST) ? 1 : 0;
++}
++
++const char* launcher_model_display_scaling_label(const LauncherModel* m) {
++    switch (m ? m->s.display_scaling : 0) {
++        case RECOMP_LAUNCHER_DISPLAY_SCALING_NEAREST: return "Nearest";
++        case RECOMP_LAUNCHER_DISPLAY_SCALING_SHARP:   return "Sharp bilinear";
++        default:                                      return "Bilinear";
++    }
++}
++
++void launcher_model_cycle_fmv_crop(LauncherModel* m) {
++    if (!m || !m->has_fmv_crop) return;
++    m->s.fmv_crop = (m->s.fmv_crop >= RECOMP_LAUNCHER_FMV_CROP_ON)
++                        ? RECOMP_LAUNCHER_FMV_CROP_OFF : RECOMP_LAUNCHER_FMV_CROP_ON;
++}
++
++const char* launcher_model_fmv_crop_label(const LauncherModel* m) {
++    return (m && m->s.fmv_crop >= RECOMP_LAUNCHER_FMV_CROP_ON) ? "On" : "Off";
++}
++
+ void launcher_model_set_shader_path(LauncherModel* m, const char* path) {
+     if (!m || !m->has_shader) return;
+     safe_copy(m->s.shader_path, sizeof(m->s.shader_path), path ? path : "");
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 475cedb..67cb1bf 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -297,6 +297,11 @@ typedef struct {
+     const RecompLauncherCNetplayCallbacks* netplay;
+     const RecompLauncherCModProvider* mods;
+     int       mod_selected;
++    /* Mods view scope, set by the dashboard nav before entering LNG_VIEW_MODS:
++     * 0 = every feature (legacy single "Mods" entry), 1 = non-cheat groups
++     * (the "Patches" entry), 2 = only the reserved "Cheats" feature group.
++     * Stays 0 for games with no Cheats group, preserving prior behavior. */
++    int       mod_group_filter;
+     int       mod_package_selected;
+     bool      mod_show_packages;
+     char      mod_search[96];
+@@ -368,6 +373,8 @@ typedef struct {
+     bool     has_antialiasing;
+     bool     has_texture_filter;
+     bool     has_fmv_filter;
++    bool     has_display_scaling;
++    bool     has_fmv_crop;
+     bool     has_screen_kind;
+     bool     has_frame_interp;
+     bool     has_spu_hq;
+@@ -718,10 +725,17 @@ const char* launcher_model_supersampling_label(const LauncherModel* m);
+ void launcher_model_cycle_aa(LauncherModel* m);            // Off/2x/4x/8x (MSAA sample count)
+ const char* launcher_model_aa_label(const LauncherModel* m);
+ void launcher_model_toggle_texture_filter(LauncherModel* m);   // Nearest/Bilinear
++void launcher_model_toggle_texture_filter_2d(LauncherModel* m); // filter 2D sprites/UI
++void launcher_model_cycle_post_processing(LauncherModel* m);    // Off/FXAA
++const char* launcher_model_post_processing_label(const LauncherModel* m);
+ const char* launcher_model_texture_filter_label(const LauncherModel* m);
+ // FMV reconstruction: Nearest/Bilinear/Sharp/Bicubic (wraps).
+ void launcher_model_cycle_fmv_filter(LauncherModel* m);
+ const char* launcher_model_fmv_filter_label(const LauncherModel* m);
++void launcher_model_cycle_display_scaling(LauncherModel* m);
++const char* launcher_model_display_scaling_label(const LauncherModel* m);
++void launcher_model_cycle_fmv_crop(LauncherModel* m);
++const char* launcher_model_fmv_crop_label(const LauncherModel* m);
+ void launcher_model_set_shader_path(LauncherModel* m, const char* path);
+ void launcher_model_clear_shader_path(LauncherModel* m);
+ // PSX geometry precision (gated on has_geometry_precision).
+diff --git a/src/common/launcher_ng_capi.c b/src/common/launcher_ng_capi.c
+index 5a10c8e..910f715 100644
+--- a/src/common/launcher_ng_capi.c
++++ b/src/common/launcher_ng_capi.c
+@@ -88,5 +88,12 @@ int recomp_launcher_run_window(const char* window_title,
+         return RECOMP_LAUNCHER_RESULT_LAUNCH;
+     }
+ 
++    /* Quit (window close): commit the edited settings back to the caller
++     * too. The host persists the Settings panel on quit-without-play, and
++     * without this commit it saved the caller's untouched pre-edit snapshot
++     * (field report: set texture filtering to Nearest, close via X, disk
++     * still says "3point"). Commit is a plain struct copy - no side
++     * effects beyond making io reflect what the user actually chose. */
++    launcher_model_commit(&model, io);
+     return RECOMP_LAUNCHER_RESULT_QUIT;
+ }
+diff --git a/src/common/launcher_platform.h b/src/common/launcher_platform.h
+index ed11186..17f7f46 100644
+--- a/src/common/launcher_platform.h
++++ b/src/common/launcher_platform.h
+@@ -38,6 +38,10 @@ typedef struct LauncherPlatform {
+     // Content scale from SDL (1.0, 1.25, 1.5, 1.75, 2.0, ...). Backends multiply
+     // font raster sizes and any physical dimensions by this.
+     float display_scale;
++    // Nonzero when display_scale is NOT expressed by the pixel/window split
++    // (Windows DPI, or the resolution-derived fallback): the ImGui host must
++    // inject logical size + framebuffer scale and de-scale mouse input.
++    int   synthetic_scale;
+ 
+     bool  scale_changed;   // set for one frame after a DPI/monitor change
+     bool  size_changed;    // set for one frame after a resize
+diff --git a/src/common/launcher_platform_sdl2.c b/src/common/launcher_platform_sdl2.c
+index c190d09..9f8980f 100644
+--- a/src/common/launcher_platform_sdl2.c
++++ b/src/common/launcher_platform_sdl2.c
+@@ -167,6 +167,17 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
+     SDL_RaiseWindow(p->window);   // foreground + keyboard focus (gamepad/kbd nav)
+ 
+     launcher_platform_refresh_metrics(p);
++    // A synthetic scale means the window was created in pixels at the logical
++    // design size — enlarge it so the scaled UI fits (fit keeps it on screen).
++    if (p->synthetic_scale) {
++        int w2 = (int)((float)logical_w * p->display_scale);
++        int h2 = (int)((float)logical_h * p->display_scale);
++        fit_initial_window_to_display(&w2, &h2);
++        SDL_SetWindowSize(p->window, w2, h2);
++        SDL_SetWindowPosition(p->window, SDL_WINDOWPOS_CENTERED,
++                              SDL_WINDOWPOS_CENTERED);
++        launcher_platform_refresh_metrics(p);
++    }
+     launcher_boot_timing_mark("rui:platform_open:window+gl_ready");
+     return true;
+ }
+@@ -217,11 +228,24 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+             if (dpi_scale > s) s = dpi_scale;
+         }
+     }
++    // Resolution fallback: a 4K/5K desktop at 100% OS scaling reports 96 dpi
++    // and renders the UI unreadably small. Derive a scale from the desktop
++    // height instead (1080p == 1.0), capped at 3.
++    if (s <= 1.001f) {
++        int rdisp = SDL_GetWindowDisplayIndex(p->window);
++        SDL_DisplayMode dm;
++        if (rdisp >= 0 && SDL_GetDesktopDisplayMode(rdisp, &dm) == 0 &&
++            dm.h >= 1600) {
++            s = (float)dm.h / 1080.0f;
++            if (s > 3.0f) s = 3.0f;
++        }
++    }
+     if (s <= 0.0f) s = 1.0f;
+     // Test hook (see launcher_platform_open): when LNG_FORCE_SCALE enlarged the
+     // window, treat it as a HiDPI display — the LOGICAL size is pixel/scale, and
+     // that scale drives DisplayFramebufferScale so ImGui renders at pixel density
+     // over a logical-sized layout (the Retina/Deck model, on any OS).
++    int env_applied = 0;
+     {
+         const char* fs = getenv("LNG_FORCE_SCALE");
+         if (fs && fs[0]) {
+@@ -230,9 +254,23 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+                 s = v;
+                 p->logical_w = (int)(p->pixel_w / v);
+                 p->logical_h = (int)(p->pixel_h / v);
++                env_applied = 1;
+             }
+         }
+     }
++    // Windows reports window sizes in pixels — a DPI- or resolution-derived
++    // scale is not expressed by the pixel/window split. Derive the logical
++    // size from it and mark the split synthetic so the ImGui host injects it
++    // and de-scales mouse coordinates.
++    p->synthetic_scale = 0;
++    if (env_applied) {
++        p->synthetic_scale = 1;
++    } else if (s > 1.001f && p->logical_w > 0 &&
++               p->pixel_w < (int)((float)p->logical_w * s * 0.999f)) {
++        p->logical_w = (int)((float)p->pixel_w / s);
++        p->logical_h = (int)((float)p->pixel_h / s);
++        p->synthetic_scale = 1;
++    }
+     p->display_scale = s;
+ }
+ 
+diff --git a/src/common/launcher_platform_sdl3.c b/src/common/launcher_platform_sdl3.c
+index 06a20b1..f0a2a13 100644
+--- a/src/common/launcher_platform_sdl3.c
++++ b/src/common/launcher_platform_sdl3.c
+@@ -113,6 +113,17 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
+     SDL_GL_SetSwapInterval(1);   // vsync — a launcher has no reason to spin
+ 
+     launcher_platform_refresh_metrics(p);
++    // A synthetic scale means the window was created in pixels at the logical
++    // design size — enlarge it so the scaled UI fits (fit keeps it on screen).
++    if (p->synthetic_scale) {
++        int w2 = (int)((float)logical_w * p->display_scale);
++        int h2 = (int)((float)logical_h * p->display_scale);
++        fit_initial_window_to_display(&w2, &h2);
++        SDL_SetWindowSize(p->window, w2, h2);
++        SDL_SetWindowPosition(p->window, SDL_WINDOWPOS_CENTERED,
++                              SDL_WINDOWPOS_CENTERED);
++        launcher_platform_refresh_metrics(p);
++    }
+     launcher_boot_timing_mark("rui:platform_open:window+gl_ready");
+     return true;
+ }
+@@ -141,6 +152,30 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+ 
+     float s = SDL_GetWindowDisplayScale(p->window);
+     if (s <= 0.0f) s = 1.0f;
++
++    // Resolution fallback: a 4K/5K desktop at 100% OS scaling reports scale
++    // 1.0 and renders the UI unreadably small. Derive a scale from the
++    // desktop height instead (1080p == 1.0), capped at 3.
++    if (s <= 1.001f) {
++        const SDL_DisplayMode* dm =
++            SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(p->window));
++        if (dm && dm->h >= 1600) {
++            s = (float)dm->h / 1080.0f;
++            if (s > 3.0f) s = 3.0f;
++        }
++    }
++
++    // On displays where window sizes are pixels (Windows, X11) the scale above
++    // is not expressed by the pixel/window split. Derive the logical size from
++    // it and mark the split synthetic so the ImGui host injects it and
++    // de-scales mouse coordinates.
++    p->synthetic_scale = 0;
++    if (s > 1.001f && p->logical_w > 0 &&
++        p->pixel_w < (int)((float)p->logical_w * s * 0.999f)) {
++        p->logical_w = (int)((float)p->pixel_w / s);
++        p->logical_h = (int)((float)p->pixel_h / s);
++        p->synthetic_scale = 1;
++    }
+     p->display_scale = s;
+ }
+ 
+diff --git a/src/consoles/psx/psx_profile.h b/src/consoles/psx/psx_profile.h
+index c801d65..fd96d06 100644
+--- a/src/consoles/psx/psx_profile.h
++++ b/src/consoles/psx/psx_profile.h
+@@ -159,6 +159,8 @@ static inline void launcher_profile_apply_psx(RecompLauncherCGameInfo* gi) {
+     gi->has_antialiasing = 1; gi->has_texture_filter = 1; gi->has_screen_kind = 1;
+     gi->has_fmv_filter = 1;    /* MDEC decodes video at native res; how it is
+                                 * scaled to the window is a player choice. */
++    gi->has_display_scaling = 1;
++    gi->has_fmv_crop = 1;
+     gi->has_frame_interp = 0; gi->has_spu_hq = 1; gi->has_skip_fmv = 0;
+     gi->has_turbo_loads = 1; gi->has_bios = 1;
+     gi->has_deadzone_pct = 1;
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 7208b19..fc60ab2 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -546,10 +546,12 @@ struct RecompLauncherCSettings {
+     // has_* flags below — consoles that don't set the flags leave these unused) ----
+     int  window_width;        // px window width (height follows aspect)
+     int  renderer;            // 0 = software, 1 = OpenGL
+-    int  supersampling;       // 1..4
++    int  supersampling;       // 1..16 (PSX_GL_MAX_INTERNAL_SCALE)
+     int  antialiasing;        // MSAA sample count: 0 = off, else 2/4/8 (x). (A
+                               // legacy on/off host may still write 0/1.)
+-    int  texture_filter;      // 0 = nearest, 1 = bilinear
++    int  texture_filter;      // 0 = nearest, 1 = bilinear (host may extend: 2 = 3-point, 3 = trilinear)
++    int  texture_filter_2d;   // bool: apply texture_filter to 2D elements (sprites/HUD); 0 keeps them nearest
++    int  post_processing;     // present post-process: 0 = off, 1 = FXAA (host may extend)
+     int  screen_kind;         // 0 raw, 1 CRT, 2 composite, 3 trinitron
+     int  frame_interp;        // bool
+     int  frame_interp_fps;    // 0=display, else 90/120/144/165/240
+@@ -741,6 +743,16 @@ struct RecompLauncherCSettings {
+      * Appended additively. */
+     int  fmv_filter;
+ 
++    /* display_scaling: how the finished frame is fitted to the window
++     * (GameInfo.has_display_scaling consoles). 1 nearest, 2 bilinear,
++     * 3 sharp-bilinear; 0 = unset (host derives from antialiasing).
++     * fmv_crop: Crop FMVs (GameInfo.has_fmv_crop). 1 off, 2 on - the host
++     * removes the black letterbox rows a movie carries inside its frame and
++     * trims the CRT overscan border, keeping pixel aspect; 0 = unset. (Older
++     * values 3/4 read as on.) Both appended additively. */
++    int  display_scaling;
++    int  fmv_crop;
++
+     /* Driver vsync at present time (GameInfo.has_vsync consoles).
+      *   RECOMP_LAUNCHER_VSYNC_ON (1)        tear-free, swap waits on the panel
+      *   RECOMP_LAUNCHER_VSYNC_OFF (2)       immediate swap, lowest display latency
+@@ -794,6 +806,16 @@ struct RecompLauncherCSettings {
+ /* Hosts can #ifdef on this to stay source-compatible with older recomp-ui. */
+ #define RECOMP_LAUNCHER_HAS_FMV_FILTER 1
+ 
++/* Values for RecompLauncherSettings.display_scaling / fmv_crop (1-based; 0 = unset). */
++#define RECOMP_LAUNCHER_DISPLAY_SCALING_NEAREST  1
++#define RECOMP_LAUNCHER_DISPLAY_SCALING_BILINEAR 2
++#define RECOMP_LAUNCHER_DISPLAY_SCALING_SHARP    3
++#define RECOMP_LAUNCHER_DISPLAY_SCALING_COUNT    3
++#define RECOMP_LAUNCHER_FMV_CROP_OFF   1
++#define RECOMP_LAUNCHER_FMV_CROP_ON    2
++#define RECOMP_LAUNCHER_FMV_CROP_COUNT 2
++#define RECOMP_LAUNCHER_HAS_DISPLAY_SCALING 1
++
+ // ---- host verification/inspection results (filled by the callbacks below) ----
+ // Plain-C structs so a host can implement the callbacks with zero launcher
+ // internal types. Mirror what the legacy launcher computed inline.
+@@ -1285,6 +1307,10 @@ typedef struct RecompLauncherCGameInfo {
+      * Appended for ABI stability. */
+     int has_fmv_filter;
+ 
++    /* Display rows for Settings.display_scaling / Settings.fmv_crop. Appended. */
++    int has_display_scaling;
++    int has_fmv_crop;
++
+     /* Optional defaults for the assist bindings above, each an array of
+      * assist_binding_count entries (keyboard = SDL scancodes, pad = the
+      * portable encoding). NULL leaves a binding unbound until the user sets
+-- 
+2.43.0
+

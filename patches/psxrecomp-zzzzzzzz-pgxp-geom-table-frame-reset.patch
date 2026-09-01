@@ -1,0 +1,107 @@
+From 27f5ad55b233d5cf6fea0dda6bc4f5bdac95cdc8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 05:44:20 +0000
+Subject: [PATCH] pgxp: retire the geometry table each frame
+
+The table maps an integer screen position to the sub-pixel projection that
+produced it. That mapping is only meaningful within ONE frame - next frame the
+camera has moved and the same pixel holds a different vertex - but nothing
+advanced the generation during normal play. The only three call sites were a
+savestate restore, a speculative rollback, and gte_geometry_correction_set()
+itself, so entries accumulated across every frame since the last of those.
+
+geom_note() is first-writer-wins and latches 'ambiguous' as soon as a second
+DIFFERENT sub-pixel value lands on an already-occupied pixel. Across frames
+that is inevitable - a vertex collides with its own entry from an earlier
+frame as soon as the camera moves - so the table saturated monotonically and
+the correction stopped applying. Measured in-race: 11,278 ambiguous rejections
+against 122 hits over two seconds, a 99% rejection rate on a tier that is
+supposed to be recovering sub-pixel positions.
+
+With correction silently off, adjacent polygons fall back to rounded integer
+positions inconsistently and seams open along the mesh - and because the
+saturation is progressive, the picture degrades the longer a race runs.
+Toggling the feature off and on advanced the generation and visibly repaired
+the scene for a few seconds, which is how the user found it.
+
+Advance once per frame from gpu_vblank_tick (renderer-independent, so the
+software rasterizer gets it too). Genuine within-frame ambiguity still gates
+correctly.
+---
+ runtime/include/cpu_state.h |  5 +++++
+ runtime/src/gpu.c           |  8 ++++++++
+ runtime/src/gte.cpp         | 26 ++++++++++++++++++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/runtime/include/cpu_state.h b/runtime/include/cpu_state.h
+index 66c1b786..03feefe8 100644
+--- a/runtime/include/cpu_state.h
++++ b/runtime/include/cpu_state.h
+@@ -211,6 +211,11 @@ extern void     gte_precision_tracking_set(int enabled);
+  * saturates SXY to integer screen pixels. Guest-visible GTE state is
+  * unchanged — this is a visual-only enhancement, default off. */
+ extern void     gte_geometry_correction_set(int enabled);
++/* Frame boundary: the geometry table maps an integer screen position to the
++ * sub-pixel projection behind it, which is only valid within one frame. Called
++ * from gpu_vblank_tick so entries cannot accumulate across frames and latch
++ * false ambiguity. */
++extern void     gte_geometry_frame_advance(void);
+ extern int      gte_geometry_correction_enabled(void);
+ /* Corrected vertices consumed since the last gte_geometry_correction_set —
+  * the "is this actually doing anything on this title" counter. */
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 88e85d2f..d6e26969 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3016,6 +3016,14 @@ void gpu_vblank_tick(void) {
+     }
+     split_trace_reset(&split_trace_this);
+     gpustat_poll_count = 0;
++    /* The PGXP geometry table describes ONE frame's projections (see
++     * gte_geometry_frame_advance): retire it here, on the guest frame
++     * boundary, so it is renderer-independent and cannot accumulate stale
++     * entries that latch false ambiguity and silently disable the correction. */
++    {
++        extern void gte_geometry_frame_advance(void);
++        gte_geometry_frame_advance();
++    }
+     /* Trusted package-selected plugins run on guest VBlank, independent of
+      * host presentation, pacing, turbo, or skipped frames. */
+     mod_runtime_on_vblank();
+diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
+index f70bbee7..61b5f185 100644
+--- a/runtime/src/gte.cpp
++++ b/runtime/src/gte.cpp
+@@ -360,6 +360,32 @@ extern "C" void gte_geometry_correction_set(int enabled) {
+     gpu_pgxp_rederive_enable();
+ }
+ 
++/* Per-frame table reset (gpu_vblank_tick).
++ *
++ * The geometry table is a slot-per-pixel map from an integer screen position
++ * to the sub-pixel projection that produced it, and it is only meaningful
++ * WITHIN one frame: next frame the camera has moved and the same pixel holds a
++ * different vertex. Nothing advanced the generation during normal play - only
++ * a savestate restore, a speculative rollback, or a toggle of the feature
++ * itself - so entries accumulated across every frame since the last of those.
++ *
++ * geom_note() is first-writer-wins and latches `ambiguous` as soon as a second
++ * DIFFERENT sub-pixel value lands on an occupied pixel. Across frames that is
++ * inevitable: a vertex collides with its own entry from a previous frame the
++ * moment the camera moves. So the table saturated monotonically - measured at
++ * 11,278 ambiguous rejections against 122 hits over two seconds - and the
++ * correction quietly stopped applying, reopening the seams it exists to close.
++ * Toggling the feature off/on advanced the generation and fixed the picture
++ * for a few seconds, which is exactly how this was found.
++ *
++ * Advancing once per frame keeps the table describing the frame it belongs to;
++ * genuine within-frame ambiguity (two vertices really sharing one pixel) still
++ * gates correctly. */
++extern "C" void gte_geometry_frame_advance(void) {
++    if (!s_geom_enabled || !s_geom_cache) return;
++    gte_geom_generation_advance();
++}
++
+ /* Lookup census for the debug server: attempted, hit, and the two miss classes.
+  * "unrecorded" means no projection was ever cached at that screen position —
+  * with an exact table that is a genuine coverage gap, not a cache artifact. */

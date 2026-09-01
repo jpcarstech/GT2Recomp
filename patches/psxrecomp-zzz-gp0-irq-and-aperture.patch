@@ -1,0 +1,78 @@
+diff --git a/runtime/src/dma_gpu_ll.c b/runtime/src/dma_gpu_ll.c
+index a462ab93..67820af9 100644
+--- a/runtime/src/dma_gpu_ll.c
++++ b/runtime/src/dma_gpu_ll.c
+@@ -16,8 +16,15 @@
+  * chains by toggling that high bit instead of writing the FFFFFFh marker.
+  * Masking it back into RAM and walking on turned one such tag into ~256k
+  * bogus nodes of GP0 spam per transfer. */
+-static int next_is_bus_error(uint32_t next) {
+-    return next != 0x00FFFFFFu && (next & 0x00800000u) != 0;
++static uint32_t resolve_address(const DMAGPULinkedListOps *ops, void *opaque,
++                                uint32_t address);
++static int next_is_bus_error(const DMAGPULinkedListOps *ops, void *opaque,
++                             uint32_t next) {
++    if (next == 0x00FFFFFFu || (next & 0x00800000u) == 0) return 0;
++    /* A pointer into the allocated mod GPU-DMA aperture (deliberately placed
++     * above the 8 MB window) resolves unfolded and stays valid; only an
++     * address that actually folds is the hardware bus-error case. */
++    return resolve_address(ops, opaque, next) != (next & 0x00FFFFFCu);
+ }
+ 
+ static uint32_t resolve_address(const DMAGPULinkedListOps *ops, void *opaque,
+@@ -99,7 +106,7 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+             finish(state, ops, opaque);
+             return;
+         }
+-        if (next_is_bus_error(state->next_addr)) {
++        if (next_is_bus_error(ops, opaque, state->next_addr)) {
+             state->bus_error = 1;
+             finish(state, ops, opaque);
+             return;
+@@ -125,7 +132,7 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+         }
+         state->total_words += state->word_count;
+ 
+-        if (state->next_addr == 0x00FFFFFFu || next_is_bus_error(state->next_addr)) {
++        if (state->next_addr == 0x00FFFFFFu || next_is_bus_error(ops, opaque, state->next_addr)) {
+             if (state->next_addr != 0x00FFFFFFu) state->bus_error = 1;
+             state->phase = DMA_GPU_LL_PHASE_COMPLETE;
+             state->cycles_remaining = state->word_count;
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 5519d5b0..04c6ca58 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -4791,7 +4791,13 @@ void gpu_ws_prepass_linked_list(uint32_t start_addr) {
+ 
+         uint32_t next = header & 0xFFFFFFu;
+         if (next == 0xFFFFFFu) break;
++        /* Mirror the DMA walker: an address outside the 8 MB DRAM decode
++         * window stops the transfer on hardware (DMA bus error / deliberate
++         * high-bit chain terminator, psx-spx) — don't keep walking garbage.
++         * A pointer into the allocated mod GPU-DMA aperture resolves
++         * unfolded and stays valid. */
+         addr = psx_mod_gpu_dma_resolve_address(next);
++        if ((next & 0x800000u) && addr != (next & 0xFFFFFCu)) break;
+     }
+     if (ws_ui_prepass_count == 0) {
+         ws_ui_prepass_count = 0;
+@@ -5152,6 +5158,19 @@ static void gp0_execute_command(void) {
+             gp0_exec_fill_rect();
+             break;
+ 
++        case 0x1F:
++            /* GP0(1Fh): Interrupt Request — sets GPUSTAT bit 24 and raises
++             * IRQ1 (edge: a request while the flag is still set is absorbed
++             * until GP1(02h) acknowledges it). Rarely used by games, but it
++             * IS a defined command — leaving it on the unimplemented-fatal
++             * path meant a stray 0x1F word in a corrupt display list took
++             * the whole process down (seen on GT2's race start). */
++            if (!irq1_flag) {
++                irq1_flag = 1;
++                psx_irq_raise(1, 0); /* IRQ_GPU */
++            }
++            break;
++
+         case 0xE1:
+             gp0_exec_draw_mode();
+             break;

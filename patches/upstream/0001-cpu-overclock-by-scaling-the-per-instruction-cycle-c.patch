@@ -1,0 +1,175 @@
+From 492a59cf40e923528091337f5ec03adf491fe2f3 Mon Sep 17 00:00:00 2001
+From: tetrisgm <30949000+tetrisgm@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 21:28:23 -0700
+Subject: [PATCH] cpu: overclock by scaling the per-instruction cycle charge
+
+The guest runs as native code, so "faster CPU" cannot mean "execute quicker" --
+it means CHARGE LESS for the same work. Every device schedules off
+psx_cycle_count and the CRTC fires VBlank on a fixed cycle period, so scaling
+the per-instruction charge down by N lets the CPU complete N times the work
+inside one frame while timers, SPU, CDROM and the refresh rate keep their
+real-world rates. Scaling the VBlank period instead would slow everything
+EXCEPT the CPU, which is backwards.
+
+Q16 fixed point with a carried remainder, not a divide: this is the hottest path
+in the runtime and integer division of a 1-2 cycle instruction cost would floor
+to zero and lose all time. The accumulator keeps the total charge exact instead
+of drifting by the truncation on every call. Stock (65536) short-circuits, so a
+non-overclocked build pays one predictable compare.
+
+[video] cpu_overclock, percent, 100 = stock. Needed because hueponik's
+pal100full8 requires >900%.
+
+STATUS, measured, not assumed: 100% and 300% boot and run. 1000% does NOT reach
+a display -- and it is neither hung nor host-bound, frames advance steadily at
+~39/s (455 -> 2574 over 54s) while the guest never enables the display. So the
+guest's own boot path stalls at that ratio; the mechanism moves time correctly
+but something in the boot sequence does not survive the CPU running 10x ahead of
+its devices. Not yet isolated, and it is the blocker for pal100full8.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+(cherry picked from commit 743717d55743178c493a284185ec2787826d8d38)
+---
+ recompiler/src/config_loader.cpp |  4 ++++
+ recompiler/src/config_loader.h   |  7 +++++++
+ runtime/include/psx_cycles.h     | 31 ++++++++++++++++++++++++++++++-
+ runtime/src/main.cpp             |  5 +++++
+ runtime/src/psx_cycles.c         | 20 ++++++++++++++++++++
+ 5 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index a8affe7b..3afc3798 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -610,6 +610,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         if (video.contains("offer_vulkan")) {
+             rt.video_offer_vulkan = toml::find<bool>(video, "offer_vulkan");
+         }
++        if (video.contains("cpu_overclock")) {
++            rt.runtime_cpu_overclock =
++                (uint32_t)toml::find<int>(video, "cpu_overclock");
++        }
+         if (video.contains("geometry_correction")) {
+             rt.video_geometry_correction =
+                 toml::find<bool>(video, "geometry_correction");
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 3a3adb36..ded393e3 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -406,6 +406,13 @@ struct RuntimeConfig {
+     // fallback. Stored as VIDEO_RENDERER_*.
+     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
+ 
++    // [video] cpu_overclock — percent of stock CPU speed. 100 = stock.
++    // The guest runs as native code, so this scales the per-instruction cycle
++    // CHARGE down: the CPU completes more work inside the same CRTC period
++    // while timers, SPU, CDROM and refresh keep their real rates.
++    // hueponik's pal100full8 patch requires >900%.
++    uint32_t              runtime_cpu_overclock = 100;
++
+     // geometry_correction: sub-pixel vertex precision (the PGXP-style fix for
+     // PS1 polygon jitter/wobble). The GTE projects in 16.16 and then throws the
+     // fraction away when it saturates SXY to integer screen pixels; vertices of
+diff --git a/runtime/include/psx_cycles.h b/runtime/include/psx_cycles.h
+index 25ba1f3b..ea47f016 100644
+--- a/runtime/include/psx_cycles.h
++++ b/runtime/include/psx_cycles.h
+@@ -79,6 +79,34 @@ void psx_advance_cycles(uint32_t cycles);
+  * on the HARD_CAP / event cadence, ≥ every 16K guest cycles) — not on every
+  * per-instruction charge. MotK VLC issues millions of advances/s; two add+
+  * branch pairs there were pure host tax. */
++/* CPU overclock. The guest CPU runs as native code, so "faster CPU" cannot
++ * mean "execute quicker" -- it means CHARGE LESS for the same work. Every
++ * device schedules off psx_cycle_count and the CRTC fires VBlank on a fixed
++ * cycle period, so scaling the per-instruction charge down by N lets the CPU
++ * complete N times as much work per frame while timers, SPU, CDROM and the
++ * refresh rate keep their real-world rates. Scaling the VBlank period instead
++ * would slow everything EXCEPT the CPU, which is the opposite.
++ *
++ * Q16 fixed point with a carried remainder rather than a divide: this is the
++ * hottest path in the runtime (millions of charges/sec), and integer division
++ * of a 1-2 cycle instruction cost would floor to zero and lose all time.
++ * 65536 == 1.0 == stock, and the accumulator makes the total charge exact
++ * over time rather than drifting by the truncation each call. */
++extern uint32_t g_psx_oc_scale_q16;
++extern uint32_t g_psx_oc_accum;
++
++/* percent: 100 = stock. hueponik's pal100full8 needs >900%. */
++void     psx_set_cpu_overclock(uint32_t percent);
++uint32_t psx_get_cpu_overclock(void);
++
++static inline uint32_t psx_oc_apply(uint32_t cycles) {
++    if (g_psx_oc_scale_q16 == 65536u) return cycles;   /* stock: exact */
++    uint64_t t = (uint64_t)cycles * (uint64_t)g_psx_oc_scale_q16
++               + (uint64_t)g_psx_oc_accum;
++    g_psx_oc_accum = (uint32_t)(t & 0xFFFFu);
++    return (uint32_t)(t >> 16);
++}
++
+ static inline void psx_advance_cycles(uint32_t cycles) {
+ #if !defined(PSX_COSIM)
+     if (g_psx_cyc_batch) {
+@@ -88,7 +116,7 @@ static inline void psx_advance_cycles(uint32_t cycles) {
+         if (cycles <= UINT32_MAX - b) cycles += b;
+         else {
+             /* Extreme: publish b first, then continue with cycles. */
+-            psx_cycle_count += (uint64_t)b;
++            psx_cycle_count += (uint64_t)psx_oc_apply(b);
+             if (!psx_in_device_service &&
+                 (psx_next_service_cycle == 0u ||
+                  psx_cycle_count >= psx_next_service_cycle)) {
+@@ -97,6 +125,7 @@ static inline void psx_advance_cycles(uint32_t cycles) {
+         }
+     }
+ #endif
++    cycles = psx_oc_apply(cycles);
+     if (cycles == 0u) return;
+ #if defined(PSX_COSIM)
+     psx_advance_cycles_slow(cycles);
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index cfb37487..d18db8d4 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -11844,6 +11844,11 @@ int main(int argc, char** argv) {
+             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
+             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
+             g_video_renderer   = gc.runtime.video_renderer;
++            if (gc.runtime.runtime_cpu_overclock != 100u) {
++                psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
++                std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
++                             psx_get_cpu_overclock());
++            }
+             g_video_screen     = gc.runtime.video_screen_kind;
+             g_video_aspect_num = gc.runtime.video_aspect_num;
+             g_video_aspect_den = gc.runtime.video_aspect_den;
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 1057093f..02076686 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -20,6 +20,26 @@
+ #include "cosim_state.h"
+ #endif
+ 
++/* CPU overclock state; the model is documented at psx_oc_apply in the header. */
++uint32_t g_psx_oc_scale_q16 = 65536u;   /* 1.0 = stock */
++uint32_t g_psx_oc_accum     = 0u;
++
++/* percent: 100 = stock, 1000 = 10x. Floor 100 because UNDERclocking would
++ * starve the guest of cycles the game assumes it has; ceiling 6400 because
++ * beyond that a single instruction charges 0 for long runs and the deadline
++ * model loses resolution against device schedules. */
++void psx_set_cpu_overclock(uint32_t percent) {
++    if (percent < 100u)  percent = 100u;
++    if (percent > 6400u) percent = 6400u;
++    g_psx_oc_scale_q16 = (uint32_t)((65536ull * 100ull) / (uint64_t)percent);
++    if (g_psx_oc_scale_q16 == 0u) g_psx_oc_scale_q16 = 1u;
++    g_psx_oc_accum = 0u;
++}
++
++uint32_t psx_get_cpu_overclock(void) {
++    if (g_psx_oc_scale_q16 == 0u) return 100u;
++    return (uint32_t)((65536ull * 100ull) / (uint64_t)g_psx_oc_scale_q16);
++}
+ uint64_t psx_cycle_count = 0;
+ uint32_t g_psx_cyc_batch = 0;
+ uint32_t g_psx_cyc_batch_limit = 0;

@@ -1,0 +1,140 @@
+From a58860f59d8bf794b9d2ce432f93cfc3a4093c4b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 28 Aug 2026 03:15:11 +0000
+Subject: [PATCH] GT2Recomp carried: [widescreen] stretch_24bpp_stills
+
+Menu and loading backdrops many PS1 games display as 24-bit stills go
+through the same display depth as FMV and were pinned 4:3 on wide
+windows. With the flag, only real MDEC activity classifies as FMV:
+movies keep the authentic 4:3 pillarbox, stills present like any game
+frame (stretched), matching global-aspect emulators. Default off.
+---
+ recompiler/src/config_loader.cpp |  5 +++++
+ recompiler/src/config_loader.h   |  1 +
+ runtime/src/gpu.c                | 12 +++++++++++-
+ runtime/src/main.cpp             | 19 +++++++++++++++++--
+ 4 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index f6d7e7a9..23746749 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -1445,6 +1445,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+     bool ws_full_2d = false;
+     bool ws_gte_game_mode = false;
+     bool ws_gte_squash = true;
++    bool ws_stretch_24bpp_stills = false;
+     bool ws_precise_nclip = false;
+     uint32_t ws_gameplay_state_addr = 0;
+     std::vector<uint32_t> ws_gameplay_state_values;
+@@ -1598,6 +1599,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+         // the GTE X-squash stays identity so the patch is not double-applied.
+         if (ws.contains("gte_squash"))
+             ws_gte_squash = toml::find<bool>(ws, "gte_squash");
++        if (ws.contains("stretch_24bpp_stills"))
++            ws_stretch_24bpp_stills =
++                toml::find<bool>(ws, "stretch_24bpp_stills");
+         if (ws.contains("precise_nclip"))
+             ws_precise_nclip = toml::find<bool>(ws, "precise_nclip");
+         const bool has_gameplay_state_addr = ws.contains("gameplay_state_addr");
+@@ -2187,6 +2191,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+         /*ws_full_2d*/            ws_full_2d,
+         /*ws_gte_game_mode*/      ws_gte_game_mode,
+         /*ws_gte_squash*/         ws_gte_squash,
++        /*ws_stretch_24bpp_stills*/ ws_stretch_24bpp_stills,
+         /*ws_precise_nclip*/      ws_precise_nclip,
+         /*ws_gameplay_state_addr*/ ws_gameplay_state_addr,
+         /*ws_gameplay_state_values*/ ws_gameplay_state_values,
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 61c4af29..1dcbfd66 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1040,6 +1040,7 @@ struct GameConfig {
+     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
+     bool ws_gte_game_mode = false;
+     bool ws_gte_squash = true;
++    bool ws_stretch_24bpp_stills = false;
+ 
+     // [widescreen] precise_nclip — use the runtime's unsaturated GTE projection
+     // provenance for NCLIP/backface tests while classic adaptive widescreen is
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 654dcbac..057ab286 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -221,6 +221,9 @@ static int ws_gameplay_state_value_count = 0;
+  * this many consecutive frames (save/options/memory-card) — reverts to 4:3. */
+ #define WS_GTE_GAME_MODE_HYSTERESIS 45u
+ void gpu_ws_set_gte_game_mode(int on) { ws_gte_game_mode_cfg = on ? 1 : 0; }
++static int ws_stretch_stills_cfg = 0;
++void gpu_ws_set_stretch_stills(int on) { ws_stretch_stills_cfg = on ? 1 : 0; }
++int gpu_ws_stretch_stills(void) { return ws_stretch_stills_cfg; }
+ void gpu_pgxp_rederive_enable(void);
+ void gpu_ws_set_precise_nclip(int on) {
+     ws_precise_nclip_cfg = on ? 1 : 0;
+@@ -363,7 +366,14 @@ int gpu_ws_present_native_43(void) {
+     if (f != s_ws_fmv_frame_cache) {
+         s_ws_fmv_frame_cache = f;
+         GpuDisplayInfo di; gpu_get_display_info(&di);
+-        s_ws_fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
++        /* [widescreen] stretch_24bpp_stills: many PS1 games draw menu and
++         * loading backdrops as 24-bit STILL images through the same display
++         * depth FMV uses. With the flag on, only real MDEC activity
++         * classifies as FMV — stills present like any game frame
++         * (stretched on a wide window), matching how a global-aspect
++         * emulator shows them. Default off: depth24 stays FMV. */
++        s_ws_fmv_cached = (di.depth24 && !ws_stretch_stills_cfg) ||
++                          mdec_recently_active(WS_FMV_HYSTERESIS);
+     }
+     return s_ws_fmv_cached;
+ }
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 02e7ca05..fc82e59b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1598,6 +1598,8 @@ extern "C" int gpu_ws_netplay_local_viewport_base_x(void);
+ extern "C" int gpu_ws_netplay_local_viewport_width(void);
+ extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
+ extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
++extern "C" void gpu_ws_set_stretch_stills(int on);
++extern "C" int  gpu_ws_stretch_stills(void);
+ /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
+  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
+  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
+@@ -7625,7 +7627,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+          * of truth, shared with the GTE/GPU squash so content and present stay
+          * locked: we squash IFF we stretch. depth24 always classifies as FMV
+          * even if the ws layer is not engaged yet (4:3 titles). */
+-        fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
++        {
++            const bool d24_fmv = di.depth24 && !gpu_ws_stretch_stills();
++            /* With stretch_24bpp_stills, gpu_ws_present_native_43() already
++             * folds real MDEC activity in — a playing movie still pins 4:3. */
++            fmv_frame = d24_fmv || !g_ws_engaged ||
++                        gpu_ws_present_native_43() != 0;
++        }
+         /* MDEC movies are already decoded at their authored cadence and are
+          * CPU/upload heavy. High-refresh crossfades only contend with decoding
+          * and can starve audio, so present native-4:3/MDEC phases directly.
+@@ -7778,7 +7786,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         }
+         /* depth24 (MotK crawl is 128 lines): pin short bands for letterbox even
+          * when fmv_frame is false on a plain 4:3 window (ws layer not engaged). */
+-        pin_43 = fmv_frame || di.depth24 || (nw_pin && !wide_present);
++        {
++            pin_43 = fmv_frame || (di.depth24 && !gpu_ws_stretch_stills()) ||
++                     (nw_pin && !wide_present);
++        }
+         if (!wide_present) {
+             /* Never hires-present under netplay CPU-auth (even if settings say
+              * 4× — that preference is offline-only). */
+@@ -11928,6 +11939,10 @@ int main(int argc, char** argv) {
+                                   gc.ws_bg2d_packet_cap);
+             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
+             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
++            /* [widescreen] stretch_24bpp_stills — menu/loading backdrops drawn
++             * as 24-bit stills present like game frames; only real MDEC
++             * playback stays 4:3. */
++            gpu_ws_set_stretch_stills(gc.ws_stretch_24bpp_stills ? 1 : 0);
+             /* [widescreen] gte_squash=false — game-native anamorphic source
+              * (a game-side widescreen patch): keep present/classification but
+              * leave the GTE X-squash at identity. */

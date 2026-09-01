@@ -1,0 +1,385 @@
+From 5887f8088aaa86bc85d468e8b9cdaad41baca7f7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 06:12:57 +0000
+Subject: [PATCH] pgxp: retire the dataflow shadow with a one-frame grace
+ window
+
+Measured on the user's machine, the two endpoints both fail and in opposite
+directions:
+
+  never retire  - shadows accumulate for the whole race. The RAM shadow is
+                  address-keyed and validated on an exact match of the packed
+                  SXY word, but that word is only the INTEGER screen position,
+                  so an entry left at a display-list address frames ago is
+                  believed as soon as a new vertex lands on its pixel. It gets
+                  that vertex's fraction wrong, adjacent polygons disagree
+                  about a shared corner, and seams open along the mesh.
+
+  wipe each frame - 'framewipe on' closed most of the seams and introduced
+                  wobble: a game builds its display list on frame N and lets
+                  the GPU consume it on frame N+1, so wiping at the boundary
+                  strands those vertices on rounded integer positions, which
+                  is precisely the artefact PGXP exists to remove.
+
+The window between them is the fix: keep exactly the current and previous
+generation live. The build->consume handoff is served, and staleness is
+bounded to one frame instead of a whole race. Every validity test now goes
+through gen_live(); assignments still stamp the current generation, and
+pgxp_invalidate_all() stays HARD (a savestate restore or feature toggle
+collapses the grace generation) so restored state cannot revive old
+provenance.
+
+framewipe stays live-tunable: 0 = never (old), 1 = hard wipe, 2 = window
+(default), so the three can be compared in one session without a rebuild.
+---
+ runtime/src/pgxp.cpp | 105 ++++++++++++++++++++++++++++---------------
+ 1 file changed, 69 insertions(+), 36 deletions(-)
+
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 58687c8e..ce89ad69 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -73,6 +73,16 @@ static PGXPValue  s_gpr[34];                  /* 32 GPRs + HI + LO            */
+ static PGXPValue  s_gte[32];                  /* GTE data registers           */
+ 
+ static uint32_t s_gen = 1;
++/* Second live generation: the PREVIOUS frame. A game builds its display list
++ * on one frame and lets the GPU consume it on the next (double-buffered
++ * ordering tables), so a shadow written on frame N is legitimately read on
++ * frame N+1 - retiring it at the frame boundary strands those vertices on
++ * their rounded integer positions, which is wobble. Keeping exactly one extra
++ * generation live serves that handoff while still bounding staleness to a
++ * single frame, so an entry from ten frames ago can no longer be believed
++ * because a new vertex happened to land on its integer pixel. */
++static uint32_t s_gen_prev = 1;
++static inline int gen_live(uint32_t g) { return g == s_gen || g == s_gen_prev; }
+ static int      s_enabled = 0;
+ static int      s_cpu_mode = 0;
+ static float    s_tolerance = -1.0f;  /* unclamped (DuckStation default); the
+@@ -108,6 +118,10 @@ extern "C" void pgxp_invalidate_all(void) {
+         std::memset(s_gte, 0, sizeof(s_gte));
+         s_gen = 1;
+     }
++    /* A HARD invalidate: a savestate restore or a feature toggle must strand
++     * every prior shadow, so collapse the grace generation onto the new one.
++     * Only the frame boundary opens the one-frame window. */
++    s_gen_prev = s_gen;
+ }
+ 
+ extern "C" void pgxp_set_enabled(int enabled) {
+@@ -145,11 +159,30 @@ extern "C" int pgxp_enabled(void) { return s_enabled; }
+  * Kept behind a toggle because a game that builds its display list on frame N
+  * and lets the GPU consume it on frame N+1 (double-buffered ordering tables)
+  * needs the shadow to survive that handoff; mode 1 tells us whether GT2 does. */
+-static int s_frame_wipe = 0;
+-extern "C" void pgxp_set_frame_wipe(int mode) { s_frame_wipe = mode ? 1 : 0; }
++/* 0 = never retire (the original behaviour: shadows accumulate forever, go
++ *     stale, and vertices inherit fractions from frames long past - seams)
++ * 1 = hard wipe every frame (no shadow survives the build->consume handoff, so
++ *     vertices fall back to rounded integer positions - wobble)
++ * 2 = retire with a one-frame grace window (default): last frame's shadows
++ *     stay readable, everything older is stranded. */
++static int s_frame_wipe = 2;
++extern "C" void pgxp_set_frame_wipe(int mode) {
++    s_frame_wipe = (mode >= 0 && mode <= 2) ? mode : 2;
++}
+ extern "C" int  pgxp_frame_wipe(void) { return s_frame_wipe; }
+ extern "C" void pgxp_frame_boundary(void) {
+-    if (s_frame_wipe && s_enabled) pgxp_invalidate_all();
++    if (!s_enabled || s_suppress != 0) return;
++    if (s_frame_wipe == 1) { pgxp_invalidate_all(); return; }
++    if (s_frame_wipe != 2) return;
++    s_gen_prev = s_gen;                    /* last frame stays live */
++    if (++s_gen == 0) {
++        if (s_ram) std::memset(s_ram, 0, PGXP_RAM_WORDS * sizeof(PGXPValue));
++        std::memset(s_scratch, 0, sizeof(s_scratch));
++        std::memset(s_gpr, 0, sizeof(s_gpr));
++        std::memset(s_gte, 0, sizeof(s_gte));
++        s_gen = 1;
++        s_gen_prev = 1;
++    }
+ }
+ 
+ extern "C" void pgxp_set_cpu_mode(int enabled) { s_cpu_mode = enabled ? 1 : 0; }
+@@ -198,13 +231,13 @@ static inline PGXPValue *pgxp_ptr(uint32_t addr) {
+ }
+ 
+ static inline int pv_live(const PGXPValue *pv) {
+-    return pv && pv->gen == s_gen && (pv->flags & PGXP_F_VXY) != 0;
++    return pv && gen_live(pv->gen) && (pv->flags & PGXP_F_VXY) != 0;
+ }
+ 
+ /* Drop whichever tracked halves no longer match the actual guest word; the
+  * depth belongs to the whole vertex, so any half going stale kills it too. */
+ static inline void pv_validate(PGXPValue *pv, uint32_t actual) {
+-    if (pv->gen != s_gen) return;
++    if (!gen_live(pv->gen)) return;
+     uint32_t diff = pv->value ^ actual;
+     if ((pv->flags & PGXP_F_VX) && (diff & 0x0000FFFFu))
+         pv->flags &= (uint16_t)~(PGXP_F_VX | PGXP_F_VZ);
+@@ -251,7 +284,7 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
+     switch (f_op(instr)) {
+     case 0x23: {                               /* LW                          */
+         PGXPValue *src = pgxp_ptr(addr);
+-        if (src && src->gen == s_gen) {
++        if (src && gen_live(src->gen)) {
+             pv_validate(src, value);
+             *dst = *src;
+         } else {
+@@ -269,7 +302,7 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
+          * cpu-mode keeps working. */
+         dst->y16 = ((int32_t)value >> 16) << 16;
+         dst->flags = PGXP_F_VY;
+-        if (src && src->gen == s_gen) {
++        if (src && gen_live(src->gen)) {
+             uint32_t actual_half = (value & 0xFFFFu) << (hi_half ? 16 : 0);
+             uint32_t mask = hi_half ? 0xFFFF0000u : 0x0000FFFFu;
+             uint16_t want = hi_half ? PGXP_F_VY : PGXP_F_VX;
+@@ -325,7 +358,7 @@ extern "C" int pgxp_probe(uint32_t addr, uint32_t *flags, uint32_t *value,
+                           int32_t *x16, int32_t *y16, uint32_t *z, int *live) {
+     PGXPValue *pv = pgxp_ptr(addr);
+     if (!pv) return 0;
+-    *live = (pv->gen == s_gen);
++    *live = (gen_live(pv->gen));
+     *flags = pv->flags; *value = pv->value;
+     *x16 = pv->x16; *y16 = pv->y16; *z = pv->z;
+     return 1;
+@@ -343,7 +376,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+     switch (f_op(instr)) {
+     case 0x2B: {                               /* SW                          */
+         trap_note(addr, instr, value, 1);
+-        if (src && src->gen == s_gen) {
++        if (src && gen_live(src->gen)) {
+             pv_validate(src, value);
+             *dst = *src;
+         } else {
+@@ -355,7 +388,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+         trap_note(addr, instr, value, 2);
+         int hi_half = (addr >> 1) & 1;
+         uint32_t half = value & 0xFFFFu;
+-        if (dst->gen != s_gen) pv_reset(dst, half << (hi_half ? 16 : 0));
++        if (!gen_live(dst->gen)) pv_reset(dst, half << (hi_half ? 16 : 0));
+         /* Patch the stored half into the tracked word; the other half's
+          * validity (if any) survives untouched. Depth never survives a
+          * half-write — the vertex it described no longer exists whole. */
+@@ -363,7 +396,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+         else         dst->value = (dst->value & 0xFFFF0000u) | half;
+         dst->flags &= (uint16_t)~((hi_half ? PGXP_F_VY : PGXP_F_VX) | PGXP_F_VZ);
+         dst->z = 0;
+-        if (src && src->gen == s_gen && (src->flags & PGXP_F_VX) &&
++        if (src && gen_live(src->gen) && (src->flags & PGXP_F_VX) &&
+             ((src->value ^ value) & 0xFFFFu) == 0) {
+             if (hi_half) { dst->y16 = src->x16; dst->flags |= PGXP_F_VY; }
+             else         { dst->x16 = src->x16; dst->flags |= PGXP_F_VX; }
+@@ -371,7 +404,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+         return;
+     }
+     case 0x28: {                               /* SB                          */
+-        if (dst->gen != s_gen) return;         /* nothing tracked: stay dead  */
++        if (!gen_live(dst->gen)) return;         /* nothing tracked: stay dead  */
+         uint32_t shift = (addr & 3u) * 8u;
+         dst->value = (dst->value & ~(0xFFu << shift)) |
+                      ((value & 0xFFu) << shift);
+@@ -421,7 +454,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+         s_cnt_lwc2++;
+         PGXPValue *src = pgxp_ptr(addr);
+         PGXPValue *dst = &s_gte[f_rt(instr)];
+-        if (src && src->gen == s_gen) {
++        if (src && gen_live(src->gen)) {
+             pv_validate(src, value);
+             *dst = *src;
+             if (!(src->flags & PGXP_F_VXY) && f_rt(instr) >= 12 &&
+@@ -439,12 +472,12 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+         {
+             PGXPValue *tsrc = &s_gte[f_rt(instr)];
+             trap_note2(addr, instr, value, 4, tsrc->flags,
+-                       tsrc->gen == s_gen, tsrc->value);
++                       gen_live(tsrc->gen), tsrc->value);
+         }
+         PGXPValue *dst = pgxp_ptr(addr);
+         if (!dst) return;
+         PGXPValue *src = &s_gte[f_rt(instr)];
+-        if (src->gen == s_gen) {
++        if (gen_live(src->gen)) {
+             pv_validate(src, value);
+             *dst = *src;
+         } else {
+@@ -459,7 +492,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+             uint32_t rt = f_rt(instr);
+             if (rt == 0) return;
+             PGXPValue *src = &s_gte[f_rd(instr)];
+-            if (src->gen == s_gen) {
++            if (gen_live(src->gen)) {
+                 pv_validate(src, value);
+                 s_gpr[rt] = *src;
+             } else {
+@@ -472,10 +505,10 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+             uint32_t rt = f_rt(instr);
+             PGXPValue *dst = &s_gte[f_rd(instr)];
+             if (f_rd(instr) >= 12 && f_rd(instr) <= 15 &&
+-                !(rt != 0 && s_gpr[rt].gen == s_gen &&
++                !(rt != 0 && gen_live(s_gpr[rt].gen) &&
+                   (s_gpr[rt].flags & PGXP_F_VXY)))
+                 dead_lwc2_note(0xFFFF0000u | f_rd(instr), value, 2);
+-            if (rt != 0 && s_gpr[rt].gen == s_gen) {
++            if (rt != 0 && gen_live(s_gpr[rt].gen)) {
+                 pv_validate(&s_gpr[rt], value);
+                 *dst = s_gpr[rt];
+             } else {
+@@ -509,7 +542,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+  * sub-pixel value; an untracked half contributes its exact integer value
+  * (adding an exact offset to a tracked coordinate keeps the fraction). */
+ static inline int32_t comp16(const PGXPValue *pv, uint32_t value, int hi_half) {
+-    if (pv && pv->gen == s_gen) {
++    if (pv && gen_live(pv->gen)) {
+         if (!hi_half && (pv->flags & PGXP_F_VX) &&
+             ((pv->value ^ value) & 0x0000FFFFu) == 0)
+             return pv->x16;
+@@ -521,7 +554,7 @@ static inline int32_t comp16(const PGXPValue *pv, uint32_t value, int hi_half) {
+ }
+ 
+ static inline int comp_tracked(const PGXPValue *pv, uint32_t value, int hi_half) {
+-    if (!pv || pv->gen != s_gen) return 0;
++    if (!pv || !gen_live(pv->gen)) return 0;
+     if (!hi_half)
+         return (pv->flags & PGXP_F_VX) &&
+                ((pv->value ^ value) & 0x0000FFFFu) == 0;
+@@ -555,7 +588,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+         uint32_t funct = f_funct(instr);
+         if (funct == 0x11 || funct == 0x13) {  /* MTHI / MTLO                 */
+             PGXPValue *hl = &s_gpr[funct == 0x11 ? PGXP_REG_HI : PGXP_REG_LO];
+-            if (s_cpu_mode && rs != 0 && s_gpr[rs].gen == s_gen) {
++            if (s_cpu_mode && rs != 0 && gen_live(s_gpr[rs].gen)) {
+                 pv_validate(&s_gpr[rs], result);
+                 *hl = s_gpr[rs];
+             } else pv_reset(hl, result);
+@@ -566,13 +599,13 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+ 
+         switch (funct) {
+         case 0x10:                             /* MFHI                        */
+-            if (s_cpu_mode && s_gpr[PGXP_REG_HI].gen == s_gen) {
++            if (s_cpu_mode && gen_live(s_gpr[PGXP_REG_HI].gen)) {
+                 pv_validate(&s_gpr[PGXP_REG_HI], result);
+                 *dst = s_gpr[PGXP_REG_HI];
+             } else pv_reset(dst, result);
+             return;
+         case 0x12:                             /* MFLO                        */
+-            if (s_cpu_mode && s_gpr[PGXP_REG_LO].gen == s_gen) {
++            if (s_cpu_mode && gen_live(s_gpr[PGXP_REG_LO].gen)) {
+                 pv_validate(&s_gpr[PGXP_REG_LO], result);
+                 *dst = s_gpr[PGXP_REG_LO];
+             } else pv_reset(dst, result);
+@@ -583,7 +616,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+             uint32_t src_reg = rt;
+             PGXPValue *src = (src_reg != 0) ? &s_gpr[src_reg] : nullptr;
+             int right = (funct & 3u) != 0;
+-            if (!s_cpu_mode || sh != 16 || !src || src->gen != s_gen) {
++            if (!s_cpu_mode || sh != 16 || !src || !gen_live(src->gen)) {
+                 pv_reset(dst, result);
+                 return;
+             }
+@@ -618,14 +651,14 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+             int is_and = (funct == 0x24);
+             uint32_t ident_rs = is_and ? 0xFFFFFFFFu : 0u;  /* rs preserved when rt == this */
+             if (s2 == ident_rs) {              /* result == s1: copy rs       */
+-                if (rs != 0 && s_gpr[rs].gen == s_gen) {
++                if (rs != 0 && gen_live(s_gpr[rs].gen)) {
+                     pv_validate(&s_gpr[rs], result);
+                     *dst = s_gpr[rs];
+                 } else pv_reset(dst, result);
+                 return;
+             }
+             if (s1 == ident_rs) {              /* result == s2: copy rt       */
+-                if (rt != 0 && s_gpr[rt].gen == s_gen) {
++                if (rt != 0 && gen_live(s_gpr[rt].gen)) {
+                     pv_validate(&s_gpr[rt], result);
+                     *dst = s_gpr[rt];
+                 } else pv_reset(dst, result);
+@@ -670,14 +703,14 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+             int is_or = (funct == 0x25);
+             int is_sub = (funct == 0x22 || funct == 0x23);
+             if ((is_or || !is_sub) && rt == 0) {   /* op rd, rs, $zero        */
+-                if (rs != 0 && s_gpr[rs].gen == s_gen) {
++                if (rs != 0 && gen_live(s_gpr[rs].gen)) {
+                     pv_validate(&s_gpr[rs], result);
+                     *dst = s_gpr[rs];
+                 } else pv_reset(dst, result);
+                 return;
+             }
+             if ((is_or || !is_sub) && rs == 0) {   /* op rd, $zero, rt        */
+-                if (rt != 0 && s_gpr[rt].gen == s_gen) {
++                if (rt != 0 && gen_live(s_gpr[rt].gen)) {
+                     pv_validate(&s_gpr[rt], result);
+                     *dst = s_gpr[rt];
+                 } else pv_reset(dst, result);
+@@ -688,14 +721,14 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+              * branchless-select tail `addu rd, base, (diff & mask)` reduces
+              * to this whenever the mask chose zero. */
+             if (s2 == 0) {                     /* result == s1: copy rs       */
+-                if (rs != 0 && s_gpr[rs].gen == s_gen) {
++                if (rs != 0 && gen_live(s_gpr[rs].gen)) {
+                     pv_validate(&s_gpr[rs], result);
+                     *dst = s_gpr[rs];
+                 } else pv_reset(dst, result);
+                 return;
+             }
+             if (!is_sub && s1 == 0) {          /* result == s2: copy rt       */
+-                if (rt != 0 && s_gpr[rt].gen == s_gen) {
++                if (rt != 0 && gen_live(s_gpr[rt].gen)) {
+                     pv_validate(&s_gpr[rt], result);
+                     *dst = s_gpr[rt];
+                 } else pv_reset(dst, result);
+@@ -765,7 +798,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+     case 0x08: case 0x09: {                    /* ADDI / ADDIU                */
+         int32_t imm = f_simm(instr);
+         if (imm == 0) {                        /* MOVE idiom                  */
+-            if (rs != 0 && s_gpr[rs].gen == s_gen) {
++            if (rs != 0 && gen_live(s_gpr[rs].gen)) {
+                 pv_validate(&s_gpr[rs], result);
+                 *dst = s_gpr[rs];
+             } else pv_reset(dst, result);
+@@ -833,7 +866,7 @@ extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+     }
+     case 0x0E: {                               /* XORI                        */
+         if ((instr & 0xFFFFu) == 0) {          /* MOVE idiom                  */
+-            if (rs != 0 && s_gpr[rs].gen == s_gen) {
++            if (rs != 0 && gen_live(s_gpr[rs].gen)) {
+                 pv_validate(&s_gpr[rs], result);
+                 *dst = s_gpr[rs];
+             } else pv_reset(dst, result);
+@@ -956,7 +989,7 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+ 
+     if (s_enabled && addr != 0xFFFFFFFFu) {
+         PGXPValue *pv = pgxp_ptr(addr);
+-        if (pv && pv->gen == s_gen && (pv->flags & PGXP_F_VXY) != 0) {
++        if (pv && gen_live(pv->gen) && (pv->flags & PGXP_F_VXY) != 0) {
+             if (pv->value == packet_word &&
+                 (pv->flags & PGXP_F_VXY) == PGXP_F_VXY) {
+                 px = pv->x16;
+@@ -968,7 +1001,7 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                 s_stats.value_mismatch++;
+                 s_last_resolve_state = 3;
+             }
+-        } else if (pv && pv->gen == s_gen) {
++        } else if (pv && gen_live(pv->gen)) {
+             s_last_resolve_state = 2;              /* live but flagless */
+         } else if (pv) {
+             s_last_resolve_state = 1;              /* stale generation  */
+@@ -1034,7 +1067,7 @@ extern "C" void pgxp_store_gte_reg(uint32_t addr, uint8_t reg) {
+     PGXPValue *dst = pgxp_ptr(addr);
+     if (!dst) return;
+     const PGXPValue *src = &s_gte[reg & 31u];
+-    if (src->gen != s_gen) return;
++    if (!gen_live(src->gen)) return;
+     s_stats.swc2_stores++;
+     *dst = *src;
+ }
+@@ -1082,7 +1115,7 @@ extern "C" int pgxp_load_precise_word(uint32_t addr, uint32_t packed,
+                                       int32_t *x16, int32_t *y16, uint16_t *z) {
+     if (!s_enabled) return 0;
+     PGXPValue *pv = pgxp_ptr(addr);
+-    if (!pv || pv->gen != s_gen || pv->value != packed ||
++    if (!pv || !gen_live(pv->gen) || pv->value != packed ||
+         (pv->flags & PGXP_F_VXY) != PGXP_F_VXY)
+         return 0;
+     if (x16) *x16 = pv->x16;

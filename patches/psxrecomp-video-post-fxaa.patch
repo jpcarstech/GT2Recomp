@@ -1,0 +1,382 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index d573dbdc..bc17f280 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2313,6 +2313,11 @@ UserSettings load_user_settings(const fs::path& path) {
+             s.texture_filter_2d = toml::find<bool>(v, "texture_filtering_2d");
+             s.has_texture_filter_2d = true;
+         });
++        if (v.contains("post_processing")) try_get([&]{
++            const auto m = toml::find<std::string>(v, "post_processing");
++            if (m == "off") { s.post_processing = 0; s.has_post_processing = true; }
++            else if (m == "fxaa") { s.post_processing = 1; s.has_post_processing = true; }
++        });
+         if (v.contains("fmv_filter")) try_get([&]{
+             const auto m = toml::find<std::string>(v, "fmv_filter");
+             if (video_fmv_filter_parse(m, &s.fmv_filter)) s.has_fmv_filter = true;
+@@ -2653,6 +2658,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+     }
+     if (s.has_texture_filter_2d)
+         f << "texture_filtering_2d = " << (s.texture_filter_2d ? "true" : "false") << "\n";
++    if (s.has_post_processing)
++        f << "post_processing = \"" << (s.post_processing == 1 ? "fxaa" : "off") << "\"\n";
+     if (s.has_fmv_filter)
+         f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
+     if (s.has_geometry_correction)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 95902895..daf5d226 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1203,6 +1203,7 @@ struct UserSettings {
+     bool has_antialiasing   = false; bool antialiasing   = true;
+     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear
+     bool has_texture_filter_2d = false; bool texture_filter_2d = true; // filter 2D sprites/UI too
++    bool has_post_processing = false; int post_processing = 0; // 0=off,1=fxaa
+     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+     // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+     bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index bb4440d0..57138e85 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -97,6 +97,8 @@ void gl_renderer_set_fmv_filter(int cfg_value);
+ /* Apply the texture filter to 2D elements (sprites + 1:1 screen-aligned
+  * polys). 1 = filter everything (legacy); 0 = 2D stays nearest. */
+ void gl_renderer_set_texture_filter_2d(int on);
++/* Present post-processing: 0 = off, 1 = FXAA over the final game frame. */
++void gl_renderer_set_post_processing(int mode);
+ int  gl_renderer_cpu_auth_dual(void);
+ 
+ /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).
+diff --git a/runtime/include/host_keymap.h b/runtime/include/host_keymap.h
+index cd78a5af..2c2babde 100644
+--- a/runtime/include/host_keymap.h
++++ b/runtime/include/host_keymap.h
+@@ -23,6 +23,7 @@ typedef enum HostKeymapAction {
+     HOST_KEYMAP_SAVE_STATE_MENU,  /* default F7 */
+     HOST_KEYMAP_RUNTIME_MENU,     /* default F1 */
+     HOST_KEYMAP_SWAP_CONTROLLER_PORTS, /* default F6 */
++    HOST_KEYMAP_QUIT,             /* default Escape; DOUBLE-press to exit */
+     HOST_KEYMAP_ACTION_COUNT
+ } HostKeymapAction;
+ 
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 2be1059b..63eb8e1a 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -916,8 +916,47 @@ static const char *PRESENT_FS =
+     "  r += texture(u_tex, vec2(t3.x , t3.y )) * (w3.x  * w3.y );\n"
+     "  return r;\n"
+     "}\n"
++    /* u_sharp==3: FXAA post-AA over the presented frame (classic compact
++     * FXAA 3.11: 5-tap luma cross, edge-direction estimate, two blended
++     * probes along the edge, inner/outer acceptance test). Runs in SOURCE
++     * texel space; taps clamp to u_uv_rect so edge pixels never blend
++     * VRAM content from outside the displayed rect. */
++    "vec2 fxaa_clamp(vec2 uv){\n"
++    "  vec2 lo = min(u_uv_rect.xy, u_uv_rect.zw);\n"
++    "  vec2 hi = max(u_uv_rect.xy, u_uv_rect.zw);\n"
++    "  return clamp(uv, lo, hi);\n"
++    "}\n"
++    "vec4 fxaa(vec2 uv){\n"
++    "  vec2 px = 1.0 / u_tex_size;\n"
++    "  const vec3 lw = vec3(0.299, 0.587, 0.114);\n"
++    "  vec3 rgbNW = texture(u_tex, fxaa_clamp(uv + vec2(-1.0,-1.0)*px)).rgb;\n"
++    "  vec3 rgbNE = texture(u_tex, fxaa_clamp(uv + vec2( 1.0,-1.0)*px)).rgb;\n"
++    "  vec3 rgbSW = texture(u_tex, fxaa_clamp(uv + vec2(-1.0, 1.0)*px)).rgb;\n"
++    "  vec3 rgbSE = texture(u_tex, fxaa_clamp(uv + vec2( 1.0, 1.0)*px)).rgb;\n"
++    "  vec4 texM  = texture(u_tex, uv);\n"
++    "  float lNW = dot(rgbNW, lw), lNE = dot(rgbNE, lw);\n"
++    "  float lSW = dot(rgbSW, lw), lSE = dot(rgbSE, lw);\n"
++    "  float lM  = dot(texM.rgb, lw);\n"
++    "  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));\n"
++    "  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));\n"
++    "  vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)),\n"
++    "                   ((lNW + lSW) - (lNE + lSE)));\n"
++    "  float dirReduce = max((lNW + lNE + lSW + lSE) * 0.25 * 0.125, 1.0/128.0);\n"
++    "  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);\n"
++    "  dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * px;\n"
++    "  vec3 rgbA = 0.5 * (\n"
++    "      texture(u_tex, fxaa_clamp(uv + dir * (1.0/3.0 - 0.5))).rgb +\n"
++    "      texture(u_tex, fxaa_clamp(uv + dir * (2.0/3.0 - 0.5))).rgb);\n"
++    "  vec3 rgbB = rgbA * 0.5 + 0.25 * (\n"
++    "      texture(u_tex, fxaa_clamp(uv + dir * -0.5)).rgb +\n"
++    "      texture(u_tex, fxaa_clamp(uv + dir *  0.5)).rgb);\n"
++    "  float lB = dot(rgbB, lw);\n"
++    "  vec3 rgb = (lB < lMin || lB > lMax) ? rgbA : rgbB;\n"
++    "  return vec4(rgb, texM.a);\n"
++    "}\n"
+     "void main(){\n"
+     "  vec2 uv = v_uv;\n"
++    "  if (u_sharp == 3) { frag = fxaa(uv); return; }\n"
+     "  if (u_sharp == 2) { frag = bicubic(uv); return; }\n"
+     "  if (u_sharp == 1) {\n"
+     "    vec2 scale = max(u_sharp_scale, vec2(1.0));\n"
+@@ -2039,14 +2078,24 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+      * triangles - filtering such prims only smears, never helps). */
+     int prim_2d = (lim != NULL);
+     if (!prim_2d && !s_tex_filter_2d && s_tex_filter != 0) {
+-        prim_2d = 1;
+-        for (int e = 0; e < 3 && prim_2d; e++) {
+-            int j = (e + 1) % 3;
+-            int dx = xs[j] - xs[e], dy = ys[j] - ys[e];
+-            int du = us[j] - us[e], dv = vs[j] - vs[e];
+-            if ((dx != du && dx != -du) || (dy != dv && dy != -dv))
+-                prim_2d = 0;
+-        }
++        /* Axis-aligned UV mapping at ANY scale: u depends only on x and v
++         * only on y (u = a + s*x, v = b + t*y). Solving the affine gradient
++         * from two independent edges, the cross terms must vanish:
++         *   du/dy = 0  <=>  dx1*du2 == dx2*du1
++         *   dv/dx = 0  <=>  dv1*dy2 == dv2*dy1
++         * This is every screen-aligned UI quad - HUD elements, menu art and
++         * scaled backdrops drawn as polys - where filtering only smears
++         * pixel art. Perspective-projected world geometry virtually never
++         * lands on an exact axis-aligned integer mapping (and a wall passing
++         * through perfect alignment for a frame just samples nearest for
++         * that frame). Degenerate (det==0) slivers count as 2D - filtering
++         * cannot help a zero-area prim. */
++        int dx1 = xs[1] - xs[0], dy1 = ys[1] - ys[0];
++        int dx2 = xs[2] - xs[0], dy2 = ys[2] - ys[0];
++        int du1 = us[1] - us[0], dv1 = vs[1] - vs[0];
++        int du2 = us[2] - us[0], dv2 = vs[2] - vs[0];
++        prim_2d = (dx1 * du2 == dx2 * du1) &&
++                  (dv1 * dy2 == dv2 * dy1);
+     }
+     const int eff_filter =
+         (prim_2d && !s_tex_filter_2d) ? 0 : s_tex_filter;
+@@ -2657,6 +2706,15 @@ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear)
+     }
+ }
+ 
++/* Present post-processing: 0 = off, 1 = FXAA (shader-pass AA over the
++ * final frame - far cheaper than MSAA; smooths polygon and dither edges).
++ * Applied on the game-frame present paths (FBO/wide); FMV keeps its own
++ * reconstruction filter. */
++static int s_present_postfx = 0;
++void gl_renderer_set_post_processing(int mode) {
++    s_present_postfx = (mode == 1) ? 1 : 0;
++}
++
+ static int s_fmv_filter_cfg = 0;          /* VIDEO_FMV_FILTER_NEAREST */
+ 
+ void gl_renderer_set_fmv_filter(int cfg_value) {
+@@ -4137,8 +4195,16 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+     p_glUseProgram(s_present_prog);
+     p_glUniform1i(s_present_uTex, 0);
+     /* The rasterized path already renders at the internal scale, so it has no
+-     * low-res source to reconstruct — keep the plain sample. */
+-    present_set_sharp(0, 0, 0, 0, 0);
++     * low-res source to reconstruct — keep the plain sample. FXAA (postfx 1)
++     * instead runs the post-AA branch over the source texels; its fractional
++     * taps need LINEAR filtering whatever the AA setting chose. */
++    if (s_present_postfx == 1) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        present_set_sharp(3, tex_w * s_scale, tex_h * s_scale, lw, lh);
++    } else {
++        present_set_sharp(0, 0, 0, 0, 0);
++    }
+     /* Half-texel inset: with GL_LINEAR, corner-mapped UVs make the outermost
+      * dest pixels blend the border texel with VRAM outside the content rect
+      * (visible edge stripe with AA on). Center-mapped UVs keep edge samples
+diff --git a/runtime/src/host_keymap.c b/runtime/src/host_keymap.c
+index 63103686..c9772685 100644
+--- a/runtime/src/host_keymap.c
++++ b/runtime/src/host_keymap.c
+@@ -102,6 +102,10 @@ static void apply_defaults(void) {
+     if (s_actions[HOST_KEYMAP_SWAP_CONTROLLER_PORTS].count == 0)
+         add_bind(HOST_KEYMAP_SWAP_CONTROLLER_PORTS, (int)SDLK_F6,
+                  (int)SDL_SCANCODE_F6, 0);
++    /* Quit is a DOUBLE-press bind (main.cpp enforces the 450 ms window) so a
++     * stray Escape - the universal "back out" reflex - never eats a session. */
++    if (s_actions[HOST_KEYMAP_QUIT].count == 0)
++        add_bind(HOST_KEYMAP_QUIT, (int)SDLK_ESCAPE, (int)SDL_SCANCODE_ESCAPE, 0);
+ }
+ 
+ /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
+@@ -162,6 +166,7 @@ static HostKeymapAction action_for_key(const char *name) {
+     if (ieq(name, "RuntimeMenu")) return HOST_KEYMAP_RUNTIME_MENU;
+     if (ieq(name, "SwapControllerPorts"))
+         return HOST_KEYMAP_SWAP_CONTROLLER_PORTS;
++    if (ieq(name, "Quit")) return HOST_KEYMAP_QUIT;
+     return HOST_KEYMAP_ACTION_COUNT;
+ }
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 56eade71..20841058 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1198,7 +1198,8 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+     return cfg_value + 1;
+ }
+ static int           g_video_texfilter = 0;
+-static int           g_video_texfilter_2d = 1;  /* filter 2D sprites/UI too (legacy on) */ /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */
++static int           g_video_texfilter_2d = 1;  /* filter 2D sprites/UI too (legacy on) */
++static int           g_video_postfx = 0;        /* present post-processing: 0 off, 1 FXAA */ /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */
+ /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
+  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
+  * SXY readback are untouched. Default off = the faithful floor. */
+@@ -7071,6 +7072,25 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                     netplay_soft_exit("netplay_escape");
+                     return ep;
+                 }
++                /* Double-press Quit (default Escape): PS1 games have no exit
++                 * path of their own, so give the keyboard one. Two presses
++                 * within 450 ms exit through the same clean path as closing
++                 * the window (memcards flushed by shutdown_runtime); a single
++                 * press just arms and hints, so the universal "back out"
++                 * reflex never eats a session. */
++                if (!key_repeat &&
++                    host_keymap_match_event(HOST_KEYMAP_QUIT, (int)key,
++                                            (int)scancode, (int)mod)) {
++                    static uint32_t s_quit_arm_ms = 0;
++                    const uint32_t now_ms = SDL_GetTicks();
++                    if (s_quit_arm_ms != 0 && now_ms - s_quit_arm_ms <= 450u) {
++                        psx_crash_trace_set_exit_origin("double_escape_quit");
++                        shutdown_runtime();
++                        std::exit(0);
++                    }
++                    s_quit_arm_ms = now_ms;
++                    host_osd_push("Press again to exit", 900);
++                }
+                 if (!key_repeat &&
+                     host_keymap_match_event(HOST_KEYMAP_REWIND, (int)key,
+                                             (int)scancode, (int)mod)) {
+@@ -12257,6 +12277,7 @@ int main(int argc, char** argv) {
+         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+         if (us.has_texture_filter_2d) g_video_texfilter_2d = us.texture_filter_2d ? 1 : 0;
++        if (us.has_post_processing) g_video_postfx = us.post_processing;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+         if (us.has_geometry_correction)
+             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
+@@ -12758,6 +12779,7 @@ int main(int argc, char** argv) {
+             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
+             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
+             seed.texture_filter_2d = (g_video_texfilter_2d != 0); seed.has_texture_filter_2d = true;
++            seed.post_processing = g_video_postfx;        seed.has_post_processing = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
+             /* Seeded (and marked present) so a launcher save round-trips the
+              * player's hand-edited value instead of dropping the key. */
+@@ -12948,6 +12970,7 @@ int main(int argc, char** argv) {
+             ls.antialiasing       = seed.antialiasing ? 1 : 0;
+             ls.texture_filter     = seed.texture_filter;
+             ls.texture_filter_2d  = seed.texture_filter_2d ? 1 : 0;
++            ls.post_processing    = seed.post_processing;
+             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
+             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
+             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
+@@ -13183,6 +13206,8 @@ int main(int argc, char** argv) {
+                 seed.has_texture_filter = true;
+                 seed.texture_filter_2d = ls.texture_filter_2d != 0;
+                 seed.has_texture_filter_2d = true;
++                seed.post_processing = (ls.post_processing == 1) ? 1 : 0;
++                seed.has_post_processing = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 seed.has_fmv_filter = true;
+                 {
+@@ -13378,6 +13403,46 @@ int main(int argc, char** argv) {
+             }
+ 
+             if (lr == 1) {
++                /* Persist Settings-panel edits on quit-without-play: closing
++                 * the launcher used to silently discard every change (the
++                 * readback + save only ran on Play) - the classic "set
++                 * 3-Point, close, it's back to Nearest" report. Overlay the
++                 * panel fields onto the EXISTING file so paths and netplay
++                 * identity survive untouched. */
++                {
++                    std::filesystem::path sp =
++                        exe_dir_from_argv(argv[0]) / "settings.toml";
++                    PSXRecompV4::UserSettings qs =
++                        PSXRecompV4::load_user_settings(sp);
++                    if (!qs.parse_error) {
++                        qs.renderer = ls.renderer; qs.has_renderer = true;
++                        qs.supersampling = ls.supersampling; qs.has_supersampling = true;
++                        qs.antialiasing = ls.antialiasing != 0; qs.has_antialiasing = true;
++                        qs.texture_filter = ls.texture_filter; qs.has_texture_filter = true;
++                        qs.texture_filter_2d = ls.texture_filter_2d != 0;
++                        qs.has_texture_filter_2d = true;
++                        qs.post_processing = (ls.post_processing == 1) ? 1 : 0;
++                        qs.has_post_processing = true;
++                        qs.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
++                        qs.has_fmv_filter = true;
++                        qs.geometry_correction = ls.geometry_correction != 0;
++                        qs.has_geometry_correction = true;
++                        qs.perspective_texturing = ls.perspective_texturing != 0;
++                        qs.has_perspective_texturing = true;
++                        qs.screen_kind = ls.screen_kind; qs.has_screen_kind = true;
++                        qs.fullscreen = ls.fullscreen; qs.has_fullscreen = true;
++                        qs.frame_interpolation = ls.frame_interp != 0;
++                        qs.has_frame_interpolation = true;
++                        qs.frame_interpolation_fps = ls.frame_interp_fps;
++                        qs.has_frame_interpolation_fps = true;
++                        qs.skip_launcher = ls.skip_launcher != 0;
++                        qs.has_skip_launcher = true;
++                        if (!PSXRecompV4::save_user_settings(sp, qs))
++                            std::fprintf(stderr,
++                                "psxrecomp: WARNING: settings.toml save failed on "
++                                "launcher quit (%s)\n", sp.string().c_str());
++                    }
++                }
+                 std::fprintf(stdout, "psxrecomp: launcher closed; exiting.\n");
+                 if (overlay_init_thread.joinable())
+                     overlay_init_thread.join();
+@@ -13437,6 +13502,8 @@ int main(int argc, char** argv) {
+                 g_video_scale     = seed.supersampling;
+                 g_video_aa        = seed.antialiasing;
+                 g_video_texfilter = seed.texture_filter;
++                g_video_texfilter_2d = seed.texture_filter_2d ? 1 : 0;
++                g_video_postfx = seed.post_processing;
+                 g_video_fmv_filter = seed.fmv_filter;
+                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
+                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
+@@ -13517,8 +13584,11 @@ int main(int argc, char** argv) {
+                 }
+                 g_video_win_w = seed.window_width;
+                 /* Persist the user's choices next to the exe. */
+-                PSXRecompV4::save_user_settings(
+-                    exe_dir_from_argv(argv[0]) / "settings.toml", seed);
++                if (!PSXRecompV4::save_user_settings(
++                        exe_dir_from_argv(argv[0]) / "settings.toml", seed))
++                    std::fprintf(stderr,
++                        "psxrecomp: WARNING: settings.toml save failed on "
++                        "launch - settings will not persist\n");
+             }
+         }
+     }
+@@ -13790,6 +13860,7 @@ session_reboot:
+     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+     gr_set_texture_filter(g_video_texfilter);
+     gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
++    gl_renderer_set_post_processing(g_video_postfx);
+     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
+      * with both off every setter below leaves the tracking caches disabled and
+      * the draw path is the faithful integer one, unchanged. */
+@@ -15219,6 +15290,8 @@ soft_return_lobby:
+                 us.has_texture_filter = true;
+                 us.texture_filter_2d = ls.texture_filter_2d != 0;
+                 us.has_texture_filter_2d = true;
++                us.post_processing = (ls.post_processing == 1) ? 1 : 0;
++                us.has_post_processing = true;
+                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 us.has_fmv_filter = true;
+                 us.geometry_correction = ls.geometry_correction != 0;
+@@ -15280,6 +15353,16 @@ soft_return_lobby:
+             g_video_scale = ls.supersampling;
+             g_video_aa = ls.antialiasing;
+             g_video_texfilter = ls.texture_filter;
++            g_video_texfilter_2d = ls.texture_filter_2d ? 1 : 0;
++            g_video_postfx = (ls.post_processing == 1) ? 1 : 0;
++            /* Re-apply live: the boot-time renderer apply already ran, so an
++             * in-game Apply must push the filter family down itself or the
++             * change silently waits for the next launch. All three setters
++             * are plain state stores - safe mid-frame, picked up by the next
++             * batch/present. */
++            gr_set_texture_filter(g_video_texfilter);
++            gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
++            gl_renderer_set_post_processing(g_video_postfx);
+             g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
+             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;

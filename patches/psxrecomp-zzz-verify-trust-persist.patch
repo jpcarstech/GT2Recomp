@@ -1,0 +1,173 @@
+diff --git a/runtime/src/overlay_loader.c b/runtime/src/overlay_loader.c
+index 8beec864..db82cbbd 100644
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -1020,6 +1020,11 @@ static void loaded_pair_commit(int tier, int provenance, uint64_t pair_id,
+ 
+ /* ---- Candidate registration -------------------------------------------- */
+ 
++/* Persistent verify-trust (defined with the cache-dir statics below). */
++static void trust_load_once(void);
++static int  trust_find(uint32_t addr, uint32_t crc, uint8_t tier);
++static uint32_t s_trust_pretrusted;     /* candidates seeded this run */
++
+ static void loader_log(const char *fmt, ...);   /* defined below */
+ static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
+                          int tier) {
+@@ -1053,6 +1058,13 @@ static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
+      * all). A candidate is callable iff live RAM matches this compiled-from hash,
+      * which makes validity timing-independent and reload-on-return work. */
+     c->crc_code = m->crc;
++    trust_load_once();
++    if (trust_find(c->addr, c->crc_code, c->tier)) {
++        /* Verified clean across the full budget in a previous session with
++         * these exact compiled bytes - start trusted, skip re-verification. */
++        c->diff_passes = OVERLAY_DIFF_BUDGET;
++        s_trust_pretrusted++;
++    }
+     c->val_gen = cand_gensum(c);
+     c->state   = (cand_crc(c) == c->crc_code && cand_delay_slots_hashed(c))
+                ? ENTRY_VALID : ENTRY_INVALID;
+@@ -1093,6 +1105,118 @@ static char s_game_id[64];
+ static uint32_t s_config_hash;
+ static int  s_active = 0;
+ 
++/* ---- Persistent differential-verify trust ------------------------------
++ * A candidate must pass OVERLAY_DIFF_BUDGET consecutive clean differential
++ * runs before executing native-live, and that counter lived only in this
++ * process: EVERY session re-verified every hot function from zero, running
++ * each dispatch twice (native + interpreter compare) for the first minutes
++ * of play. On a warmed cache that is a large, recurring startup tax (GT2:
++ * ~15k candidates x 32 passes; the first minute of every launch - the intro
++ * movie - audibly starved the audio thread).
++ *
++ * A shard's verification outcome is a function of its compiled bytes, not
++ * of the session: identity = (entry addr, authoritative code CRC, compiler
++ * tier). Entries that complete the budget cleanly are appended to a trust
++ * file under the cache; at registration a matching candidate starts with a
++ * full budget and skips re-verification. Divergence identities are never
++ * written (a diverging candidate resets and cannot complete the budget),
++ * and a recompiled shard has a new CRC, so stale trust cannot apply. */
++typedef struct { uint32_t addr, crc; uint8_t tier; } TrustKey;
++#define TRUST_CAP (CAND_CAP)
++static TrustKey s_trust[TRUST_CAP];
++static uint32_t s_trust_n = 0;
++static int      s_trust_loaded = 0;
++static int      s_trust_dirty = 0;
++
++static void trust_file_path(char *buf, size_t n) {
++    snprintf(buf, n, "%s/%s/verify_trust_v1.txt", s_cache_dir, s_game_id);
++}
++
++static uint32_t s_trust_sorted_n = 0;   /* prefix kept sorted (loaded file) */
++
++static int trust_cmp(const void *a, const void *b) {
++    const TrustKey *x = (const TrustKey *)a, *y = (const TrustKey *)b;
++    if (x->addr != y->addr) return x->addr < y->addr ? -1 : 1;
++    if (x->crc  != y->crc)  return x->crc  < y->crc  ? -1 : 1;
++    return (int)x->tier - (int)y->tier;
++}
++
++static int trust_find(uint32_t addr, uint32_t crc, uint8_t tier) {
++    TrustKey k; k.addr = addr; k.crc = crc; k.tier = tier;
++    if (s_trust_sorted_n &&
++        bsearch(&k, s_trust, s_trust_sorted_n, sizeof(TrustKey), trust_cmp))
++        return 1;
++    for (uint32_t i = s_trust_sorted_n; i < s_trust_n; i++)
++        if (s_trust[i].addr == addr && s_trust[i].crc == crc &&
++            s_trust[i].tier == tier)
++            return 1;
++    return 0;
++}
++
++static void trust_flush(void);
++
++static void trust_load_once(void) {
++    if (s_trust_loaded || !s_cache_dir[0] || !s_game_id[0]) return;
++    s_trust_loaded = 1;
++    atexit(trust_flush);
++    char path[640];
++    trust_file_path(path, sizeof(path));
++    FILE *f = fopen(path, "rb");
++    if (!f) return;
++    char line[128];
++    while (fgets(line, sizeof(line), f) && s_trust_n < TRUST_CAP) {
++        unsigned a, c, t;
++        if (sscanf(line, "%x %x %u", &a, &c, &t) == 3) {
++            s_trust[s_trust_n].addr = a;
++            s_trust[s_trust_n].crc = c;
++            s_trust[s_trust_n].tier = (uint8_t)t;
++            s_trust_n++;
++        }
++    }
++    fclose(f);
++    qsort(s_trust, s_trust_n, sizeof(TrustKey), trust_cmp);
++    s_trust_sorted_n = s_trust_n;
++}
++
++static void trust_flush(void) {
++    if (!s_trust_dirty || !s_cache_dir[0] || !s_game_id[0]) return;
++    char path[640], tmp[656];
++    trust_file_path(path, sizeof(path));
++    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
++    FILE *f = fopen(tmp, "wb");
++    if (!f) return;
++    for (uint32_t i = 0; i < s_trust_n; i++)
++        fprintf(f, "%08X %08X %u\n", s_trust[i].addr, s_trust[i].crc,
++                (unsigned)s_trust[i].tier);
++    fclose(f);
++#ifdef _WIN32
++    MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
++#else
++    rename(tmp, path);
++#endif
++    s_trust_dirty = 0;
++}
++
++static void trust_note_completed(const Candidate *c) {
++    /* Called when a candidate crosses to a FULL budget via a clean pass. */
++    if (c->state == ENTRY_BLACKLIST) return;
++    if (s_trust_n >= TRUST_CAP) return;
++    if (trust_find(c->addr, c->crc_code, c->tier)) return;
++    s_trust[s_trust_n].addr = c->addr;
++    s_trust[s_trust_n].crc  = c->crc_code;
++    s_trust[s_trust_n].tier = c->tier;
++    s_trust_n++;
++    s_trust_dirty = 1;
++    /* Rate-limited opportunistic flush: at most one file write per 64 new
++     * completions; the atexit flush catches the remainder. */
++    if ((s_trust_n & 63u) == 0) trust_flush();
++}
++
++uint32_t overlay_trust_stats(uint32_t *loaded) {
++    if (loaded) *loaded = s_trust_n;
++    return s_trust_pretrusted;
++}
++
+ /* Canonical (filesystem-resolved) form of s_cache_dir, computed lazily on the
+  * first live publication — the root is guaranteed to exist by then (the
+  * compiler just wrote a DLL into it). cache_path_has_root() is sound ONLY on
+@@ -4159,7 +4283,10 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
+     }
+     if (!scheduler_bail && reg < 0 && !hidiff && !lodiff && ramoff < 0) {
+         /* Clean pass: credit the verify budget. */
+-        if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
++        if (c->diff_passes < OVERLAY_DIFF_BUDGET) {
++            c->diff_passes++;
++            if (c->diff_passes == OVERLAY_DIFF_BUDGET) trust_note_completed(c);
++        }
+     } else {
+         /* Divergence: reset the budget. Promotion to live requires N CONSECUTIVE
+          * clean passes (the spec's "0 divergences over the budget"), so an
+@@ -4394,7 +4521,10 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
+     if (kind == SHDIFF_NONE && scheduler_bail) kind = SHDIFF_SCHED;
+ 
+     if (kind == SHDIFF_NONE) {
+-        if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
++        if (c->diff_passes < OVERLAY_DIFF_BUDGET) {
++            c->diff_passes++;
++            if (c->diff_passes == OVERLAY_DIFF_BUDGET) trust_note_completed(c);
++        }
+     } else {
+         c->diff_passes = 0;
+         c->device_touch = 1;  /* fail closed: all later calls stay interpreted */

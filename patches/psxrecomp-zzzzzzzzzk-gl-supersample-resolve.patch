@@ -1,0 +1,137 @@
+From 7825a9271b9a9fb659ba7fc31ca52f79a64423a6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 14:26:30 +0000
+Subject: [PATCH] gl: resolve the supersampled surface at present (mip-chain
+ box filter) instead of decimating it
+
+The scene is rasterized at s_scale x native but presented by sampling that
+surface straight into the window: at 16x into a 1280x960 window that is a
+4:1 minification, and GL_NEAREST ([video] antialiasing=false) keeps ONE of
+every 16 rendered pixels; GL_LINEAR keeps four. The supersamples are thrown
+away and what reaches the screen is decimation aliasing - every thin detail
+(billboard text, palm fronds, wires, fence mesh, the car's trunk emblem)
+changes shape as it moves by sub-window-pixel amounts. PGXP's sub-pixel
+geometry makes that motion happen every frame, so on screen it reads as
+wobble on trackside objects and texture crawl on the car, and it got worse
+when supersampling went from 4x to 16x. screenshot_hires reads the surface,
+not the window, which is why no capture ever showed it.
+
+When the present is minifying (>1.05:1), generate the mip chain down to the
+minification level and sample LINEAR_MIPMAP_LINEAR: at an integer ratio that
+IS the box average of the supersamples (level 2 == 4x4 box); in between it
+blends the two nearest box levels. Magnified or 1:1 presents keep the user's
+nearest/linear choice. Filter state is restored after the draw so blits,
+hold captures and pack still see a single-level texture. Lab, 16x into a
+1440x1080 window, creeping past the Tahiti billboards: pixels changing per
+frame in the billboard region 5-9k (decimated) -> 1-4k (resolved), text and
+fronds smooth; no black frames (chain is complete up to MAX_LEVEL).
+---
+ runtime/src/gpu_gl_renderer.c | 53 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index eae9d13b..315ef06c 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -106,6 +106,7 @@
+ #define PSXGL_ARRAY_BUFFER          0x8892
+ #define PSXGL_STREAM_DRAW           0x88E0
+ #define PSXGL_FRAMEBUFFER           0x8D40
++#define PSXGL_TEXTURE_MAX_LEVEL     0x813D
+ #define PSXGL_READ_FRAMEBUFFER      0x8CA8
+ #define PSXGL_DRAW_FRAMEBUFFER      0x8CA9
+ #define PSXGL_COLOR_ATTACHMENT0     0x8CE0
+@@ -171,6 +172,11 @@ typedef void   (APIENTRY *PFN_glBufferData)(GLenum, ptrdiff_t, const void *, GLe
+ typedef void   (APIENTRY *PFN_glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
+ typedef void   (APIENTRY *PFN_glEnableVertexAttribArray)(GLuint);
+ typedef void   (APIENTRY *PFN_glBindFragDataLocationIndexed)(GLuint, GLuint, GLuint, const char *);
++typedef GLsync (APIENTRY *PFN_glFenceSync)(GLenum, GLbitfield);
++typedef void   (APIENTRY *PFN_glWaitSync)(GLsync, GLbitfield, GLuint64);
++typedef void   (APIENTRY *PFN_glDeleteSync)(GLsync);
++typedef void   (APIENTRY *PFN_glGenerateMipmap)(GLenum);
++static PFN_glGenerateMipmap p_glGenerateMipmap;   /* optional: supersample resolve at present */
+ typedef void   (APIENTRY *PFN_glGenFramebuffers)(GLsizei, GLuint *);
+ typedef void   (APIENTRY *PFN_glDeleteFramebuffers)(GLsizei, const GLuint *);
+ typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
+@@ -305,6 +311,9 @@ static int load_modern_gl(void) {
+     p_glGetQueryObjectui64v = (void *)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
+     p_glGetQueryObjectiv    = (void *)SDL_GL_GetProcAddress("glGetQueryObjectiv");
+     p_glQueryCounter        = (void *)SDL_GL_GetProcAddress("glQueryCounter");
++    /* Supersample resolve at present — optional; without it the present falls
++     * back to the historical point/bilinear sample. */
++    p_glGenerateMipmap      = (void *)SDL_GL_GetProcAddress("glGenerateMipmap");
+ #undef LOAD
+     return ok;
+ }
+@@ -3208,6 +3217,7 @@ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear)
+  * Applied on the game-frame present paths (FBO/wide); FMV keeps its own
+  * reconstruction filter. */
+ static int s_present_postfx = 0;
++static int s_present_resolved = 0;   /* last present used the mip resolve (debug) */
+ void gl_renderer_set_post_processing(int mode) {
+     s_present_postfx = (mode == 1) ? 1 : 0;
+ }
+@@ -4868,6 +4878,42 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+     glBindTexture(GL_TEXTURE_2D, tex);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
++    /* SUPERSAMPLE RESOLVE. The scene is rasterized at s_scale x native, but the
++     * window is usually far smaller than that surface (16x = 5120x3840 into a
++     * 1280x960 window is a 4:1 minification). Point-sampling that (the
++     * [video] antialiasing=false present) keeps ONE of every 16 rendered
++     * pixels; GL_LINEAR keeps four. Either way the supersamples are thrown
++     * away, and what survives is decimation aliasing: every thin detail -
++     * billboard text, palm fronds, wires, fence mesh, the car's emblem -
++     * changes shape as it moves by sub-window-pixel amounts. With PGXP's
++     * sub-pixel geometry that motion happens every frame, so it reads as
++     * wobble/shimmer on trackside objects and texture crawl on the car; the
++     * lab never sees it because screenshot_hires reads the surface, not the
++     * window. Resolve it properly: generate the mip chain down to the
++     * minification level and sample LINEAR_MIPMAP_LINEAR, which at an integer
++     * ratio IS the box average of the supersamples (level 2 == 4x4 box) and
++     * in between blends the two nearest box levels. This is what
++     * supersampling means; before this the extra scale bought nothing at the
++     * window but aliasing. Only when actually minifying; a 1:1 or magnified
++     * present keeps the user's nearest/linear choice untouched. */
++    {
++        int did_mip = 0;
++        if (p_glGenerateMipmap && s_scale > 1 && w > 0 && h > 0 && lw > 0 && lh > 0) {
++            float rx = (float)(w * s_scale) / (float)lw;
++            float ry = (float)(h * s_scale) / (float)lh;
++            float r = rx > ry ? rx : ry;
++            if (r > 1.05f) {
++                int levels = 0; float t = r;
++                while (t > 1.0f && levels < 8) { t *= 0.5f; levels++; }
++                glTexParameteri(GL_TEXTURE_2D, PSXGL_TEXTURE_MAX_LEVEL, levels);
++                p_glGenerateMipmap(GL_TEXTURE_2D);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                did_mip = 1;
++            }
++        }
++        s_present_resolved = did_mip;
++    }
+     p_glUseProgram(s_present_prog);
+     p_glUniform1i(s_present_uTex, 0);
+     /* PGXP crack fill: active when presenting either the canonical hires scene
+@@ -4913,7 +4959,8 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+      * instead runs the post-AA branch over the source texels; its fractional
+      * taps need LINEAR filtering whatever the AA setting chose. */
+     if (s_present_postfx == 1) {
+-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
++                        s_present_resolved ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+         present_set_sharp(3, tex_w * s_scale, tex_h * s_scale, lw, lh);
+     } else {
+@@ -4942,6 +4989,10 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+     glDrawArrays(GL_TRIANGLES, 0, 3);
+     p_glBindVertexArray(0);
+     p_glUseProgram(0);
++    /* Leave the texture non-mipmapped for every other consumer (blits, hold
++     * captures, pack) — they bind it expecting a single-level sample. */
++    if (s_present_resolved)
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+ }
+ 
+ /* Bezel art: a still image behind the frame, filling whatever the letterbox or

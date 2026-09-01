@@ -1,0 +1,101 @@
+From 1f38db17b4944cada48de06af917ce32fd347d42 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 06:18:04 +0000
+Subject: [PATCH] pgxp: census WHY a vertex falls back to the integer position
+
+The share that falls back (6.2% in-race) says a seam is possible but not what
+to fix. Every seam is two copies of one corner where one landed in that 6.2%
+and the other did not, so the question is which failure mode puts it there.
+
+Six buckets, tallied at the resolve exit and reported over the debug server:
+noaddr / stale / flagless / mismatch / tracked / fallback.
+
+'flagless' is the one worth knowing: a LIVE slot carrying no X/Y precision
+means the address WAS tracked but the value reached it through a path that did
+not propagate a projection - a copy, a half-word assembly, a DMA. That is
+provenance lost in transit, which is a bug with an address to hunt, as opposed
+to provenance never recorded.
+---
+ runtime/src/debug_server.c | 13 +++++++++++--
+ runtime/src/pgxp.cpp       | 23 +++++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 16f3e3bf..8a4223b6 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5249,6 +5249,10 @@ static void handle_geom_correction(int id, const char *json)
+      * triangles that reach the predicate. */
+     uint64_t tc_att = 0, tc_arm = 0, tc_off = 0, tc_nosrc = 0, tc_noz = 0;
+     gpu_texture_correction_stats(&tc_att, &tc_arm, &tc_off, &tc_nosrc, &tc_noz);
++    /* Why unresolved vertices failed - see pgxp_resolve_state_census. */
++    uint64_t rs[6] = {0,0,0,0,0,0};
++    { extern void pgxp_resolve_state_census(uint64_t out[6]);
++      pgxp_resolve_state_census(rs); }
+     send_fmt("{\"id\":%d,\"ok\":true,"
+              "\"geometry_correction\":%d,"
+              "\"geometry_vertex_hits\":%u,"
+@@ -5260,7 +5264,9 @@ static void handle_geom_correction(int id, const char *json)
+              "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
+              "\"native\":%llu,\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
+              "\"tolerance_reject\":%llu,\"w_valid\":%llu,"
+-             "\"produced\":%llu,\"swc2_stores\":%llu}}",
++             "\"produced\":%llu,\"swc2_stores\":%llu,"
++             "\"why\":{\"noaddr\":%llu,\"stale\":%llu,\"flagless\":%llu,"
++             "\"mismatch\":%llu,\"tracked\":%llu,\"fallback\":%llu}}}",
+              id,
+              gte_geometry_correction_enabled(),
+              (unsigned)hits,
+@@ -5279,7 +5285,10 @@ static void handle_geom_correction(int id, const char *json)
+              (unsigned long long)ps.tolerance_reject,
+              (unsigned long long)ps.w_valid,
+              (unsigned long long)ps.produced,
+-             (unsigned long long)ps.swc2_stores);
++             (unsigned long long)ps.swc2_stores,
++             (unsigned long long)rs[0], (unsigned long long)rs[1],
++             (unsigned long long)rs[2], (unsigned long long)rs[3],
++             (unsigned long long)rs[4], (unsigned long long)rs[5]);
+ }
+ 
+ /* pgxp — live-tune the value-propagation engine for one-toggle isolation runs
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index ce89ad69..2a4cfe8c 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -976,6 +976,28 @@ static uint8_t s_last_resolve_state = 0;  /* 0 no-pv/noaddr 1 stale 2 live-flagl
+                                              3 mismatch 4 tracked 5 fallback */
+ extern "C" uint8_t pgxp_last_resolve_state(void) { return s_last_resolve_state; }
+ 
++/* Census of WHY a vertex failed to resolve. 6.2% of vertices fall back to the
++ * rounded integer position, and every seam is two copies of one corner where
++ * one copy landed in that 6.2% and the other did not. The share alone cannot
++ * say what to fix; these six buckets can:
++ *   0 noaddr  - the GPU had no source address, or no shadow slot exists.
++ *   1 stale   - a slot exists but from a retired generation.
++ *   2 flagless- the slot is LIVE but carries no X/Y precision: the address was
++ *               tracked, yet the value reached it through a path that did not
++ *               propagate a projection (a copy, a half-word assembly, a DMA).
++ *   3 mismatch- live and flagged, but describes a different packed word.
++ *   4 tracked - resolved from the dataflow shadow.
++ *   5 fallback- resolved from the screen-position table (vertex cache).
++ * 2 is the interesting one: it means provenance is being LOST in transit
++ * rather than never recorded, which is a bug with an address to hunt. */
++static uint64_t s_resolve_state_n[6] = {0,0,0,0,0,0};
++extern "C" void pgxp_resolve_state_census(uint64_t out[6]) {
++    for (int i = 0; i < 6; i++) out[i] = s_resolve_state_n[i];
++}
++extern "C" void pgxp_resolve_state_reset(void) {
++    for (int i = 0; i < 6; i++) s_resolve_state_n[i] = 0;
++}
++
+ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+                                        int32_t int_x, int32_t int_y,
+                                        int32_t *x16, int32_t *y16,
+@@ -1039,6 +1061,7 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+     }
+ 
+     if (!have) {
++        if (s_last_resolve_state < 6) s_resolve_state_n[s_last_resolve_state]++;
+         s_stats.native++;
+         *x16 = int_x << 16;
+         *y16 = int_y << 16;

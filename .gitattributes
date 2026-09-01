@@ -1,0 +1,15 @@
+# Patches are applied byte-for-byte by git apply; never let a checkout rewrite
+# their line endings (a CRLF patch fails to apply on the pinned submodule).
+patches/** -text
+*.patch -text
+# Shell scripts must stay LF even on Windows checkouts (bash rejects CRLF).
+*.sh text eol=lf
+# PowerShell / cmd are happy either way; keep the repo canonical as LF.
+*.ps1 text eol=lf
+*.cmd text eol=crlf
+*.toml text eol=lf
+*.md text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.txt text eol=lf
+*.docx binary

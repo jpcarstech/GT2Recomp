@@ -1,0 +1,43 @@
+# Game data / copyrighted or derived-from-game material — never committed
+*.bin
+*.cue
+*.img
+*.iso
+*.chd
+extracted/
+disc/
+bios/
+generated/
+cache*/
+overlay_captures.json*
+saves/
+*.mcd
+*.mcr
+
+# Build trees
+build/
+build-win/
+build-dbg/
+release/
+
+# Runtime debris
+psx_last_run_report.json
+psx_freeze_heartbeat.json
+gt2_out.txt
+gt2_err.txt
+input.ini
+keybinds.ini
+settings.toml
+tools/__pycache__/
+__pycache__/
+*.pyc
+*.new
+diagnostics/
+dumps/
+_attic/
+overlay_toolchain/
+*.bundle
+starvation_dump.jsonl
+compile_cache.txt
+retail-test/
+build-retail/

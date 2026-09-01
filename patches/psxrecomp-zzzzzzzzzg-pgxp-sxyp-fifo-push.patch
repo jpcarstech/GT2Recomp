@@ -1,0 +1,397 @@
+From a05ff2c8a6f9ba2713b69739b19cf806faf3e4c3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 08:38:35 +0000
+Subject: [PATCH] pgxp: model the SXYP FIFO push in the GTE register shadows -
+ the GT2 track seams
+
+ROOT CAUSE. Guest writes to SXYP (GTE data reg 15) are a FIFO push on hardware:
+SXY0<-SXY1, SXY1<-SXY2, SXY2<-new. gte_write_data shifted the REAL registers
+but the PGXP shadows for 12..14 were left describing the pre-push words. The
+old comment called this acceptable ('validation drops them on next use').
+It is not: the next SWC2 of SXY0/1/2 runs pv_validate, sees value != actual,
+strips the X/Y flags and copies a FLAGLESS shadow into the display list. The
+GPU then draws that corner at its rounded integer position while the adjacent
+face - whose copy came straight from RTPS - keeps its fraction. Two faces of
+one mesh disagree about a shared corner by up to a pixel. At 16x that is a
+16-pixel line of whatever lies behind the track.
+
+GT2's race overlay does this constantly: its strip builder loads three cached
+projections with lwc2 into SXY0..2, NCLIPs, stores them with swc2, then
+pushes a fourth through SXYP (mtc2 gte15 at 0x80024E10) to NCLIP the quad's
+other triangle - and the same 'reinject a cached projection' idiom is all over
+the track code (0x80025444/48, 0x80025538/3C, 0x80025698/A0/B0, ...).
+
+Measured on Tahiti at the grid, same savestate:
+  mixed triangles (1-2 of 3 corners precise) per 3s :  ~1600 -> 0
+  shared-EDGE corners on track faces that disagree  :   702 -> 0
+  swc2 sites whose SXY shadow != stored word        :  100% -> 0% at every site
+  teal seam pixels in the hires frame               :  3513 -> ~0
+
+Design, with the ordering every caller already has (gte_write_data, then the
+PGXP cop2 hook):
+  - gte_write_data case 15 notifies pgxp_gte_reg_written(15) ONLY, which
+    shifts the shadow FIFO and leaves a value-only shadow in 14/15.
+  - The LWC2/MTC2 hook for rt/rd==15 does NOT shift again; it replaces 14/15
+    with the source's real precision. rt/rd==14 mirrors into 15 likewise.
+  - gte_write_data case 14 no longer notifies 15: SXYP mirrors SXY2, it is not
+    a push. Treating it as one shifted SXY0/SXY1 on every lwc2 of SXY2 and
+    broke every load-three/NCLIP/store sequence (measured: reg12/13 100% bad,
+    reg14 fine - the signature that located it).
+
+Diagnostics that found it, kept: per-slot last-writer provenance (wr_instr/
+wr_pc), the mixed-primitive census (pgxp_mixed), the resolved-corner ring
+(pgxp_tris) with the offline seam analyser, and per-site swc2 shadow health
+(pgxp_swc2).
+---
+ runtime/src/debug_server.c |  32 ++++++++--
+ runtime/src/gte.cpp        |  18 ++++--
+ runtime/src/pgxp.cpp       | 116 +++++++++++++++++++++++++++++++------
+ 3 files changed, 136 insertions(+), 30 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 293b7ecf..b546317b 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -6461,6 +6461,22 @@ static void handle_pgxp_trap(int id, const char *json)
+     send_fmt("%s", buf);
+ }
+ 
++/* pgxp_swc2 - per-site health of SXY shadows at swc2 of regs 12..14. */
++static void handle_pgxp_swc2(int id, const char *json)
++{
++    typedef struct { uint32_t pc, total, bad; uint8_t reg; } Site;
++    extern int pgxp_swc2_sites(void *out, int max);
++    extern void pgxp_swc2_sites_reset(void);
++    if (json_get_int(json, "reset", 0)) { pgxp_swc2_sites_reset(); send_fmt("{\"id\":%d,\"ok\":true,\"reset\":1}", id); return; }
++    Site st[96]; int n = pgxp_swc2_sites(st, 96);
++    char buf[8192]; int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"sites\":[", id);
++    for (int i = 0; i < n && pos < (int)sizeof(buf) - 96; i++)
++        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{\"pc\":\"0x%08X\",\"reg\":%u,\"total\":%u,\"bad\":%u}",
++                        i ? "," : "", st[i].pc, (unsigned)st[i].reg, st[i].total, st[i].bad);
++    snprintf(buf + pos, sizeof(buf) - pos, "]}");
++    send_fmt("%s", buf);
++}
++
+ /* pgxp_tris - dump the resolved-corner ring (see gpu.c tri_ring_note) as CSV
+  * to a file: {"cmd":"pgxp_tris","path":"..."}. One row per triangle:
+  * seq,src,cmd0,any, then per corner ix,iy,fx,fy,tier. Analysed offline. */
+@@ -6505,7 +6521,7 @@ static void handle_pgxp_tris(int id, const char *json)
+ static void handle_pgxp_mixed(int id, const char *json)
+ {
+     (void)json;
+-    typedef struct { uint32_t addr, word, src; uint8_t state, n_precise; } Hit;
++    typedef struct { uint32_t addr, word, src, wr_instr, wr_pc; uint8_t state, n_precise; } Hit;
+     extern void pgxp_mixed_stats(uint64_t *, uint64_t *, uint64_t *);
+     extern int  pgxp_mixed_samples(void *out, int max);
+     uint64_t a3 = 0, mx = 0, no = 0;
+@@ -6521,9 +6537,11 @@ static void handle_pgxp_mixed(int id, const char *json)
+     for (int i = 0; i < n && pos < (int)sizeof(buf) - 160; i++)
+         pos += snprintf(buf + pos, sizeof(buf) - pos,
+             "%s{\"addr\":\"0x%08X\",\"word\":\"0x%08X\",\"src\":\"0x%08X\","
+-            "\"state\":\"%s\",\"n_precise\":%u}",
++            "\"state\":\"%s\",\"n_precise\":%u,"
++            "\"wr_instr\":\"0x%08X\",\"wr_pc\":\"0x%08X\"}",
+             i ? "," : "", h[i].addr, h[i].word, h[i].src,
+-            sn[h[i].state < 6 ? h[i].state : 0], (unsigned)h[i].n_precise);
++            sn[h[i].state < 6 ? h[i].state : 0], (unsigned)h[i].n_precise,
++            h[i].wr_instr, h[i].wr_pc);
+     snprintf(buf + pos, sizeof(buf) - pos, "]}");
+     send_fmt("%s", buf);
+ }
+@@ -6533,7 +6551,7 @@ static void handle_pgxp_mixed(int id, const char *json)
+ static void handle_pgxp_flagless(int id, const char *json)
+ {
+     (void)json;
+-    typedef struct { uint32_t addr, packet, flags, value; } Hit;
++    typedef struct { uint32_t addr, packet, flags, value, wr_instr, wr_pc; } Hit;
+     extern int pgxp_flagless_samples(void *out, int max);
+     Hit h[32];
+     int n = pgxp_flagless_samples(h, 32);
+@@ -6543,9 +6561,10 @@ static void handle_pgxp_flagless(int id, const char *json)
+     for (int i = 0; i < n && pos < (int)sizeof(buf) - 128; i++)
+         pos += snprintf(buf + pos, sizeof(buf) - pos,
+                         "%s{\"addr\":\"0x%08X\",\"packet\":\"0x%08X\","
+-                        "\"flags\":%u,\"value\":\"0x%08X\"}",
++                        "\"flags\":%u,\"value\":\"0x%08X\","
++                        "\"wr_instr\":\"0x%08X\",\"wr_pc\":\"0x%08X\"}",
+                         i ? "," : "", h[i].addr, h[i].packet,
+-                        (unsigned)h[i].flags, h[i].value);
++                        (unsigned)h[i].flags, h[i].value, h[i].wr_instr, h[i].wr_pc);
+     snprintf(buf + pos, sizeof(buf) - pos, "]}");
+     send_fmt("%s", buf);
+ }
+@@ -14314,6 +14333,7 @@ static const CmdEntry s_commands[] = {
+     { "wide_full",         handle_wide_full },
+     { "wide_shot",         handle_wide_shot },
+     { "pgxp_trap",         handle_pgxp_trap },
++    { "pgxp_swc2",         handle_pgxp_swc2 },
+     { "pgxp_tris",         handle_pgxp_tris },
+     { "pgxp_mixed",        handle_pgxp_mixed },
+     { "pgxp_flagless",     handle_pgxp_flagless },
+diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
+index 61b5f185..dbf5124e 100644
+--- a/runtime/src/gte.cpp
++++ b/runtime/src/gte.cpp
+@@ -2239,20 +2239,26 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
+         case 14:
+             cpu->gte_data[14] = val;
+             cpu->gte_data[15] = val;
+-            if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
++            /* SXY2 write: SXYP mirrors it, NO FIFO shift. Notify 14 only;
++             * pgxp_gte_reg_written(15) is reserved for the genuine push in
++             * case 15 - calling it here shifted the SXY0/SXY1 shadows on every
++             * lwc2/mtc2 of SXY2 and broke every 'load three cached
++             * projections, NCLIP, store' sequence (GT2 track strips). */
++            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
+                 pgxp_gte_reg_written(14, val);
+-                pgxp_gte_reg_written(15, val);
+-            }
+             break;
+         case 15:
+             cpu->gte_data[12] = cpu->gte_data[13];
+             cpu->gte_data[13] = cpu->gte_data[14];
+             cpu->gte_data[14] = val;
+             cpu->gte_data[15] = val;
+-            if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
+-                pgxp_gte_reg_written(14, val);
++            /* SXYP is a FIFO push: the shadows shift with the hardware
++             * (pgxp_gte_reg_written(15) models it). Notifying 14 first would
++             * flatten SXY2's shadow before it shifts into SXY1. The LWC2/MTC2
++             * PGXP hook that follows this call refines the pushed slot with
++             * the source's precision; see psx_pgxp_cop2. */
++            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
+                 pgxp_gte_reg_written(15, val);
+-            }
+             break;
+         case 28: {
+             cpu->gte_data[9] = (val & 0x1Fu) << 7;
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 186cdb3d..41b5bde1 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -60,6 +60,12 @@ struct PGXPValue {
+     uint16_t flags;
+     uint32_t value;      /* the guest word this shadow describes              */
+     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
++    /* Diagnostic provenance: the last hook that wrote this slot. wr_kind is
++     * the instruction opcode (0x2B sw, 0x29 sh, 0x3A swc2, ...) or a marker
++     * for non-instruction paths; wr_instr the full word. Lets a slot the GPU
++     * finds flagless name its own last writer with no timing race. */
++    uint32_t wr_instr;
++    uint32_t wr_pc;
+ };
+ 
+ #define PGXP_RAM_WORDS     (PSX_MAIN_RAM_BYTES >> 2)   /* 2 MB RAM                     */
+@@ -266,6 +272,31 @@ static inline void pv_reset(PGXPValue *pv, uint32_t value) {
+ 
+ static inline void pv_kill(PGXPValue *pv) { pv->gen = 0; }
+ 
++/* Guest write to SXYP (GTE data reg 15). On hardware this is a FIFO push:
++ * SXY0 <- SXY1, SXY1 <- SXY2, SXY2 <- new, and SXYP reads back as SXY2. The
++ * shadows MUST shift the same way, or regs 12..14 keep describing the words
++ * they held before the push. That is not a harmless staleness: the very next
++ * SWC2 of SXY0/1/2 runs pv_validate, sees value != actual, strips the X/Y
++ * flags, and copies a FLAGLESS shadow into the display list - the GPU then
++ * draws that corner at its rounded integer position while the adjacent face
++ * (whose copy came straight from RTPS) keeps the fraction. Two faces disagree
++ * about a shared corner by up to a pixel: a seam, 16px wide at 16x.
++ *
++ * GT2's track renderer does exactly this in its strip builder (race overlay,
++ * 0x80024E10: mtc2 SXYP between two NCLIPs to test the quad's second
++ * triangle), and the same idiom - re-inject a cached projection and NCLIP -
++ * is standard PS1 practice. Measured on Tahiti: 11% of shared-edge corners
++ * disagreed before this; the flagless writers were the swc2 stores that
++ * followed the push. `newv` is the pushed word's shadow (already validated by
++ * the caller) or a flagless reset when the source carried none. */
++static inline void gte_sxyp_push_shadow(const PGXPValue *newv) {
++    s_gte[12] = s_gte[13];
++    s_gte[13] = s_gte[14];
++    s_gte[14] = *newv;
++    s_gte[15] = *newv;
++}
++
++
+ /* ------------------------------------------------------------------------- */
+ /* Instruction field helpers                                                  */
+ /* ------------------------------------------------------------------------- */
+@@ -381,6 +412,8 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+     if (!dst) return;
+     uint32_t rt = f_rt(instr);
+     PGXPValue *src = (rt != 0) ? &s_gpr[rt] : nullptr;
++    { extern uint32_t g_debug_last_store_pc;
++      dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; }
+ 
+     switch (f_op(instr)) {
+     case 0x2B: {                               /* SW                          */
+@@ -388,6 +421,8 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
+         if (src && gen_live(src->gen)) {
+             pv_validate(src, value);
+             *dst = *src;
++            { extern uint32_t g_debug_last_store_pc;     /* struct copy clobbered it */
++              dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; }
+         } else {
+             pv_reset(dst, value);
+         }
+@@ -453,6 +488,15 @@ extern "C" uint32_t pgxp_dead_lwc2(void *out, int max) {
+     return (uint32_t)((uint64_t)s_dead_lwc2_n << 8 | (uint32_t)n);
+ }
+ 
++typedef struct { uint32_t pc, total, bad; uint8_t reg; } PgxpSwc2Site;
++static PgxpSwc2Site s_swc2_site[96];
++extern "C" int pgxp_swc2_sites(void *out, int max) {
++    int n = 0; PgxpSwc2Site *o = (PgxpSwc2Site *)out;
++    for (int i = 0; i < 96 && n < max; i++) if (s_swc2_site[i].pc) o[n++] = s_swc2_site[i];
++    return n;
++}
++extern "C" void pgxp_swc2_sites_reset(void) { for (int i = 0; i < 96; i++) s_swc2_site[i].pc = s_swc2_site[i].total = s_swc2_site[i].bad = 0; }
++
+ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+                               uint32_t value, uint32_t addr) {
+     (void)cpu;
+@@ -462,22 +506,37 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+     case 0x32: {                               /* LWC2: gte[rt] <- [addr]     */
+         s_cnt_lwc2++;
+         PGXPValue *src = pgxp_ptr(addr);
+-        PGXPValue *dst = &s_gte[f_rt(instr)];
++        uint32_t rt = f_rt(instr);
++        PGXPValue tmp = {};
+         if (src && gen_live(src->gen)) {
+             pv_validate(src, value);
+-            *dst = *src;
+-            if (!(src->flags & PGXP_F_VXY) && f_rt(instr) >= 12 &&
+-                f_rt(instr) <= 15)
++            tmp = *src;
++            if (!(src->flags & PGXP_F_VXY) && rt >= 12 && rt <= 15)
+                 dead_lwc2_note(addr, value, 1);   /* live but flagless */
+         } else {
+-            pv_reset(dst, value);
+-            if (f_rt(instr) >= 12 && f_rt(instr) <= 15)
++            pv_reset(&tmp, value);
++            if (rt >= 12 && rt <= 15)
+                 dead_lwc2_note(addr, value, 0);   /* dead shadow */
+         }
++        if (rt == 15 || rt == 14) { s_gte[14] = tmp; s_gte[15] = tmp; } /* SXYP mirrors SXY2; push already done in gte_write_data */
++        else                       s_gte[rt] = tmp;
+         return;
+     }
+     case 0x3A: {                               /* SWC2: [addr] <- gte[rt]     */
+         s_cnt_swc2++;
++        /* Per-site health of the SXY register shadows: at each swc2 of regs
++         * 12..14, does the shadow describe the word actually being stored?
++         * A site with a high mismatch rate names an unmodeled FIFO effect
++         * upstream of it. Top 16 sites by PC. */
++        if (f_rt(instr) >= 12 && f_rt(instr) <= 14) {
++            extern uint32_t g_debug_last_store_pc;
++            const PGXPValue *sv = &s_gte[f_rt(instr)];
++            int bad = !(gen_live(sv->gen) && sv->value == value && (sv->flags & PGXP_F_VXY) == PGXP_F_VXY);
++            uint32_t pc = g_debug_last_store_pc;
++            int slot = -1;
++            for (int i = 0; i < 96; i++) { if (s_swc2_site[i].pc == pc) { slot = i; break; } if (s_swc2_site[i].pc == 0 && slot < 0) slot = i; }
++            if (slot >= 0) { s_swc2_site[slot].pc = pc; s_swc2_site[slot].reg = (uint8_t)f_rt(instr); s_swc2_site[slot].total++; if (bad) s_swc2_site[slot].bad++; }
++        }
+         {
+             PGXPValue *tsrc = &s_gte[f_rt(instr)];
+             trap_note2(addr, instr, value, 4, tsrc->flags,
+@@ -492,6 +551,8 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+         } else {
+             pv_reset(dst, value);
+         }
++        { extern uint32_t g_debug_last_store_pc;
++          dst->wr_instr = instr; dst->wr_pc = g_debug_last_store_pc; }
+         return;
+     }
+     case 0x12: {                               /* COP2 register transfers     */
+@@ -512,20 +573,23 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+         case 0x04: {                           /* MTC2: gte[rd] <- gpr[rt]    */
+             s_cnt_mtc2++;
+             uint32_t rt = f_rt(instr);
+-            PGXPValue *dst = &s_gte[f_rd(instr)];
+-            if (f_rd(instr) >= 12 && f_rd(instr) <= 15 &&
++            uint32_t rd = f_rd(instr);
++            if (rd >= 12 && rd <= 15 &&
+                 !(rt != 0 && gen_live(s_gpr[rt].gen) &&
+                   (s_gpr[rt].flags & PGXP_F_VXY)))
+-                dead_lwc2_note(0xFFFF0000u | f_rd(instr), value, 2);
++                dead_lwc2_note(0xFFFF0000u | rd, value, 2);
++            PGXPValue tmp = {};
+             if (rt != 0 && gen_live(s_gpr[rt].gen)) {
+                 pv_validate(&s_gpr[rt], value);
+-                *dst = s_gpr[rt];
++                tmp = s_gpr[rt];
+             } else {
+-                pv_reset(dst, value);
++                pv_reset(&tmp, value);
+             }
+-            /* An SXYP write (rd==15) shifts the hardware FIFO; we do not
+-             * model it — regs 12..14 now describe words they no longer
+-             * match, and validation drops them on next use. */
++            /* SXYP (rd==15) is a FIFO push on hardware - model it, see
++             * gte_sxyp_push_shadow. Leaving regs 12..14 stale here was the
++             * GT2 track-seam bug. */
++            if (rd == 15 || rd == 14) { s_gte[14] = tmp; s_gte[15] = tmp; } /* SXYP mirrors SXY2; push already done in gte_write_data */
++            else                       s_gte[rd] = tmp;
+             return;
+         }
+         case 0x02: {                           /* CFC2: control regs carry no
+@@ -945,8 +1009,19 @@ extern "C" void pgxp_gte_reg_written(int reg, uint32_t value) {
+      * machine state back, so its writes must not stick to the shadows). */
+     if (s_suppress != 0) return;
+     if (reg < 0 || reg > 31) return;
++    if (reg == 15) {                           /* SXYP: FIFO push             */
++        /* Shift with the hardware. The pushed slot gets a value-only shadow
++         * here; when the write came through LWC2/MTC2 the cop2 hook runs
++         * next and replaces 14/15 with the source's real precision. Any path
++         * that reaches here without a hook (direct gte_write_data) is left
++         * consistent: right value, no fraction, no stale fraction either. */
++        PGXPValue tmp = {}; pv_reset(&tmp, value);
++        gte_sxyp_push_shadow(&tmp);
++        return;
++    }
+     pv_kill(&s_gte[reg]);
+     pv_reset(&s_gte[reg], value);
++    if (reg == 14) { pv_kill(&s_gte[15]); pv_reset(&s_gte[15], value); } /* SXYP mirrors SXY2 */
+ }
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -1004,17 +1079,19 @@ static uint64_t s_resolve_state_n[6] = {0,0,0,0,0,0};
+  * exists and is live but carries no position; naming the addresses lets the
+  * writer trap (pgxp_trap_set) identify the instruction that put an unflagged
+  * value there, which is the last unknown in the seam chain. */
+-typedef struct { uint32_t addr, packet, flags, value; } PgxpFlaglessHit;
++typedef struct { uint32_t addr, packet, flags, value, wr_instr, wr_pc; } PgxpFlaglessHit;
+ static PgxpFlaglessHit s_flagless_ring[32];
+ static uint32_t s_flagless_w = 0;
+ static inline void flagless_note(uint32_t addr, uint32_t packet,
+-                                 uint32_t flags, uint32_t value) {
++                                 uint32_t flags, uint32_t value,
++                                 uint32_t wr_instr, uint32_t wr_pc) {
+     PgxpFlaglessHit *h = &s_flagless_ring[s_flagless_w & 31];
+     s_flagless_w++;
+     h->addr = addr; h->packet = packet; h->flags = flags; h->value = value;
++    h->wr_instr = wr_instr; h->wr_pc = wr_pc;
+ }
+ /* Mixed-primitive census (fed from gpu.c prepare_precise_triangle). */
+-typedef struct { uint32_t addr, word, src; uint8_t state, n_precise; } PgxpMixedHit;
++typedef struct { uint32_t addr, word, src, wr_instr, wr_pc; uint8_t state, n_precise; } PgxpMixedHit;
+ static PgxpMixedHit s_mixed_ring[32];
+ static uint32_t s_mixed_w = 0;
+ static uint64_t s_tri_all3 = 0, s_tri_mixed = 0, s_tri_none = 0;
+@@ -1033,6 +1110,8 @@ extern "C" void pgxp_mixed_note(int n_precise, uint32_t addr, uint32_t word,
+     s_mixed_w++;
+     h->addr = addr; h->word = word; h->src = src_addr;
+     h->state = state; h->n_precise = (uint8_t)n_precise;
++    { PGXPValue *pv = pgxp_ptr(addr);
++      h->wr_instr = pv ? pv->wr_instr : 0; h->wr_pc = pv ? pv->wr_pc : 0; }
+ }
+ extern "C" void pgxp_mixed_stats(uint64_t *all3, uint64_t *mixed, uint64_t *none) {
+     if (all3) *all3 = s_tri_all3; if (mixed) *mixed = s_tri_mixed; if (none) *none = s_tri_none;
+@@ -1084,7 +1163,8 @@ extern "C" int pgxp_get_precise_vertex(uint32_t addr, uint32_t packet_word,
+             }
+         } else if (pv && gen_live(pv->gen)) {
+             s_last_resolve_state = 2;              /* live but flagless */
+-            flagless_note(addr, packet_word, pv->flags, pv->value);
++            flagless_note(addr, packet_word, pv->flags, pv->value,
++                          pv->wr_instr, pv->wr_pc);
+         } else if (pv) {
+             s_last_resolve_state = 1;              /* stale generation  */
+         }

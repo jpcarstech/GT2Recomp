@@ -1,0 +1,59 @@
+# Gran Turismo 2 (GT2 Combined mod) — hand-filled from disc probe data.
+# Disc image stays beside the exe at runtime; not present in this repo.
+
+[game]
+name = "Gran Turismo 2"
+id = "SCUS-94488"
+players = 2
+exe = "disc/SCUS_944.88"
+disc = "disc/Gran Turismo 2 Combined.cue"
+load_address = "0x80010000"
+entry_pc = "0x8005D5C0"
+text_size = "0x00099000"
+stack_base = "0x801FFF00"
+
+[prepare_disc]
+out_dir = "disc"
+bin_name = "Gran Turismo 2 Combined.bin"
+cue_name = "Gran Turismo 2 Combined.cue"
+boot_exe = "SCUS_944.88"
+known_sizes = [1033459392]
+known_md5 = [
+  "70ecd6e788501eb69a220d2a96e624c4",
+]
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+# Emit a trusted mod hook at the PS-EXE entry: GT2 defeats both of the
+# framework's game-start detectors (HLE handoff skips the entry dispatch;
+# overlays overwrite game text so the clean-text match never fires), so the
+# widescreen engage latch — and the rest of the boot handoff — never
+# triggered. The hook calls fntrace_mark_game_started at entry.
+mod_function_entry_funcs = ["0x8005D5C0"]
+out_dir = "generated"
+strict = true
+
+[runtime]
+window_title = "Gran Turismo 2 Recompiled"
+memcard_dir = "saves"
+
+[widescreen]
+# GTE-activity gameplay detector: without a per-game classifier every frame
+# counts as a "full-2D screen" and the present stays a native 4:3 pillarbox
+# even after widescreen engages. GT2 is fully 3D in gameplay; frames that
+# project GTE vertices classify as gameplay (2D menus stay authentic 4:3).
+gte_game_mode = true
+# Native-wide (default) only presents wide when the game renders extra width —
+# untuned GT2 culls to 4:3, so it pillarboxes. Squash mode is the generic
+# DuckStation-style hack: GTE X-squash + wide stretch, with the framework's
+# per-prim proportion correction for HUD/sprites. Revisit when GT2 gets
+# cull-site tuning for true native-wide.
+native_wide = false
+
+[video]
+renderer = "opengl"
+aspect_ratio = "4:3"   # launcher Settings overrides; "16:10" also valid here
+
+[controller]
+default_mode = "analog"
+p1_device = "auto"

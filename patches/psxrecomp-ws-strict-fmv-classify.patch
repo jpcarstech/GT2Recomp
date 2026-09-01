@@ -1,0 +1,67 @@
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index 0ae2ad2c..c262b549 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -230,6 +230,7 @@ int  gpu_ws_netplay_local_viewport_width(void);
+  * full-2D menu/title screen), so the squash is suppressed and content drawn
+  * pixel-native. The present path uses the same predicate to pillarbox. */
+ int  gpu_ws_present_native_43(void);
++int  gpu_ws_fmv_frame(void);        /* strict FMV bit of the 4:3 predicate */
+ /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
+  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
+ int  psx_ws_x_margin(void);
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 057ab286..a3279388 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -372,12 +372,35 @@ int gpu_ws_present_native_43(void) {
+          * classifies as FMV — stills present like any game frame
+          * (stretched on a wide window), matching how a global-aspect
+          * emulator shows them. Default off: depth24 stays FMV. */
+-        s_ws_fmv_cached = (di.depth24 && !ws_stretch_stills_cfg) ||
+-                          mdec_recently_active(WS_FMV_HYSTERESIS);
++        int mdec_fmv = mdec_recently_active(WS_FMV_HYSTERESIS);
++        if (ws_stretch_stills_cfg) {
++            /* Strict FMV classification (same flag): recent MDEC counts as
++             * FMV only for frames that LOOK like video — a 24-bit display,
++             * or no shaded 3D content in the last frames. GT2's course
++             * select composites an MDEC track-preview movie INTO a live
++             * shaded 15-bit scene (car model + UI); recent-MDEC alone
++             * misclassified the whole screen as FMV and pinned it 4:3.
++             * Fullscreen streamed video draws no shaded prims (GP0
++             * 0x30-0x3F), so it still classifies. */
++            mdec_fmv = mdec_fmv &&
++                       (di.depth24 ||
++                        f - ws_last_3d_stamp > WS_FMV_HYSTERESIS);
++        }
++        s_ws_fmv_cached = (di.depth24 && !ws_stretch_stills_cfg) || mdec_fmv;
+     }
+     return s_ws_fmv_cached;
+ }
+ 
++/* The FMV half of the native-4:3 predicate, exported for trusted mods that
++ * must leave "authentic video playback" untouched (e.g. a CPU overclock that
++ * disengages during movies): under strict classification a composited scene
++ * with an embedded MDEC stream (GT2 course select) is NOT video, so the mod
++ * stays engaged there while the intro and fullscreen movies still gate it. */
++int gpu_ws_fmv_frame(void) {
++    (void)gpu_ws_present_native_43();   /* refresh the per-frame cache */
++    return s_ws_fmv_cached;
++}
++
+ /* Squash applies only when configured AND the frame is being stretched. */
+ static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
+ 
+@@ -1933,8 +1956,10 @@ void ws_bg_phase_note(uint32_t op) {
+     if (f != s_bg_phase_frame) { s_bg_phase_frame = f; s_bg_phase_over = 0; }
+     if (op >= 0x30u && op <= 0x3Fu) {
+         s_bg_phase_over = 1;   /* shaded = 3D world (within-frame draw order) */
+-        ws_last_3d_stamp = f;  /* diagnostic only — see ws_2d_only_scene() for
+-                                  why shaded prims are NOT the scene classifier */
++        ws_last_3d_stamp = f;  /* scene classifier input for STRICT FMV mode
++                                  (stretch_24bpp_stills: shaded prims veto the
++                                  recent-MDEC FMV heuristic); still NOT the 2D
++                                  scene classifier — see ws_2d_only_scene() */
+     }
+ }
+ static int ws_bg_phase_over(void) {

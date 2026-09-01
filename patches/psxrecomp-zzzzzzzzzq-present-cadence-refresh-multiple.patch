@@ -1,0 +1,221 @@
+From 1081aa87a57793a1fbd9f0b8b7d6089437198914 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 11:14:49 +0000
+Subject: [PATCH] present: let driver vsync own cadence on integer-multiple
+ refresh panels (120/180/240 Hz)
+
+host_refresh_matches_guest_cadence() only accepted a ~60 Hz panel; on a
+120 Hz panel the runtime switched driver vsync OFF and paced 59.94 Hz by wall
+clock, so a 30 fps title landed on the refresh grid with +-1 refresh jitter
+(3/4/5 refreshes per game frame) and tearing -- visible as judder/wobble of
+everything panning across the view, invisible in screenshots. Now the GL
+path asks for swap interval k = round(panel/guest) when panel/k is within
+2% of the guest rate (2 on 120 Hz, 4 on 240 Hz) and the sync-to-host period
+becomes k/panel; Vulkan keeps k=1 only (FIFO has no every-kth-refresh).
+gl_apply_swap_interval() falls back to 1 when the driver rejects k>1 or
+adaptive, instead of silently leaving the previous interval in place.
+---
+ runtime/src/debug_server.c    | 16 +++++++++
+ runtime/src/gpu_gl_renderer.c | 27 +++++++++------
+ runtime/src/main.cpp          | 65 ++++++++++++++++++++++++++++++-----
+ 3 files changed, 90 insertions(+), 18 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 921cc7a4..e87b1a0c 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8263,6 +8263,21 @@ static void handle_synth_recurse(int id, const char *json)
+ #endif
+ }
+ 
++/* {"cmd":"present_cadence"} -> the resolved present pacing state. */
++static void handle_present_cadence(int id, const char *json)
++{
++    (void)json;
++    extern void debug_get_present_cadence(double *, int *, int *, int *, double *, int *, int *);
++    double host_hz = 0.0, period_ms = 0.0;
++    int swap_interval = 0, vsync_owns = 0, multiple = 0, video_vsync = 0, fullscreen = 0;
++    debug_get_present_cadence(&host_hz, &swap_interval, &vsync_owns, &multiple,
++                              &period_ms, &video_vsync, &fullscreen);
++    send_fmt("{\"id\":%d,\"ok\":true,\"host_refresh_hz\":%.3f,\"swap_interval\":%d,"
++             "\"vsync_owns_cadence\":%d,\"refresh_multiple\":%d,\"frame_period_ms\":%.4f,"
++             "\"video_vsync\":%d,\"fullscreen\":%d}",
++             id, host_hz, swap_interval, vsync_owns, multiple, period_ms, video_vsync, fullscreen);
++}
++
+ static void handle_frame_perf(int id, const char *json)
+ {
+     (void)json;
+@@ -14263,6 +14278,7 @@ static const CmdEntry s_commands[] = {
+     { "gl_present_ring",   handle_gl_present_ring },
+     { "present_ring",      handle_present_ring },
+     { "frame_perf",        handle_frame_perf },
++    { "present_cadence",   handle_present_cadence },
+     { "gl_ws_ablate",      handle_gl_ws_ablate },
+     { "gl_interp",         handle_gl_interp },
+     { "gl_wide_fast",      handle_gl_wide_fast },
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 6c391c04..3e00ae49 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3597,6 +3597,20 @@ static int init_gpu_raster(void) {
+     return 1;
+ }
+ 
++/* Apply a swap interval with the documented fallbacks: -1 (adaptive) -> 1 when
++ * the driver rejects adaptive; k > 1 (panel at k x guest rate, main.cpp
++ * host_refresh_cadence_multiple) -> 1 when the driver cannot do "every kth
++ * refresh" (the wall-clock pacer then still caps the guest at its rate, so
++ * nothing runs fast; the driver swap just no longer owns the cadence). */
++static void gl_apply_swap_interval(int interval) {
++    if (SDL_GL_SetSwapInterval(interval) == 0) { s_swap_interval = interval; return; }
++    if (interval < 0 || interval > 1) {
++        if (SDL_GL_SetSwapInterval(1) == 0) { s_swap_interval = 1; return; }
++    }
++    fprintf(stdout, "psxrecomp: SDL_GL_SetSwapInterval(%d) rejected (%s)\n",
++            interval, SDL_GetError());
++}
++
+ int gl_renderer_init_context(SDL_Window *win) {
+     s_win = win;
+     s_present_w = 0;
+@@ -3609,10 +3623,7 @@ int gl_renderer_init_context(SDL_Window *win) {
+     /* Swap interval: 1=vsync (tear-free, default), 0=immediate (lowest display
+      * latency, may tear; our wall-clock pacer still holds 59.94Hz), -1=adaptive.
+      * Adaptive falls back to vsync if the driver rejects it. */
+-    if (SDL_GL_SetSwapInterval(s_swap_interval) != 0 && s_swap_interval < 0) {
+-        SDL_GL_SetSwapInterval(1);
+-        s_swap_interval = 1;
+-    }
++    gl_apply_swap_interval(s_swap_interval);
+     glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+     const char *ver = (const char *)glGetString(GL_VERSION);
+     fprintf(stdout, "psxrecomp: OpenGL context created (%s)\n", ver ? ver : "?");
+@@ -3678,12 +3689,8 @@ int gl_renderer_init_context(SDL_Window *win) {
+  * exists. Adaptive falls back to vsync if unsupported. */
+ void gl_renderer_set_swap_interval(int interval) {
+     s_swap_interval = interval;
+-    if (s_ctx) {
+-        if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
+-            SDL_GL_SetSwapInterval(1);
+-            s_swap_interval = 1;
+-        }
+-    }
++    if (s_ctx)
++        gl_apply_swap_interval(interval);
+ }
+ 
+ void gl_renderer_shutdown(void) {
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 9ade123d..4bb6f517 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2856,12 +2856,36 @@ static void apply_netplay_local_viewport_aspect(bool netplay_enabled) {
+  * offline. Force immediate swaps for the session; restore on soft-exit. */
+ static double present_effective_frame_period_ms(void);
+ 
+-static int host_refresh_matches_guest_cadence(void) {
++/* Swap-interval multiple that lets the driver's vsync own the guest cadence:
++ * 1 on a ~60 Hz panel, 2 on ~120 Hz, 3 on ~180 Hz, 4 on ~240 Hz (each within
++ * 2% of guest_hz after division); 0 when no multiple fits (72/75/144/165 Hz).
++ *
++ * Only the GL present path can ask the driver for an interval > 1
++ * (WGL/GLX swap_control); Vulkan FIFO has no "every Nth refresh", so there
++ * the multiple is only honoured at 1 and the wall-clock pacer keeps 120 Hz+.
++ *
++ * Why this matters: a 30 fps title on a 120 Hz panel presented by the
++ * wall-clock pacer with vsync OFF lands each frame on the refresh grid with
++ * +-1 refresh of jitter (3/4/5 refreshes per game frame) and tears -- on
++ * screen that is a steady judder of everything panning across the view
++ * (distant scenery, poles, billboards), invisible in any screenshot. With
++ * swap interval 2 every guest vblank is exactly two refreshes and a 30 fps
++ * frame is held for exactly four. */
++static int host_refresh_cadence_multiple(void) {
+     const double period_ms = present_effective_frame_period_ms();
+     if (g_host_refresh_hz <= 0.0 || period_ms <= 0.0)
+         return 0;
+     const double guest_hz = 1000.0 / period_ms;
+-    return std::fabs(g_host_refresh_hz - guest_hz) <= guest_hz * 0.02;
++    const int kmax = (g_video_renderer == 1) ? 4 : 1;
++    for (int k = 1; k <= kmax; k++) {
++        if (std::fabs(g_host_refresh_hz / (double)k - guest_hz) <= guest_hz * 0.02)
++            return k;
++    }
++    return 0;
++}
++
++static int host_refresh_matches_guest_cadence(void) {
++    return host_refresh_cadence_multiple() != 0;
+ }
+ 
+ /* PAL titles (GP1(08h) bit 3 set) present at 50 Hz. Follow the GPU video
+@@ -2960,8 +2984,14 @@ static int present_effective_swap_interval(void) {
+         return 0;
+     if (g_frame_period_ms <= 0.0)
+         return 0;
+-    if (present_vsync_owns_cadence())
++    if (present_vsync_owns_cadence()) {
++        const int k = host_refresh_cadence_multiple();
++        /* Adaptive (-1) only exists as "every refresh"; at a multiple > 1 the
++         * regular interval is the only way the driver can hold the cadence. */
++        if (k > 1)
++            return k;
+         return g_video_vsync;
++    }
+     return 0;
+ }
+ 
+@@ -3003,6 +3033,22 @@ static void apply_present_cadence(void) {
+ #endif
+ }
+ 
++/* Debug observability (TCP "present_cadence"): the resolved present pacing
++ * truth -- what the panel reported, which multiple was chosen, whether the
++ * driver swap owns the cadence, and the wall-clock period in force. */
++extern "C" void debug_get_present_cadence(double *host_hz, int *swap_interval,
++                                          int *vsync_owns, int *multiple,
++                                          double *period_ms, int *video_vsync,
++                                          int *fullscreen) {
++    if (host_hz)       *host_hz       = g_host_refresh_hz;
++    if (swap_interval) *swap_interval = present_effective_swap_interval();
++    if (vsync_owns)    *vsync_owns    = present_vsync_owns_cadence();
++    if (multiple)      *multiple      = host_refresh_cadence_multiple();
++    if (period_ms)     *period_ms     = g_frame_period_ms;
++    if (video_vsync)   *video_vsync   = g_video_vsync;
++    if (fullscreen)    *fullscreen    = g_fullscreen;
++}
++
+ static void log_present_cadence(void) {
+     if (present_vsync_owns_cadence()) {
+         /* The pacer still runs underneath as a deadline cap (see
+@@ -3011,9 +3057,10 @@ static void log_present_cadence(void) {
+          * line is how a bring-up session decides whether pacing is accounted
+          * for, and "skipped" sent this one hunting a phantom stuck
+          * fast-forward instead of an unpaced present. */
+-        std::printf("psxrecomp: present cadence: driver vsync (%.1f Hz panel; "
+-                    "wall-clock cap %.4f ms/frame)\n",
+-                    g_host_refresh_hz, g_frame_period_ms);
++        std::printf("psxrecomp: present cadence: driver vsync (%.1f Hz panel, "
++                    "swap interval %d; wall-clock cap %.4f ms/frame)\n",
++                    g_host_refresh_hz, present_effective_swap_interval(),
++                    g_frame_period_ms);
+     } else if (g_frame_period_ms > 0.0) {
+         if (g_video_vsync != 0 && !g_frame_interpolation &&
+             !g_netplay_vsync_forced_off) {
+@@ -14317,9 +14364,11 @@ session_reboot:
+             double host_hz = (double)dm.refresh_rate;
+             g_host_refresh_hz = host_hz;
+             if (host_refresh_matches_guest_cadence()) {
+-                g_frame_period_ms = 1000.0 / host_hz;
++                const int k = host_refresh_cadence_multiple();
++                g_frame_period_ms = 1000.0 * (double)k / host_hz;
+                 std::printf("psxrecomp: sync-to-host-refresh: pacing to %.1f Hz panel "
+-                            "(%.4f ms/frame)\n", host_hz, g_frame_period_ms);
++                            "(swap interval %d, %.4f ms/frame)\n", host_hz, k,
++                            g_frame_period_ms);
+             } else {
+                 std::printf("psxrecomp: host panel %.1f Hz does not match guest "
+                             "cadence; keeping %.2f Hz pacing\n",
+-- 
+2.43.0
+

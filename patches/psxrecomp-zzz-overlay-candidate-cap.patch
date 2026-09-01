@@ -1,0 +1,26 @@
+diff --git a/runtime/include/overlay_api.h b/runtime/include/overlay_api.h
+index e553d029..6ce7251b 100644
+--- a/runtime/include/overlay_api.h
++++ b/runtime/include/overlay_api.h
+@@ -99,8 +99,19 @@
+  * record consumes one slot, even when another DLL carries an identical
+  * (entry, CRC, ranges) identity.  Offline publishers parse this same literal
+  * before adding a cache pair so compiler-side accounting cannot drift from
+- * the loader's fixed arrays. */
+-#define PSX_OVERLAY_CANDIDATE_CAP 32768
++ * the loader's fixed arrays.
++ *
++ * 131072 (2^17 — the lazy-entry hash mask requires a power of two): GT2's
++ * Combined disc saturated the old 32768 ceiling on menu/boot/intro coverage
++ * alone, and once a namespace hits the cap the publisher stops accepting new
++ * shards FOREVER — the race engine (the hottest code in the game) stayed
++ * interpreter-only at ~93%% of dispatches, presenting as audio starvation
++ * and frame hitching. The capacity is static arrays (~64 MB at this size on
++ * 64-bit, up from ~16 MB) — cheap on the PC targets this runtime serves.
++ * NOTE: this header feeds the codegen tag (codegen_hash_sources.cmake), so
++ * changing the cap rolls the cache namespace; the capture history
++ * (overlay_captures.json.d) rebuilds the cache in one offline run. */
++#define PSX_OVERLAY_CANDIDATE_CAP 131072
+ 
+ /* Codegen flavor of the recompiled output the overlays + runtime were built
+  * against. Overlays are keyed in the cache by guest-bytes CRC, which is

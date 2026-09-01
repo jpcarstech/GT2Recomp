@@ -1,0 +1,49 @@
+name: patch stack
+
+# The carried framework changes travel as patches/ applied onto pinned
+# submodule commits. This job proves the whole stack still applies cleanly,
+# in the exact order local_build.sh uses, on every push - a build that silently
+# lacks a patch is indistinguishable from "the change did not help".
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: apply psxrecomp patches (upstream/ then carried, byte order)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd psxrecomp
+          n=0
+          while IFS= read -r p; do
+            [ -f "$p" ] || continue
+            n=$((n+1))
+            git apply --check "$p" || { echo "FAILED: $p"; exit 1; }
+            git apply "$p"
+            echo "applied $(basename "$p")"
+          done < <(LC_ALL=C printf '%s\n' ../patches/upstream/*.patch ../patches/psxrecomp-*.patch | LC_ALL=C sort)
+          echo "$n patches applied"
+          [ "$n" -gt 0 ]
+      - name: apply recomp-ui patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd recomp-ui
+          for p in ../patches/recomp-ui/*.patch; do
+            git apply --check "$p" || { echo "FAILED: $p"; exit 1; }
+            git apply "$p"; echo "applied $(basename "$p")"
+          done
+      - name: shell syntax
+        run: bash -n tools-win/local-build/local_build.sh tools/make_bundle.sh
+      - name: recompiler tool configures and builds
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build cmake
+          cmake -S psxrecomp/recompiler -B /tmp/rc -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/rc --target psxrecomp-game -j

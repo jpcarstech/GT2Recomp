@@ -1,0 +1,42 @@
+From 05dee5bf86974bb3ad76cc5b77371a6f16632671 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 06:22:50 +0000
+Subject: [PATCH] pgxp: default frame retirement OFF - it trades one artefact
+ for another
+
+Mode 1 (hard wipe) closes the gaps by suppressing correction broadly, so the
+whole scene wobbles. Mode 2 (one-frame window) keeps the track looking right
+but strands data the game reuses for longer than two frames - reported as the
+car's wheel models wobbling. Neither is a fix.
+
+psx_pgxp_store already resets a shadow when the guest overwrites the word with
+an untracked value, so time-based retirement is redundant where the game
+rewrites its vertex data each frame and actively harmful where it does not.
+Left tunable for A/B; the defect to chase is the ~6% of vertices that never
+receive provenance at all.
+---
+ runtime/src/pgxp.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 2a4cfe8c..432cefaf 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -165,7 +165,16 @@ extern "C" int pgxp_enabled(void) { return s_enabled; }
+  *     vertices fall back to rounded integer positions - wobble)
+  * 2 = retire with a one-frame grace window (default): last frame's shadows
+  *     stay readable, everything older is stranded. */
+-static int s_frame_wipe = 2;
++/* Default 0. Both retirement modes trade one artefact for another rather than
++ * fixing either: mode 1 suppresses correction broadly (gaps close, everything
++ * wobbles), and mode 2 strands data the game reuses for more than two frames -
++ * observed as wheel models wobbling while the track looked right. Store
++ * invalidation (psx_pgxp_store) already kills a shadow when the guest
++ * overwrites the word, so time-based retirement is redundant where the game
++ * rewrites its vertex data and harmful where it does not. Kept tunable for
++ * A/B work; the real defect is the ~6% of vertices that never get provenance
++ * at all (see pgxp_resolve_state_census). */
++static int s_frame_wipe = 0;
+ extern "C" void pgxp_set_frame_wipe(int mode) {
+     s_frame_wipe = (mode >= 0 && mode <= 2) ? mode : 2;
+ }

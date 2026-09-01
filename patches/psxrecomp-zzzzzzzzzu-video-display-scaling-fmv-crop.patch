@@ -1,0 +1,404 @@
+From 4a490a8c6bfa2441ff058dbcef1cca610ac9fcca Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 16:05:07 +0000
+Subject: [PATCH] video: display_scaling (nearest/bilinear/sharp) and fmv_crop
+ settings - launcher, F1 menu, settings.toml
+
+display_scaling replaces the misnamed 'antialiasing' switch as the user-facing
+present policy: nearest (true nearest at integer ratios, sharp-bilinear at a
+non-integer magnification), bilinear, or sharp-bilinear always - DuckStation's
+Nearest / Bilinear (Smooth) / Bilinear (Sharp). Unset keeps following
+antialiasing. fmv_crop trims N native rows top/bottom (and 4/3 N columns per
+side) from a 24-bit FMV frame before the 4:3 fit, so movies fill more of the
+window without changing aspect (DuckStation Crop Mode = Overscan). Both are
+settings.toml keys, launcher rows (recomp-ui: Display scaling / FMV overscan
+crop; the Antialiasing row is hidden when Display scaling is offered) and F1
+Graphics rows (persisted on menu close).
+---
+ recompiler/src/config_loader.cpp  | 14 +++++
+ recompiler/src/config_loader.h    | 10 ++++
+ runtime/include/gpu_gl_renderer.h |  6 +++
+ runtime/src/gpu_gl_renderer.c     | 37 ++++++++++++-
+ runtime/src/main.cpp              | 89 ++++++++++++++++++++++++++++++-
+ 5 files changed, 153 insertions(+), 3 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index abdfb3ed..a0997806 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2348,6 +2348,16 @@ UserSettings load_user_settings(const fs::path& path) {
+             s.texture_filter_2d = toml::find<bool>(v, "texture_filtering_2d");
+             s.has_texture_filter_2d = true;
+         });
++        if (v.contains("display_scaling")) try_get([&]{
++            const auto m = toml::find<std::string>(v, "display_scaling");
++            if (m == "nearest") { s.display_scaling = 0; s.has_display_scaling = true; }
++            else if (m == "bilinear") { s.display_scaling = 1; s.has_display_scaling = true; }
++            else if (m == "sharp") { s.display_scaling = 2; s.has_display_scaling = true; }
++        });
++        if (v.contains("fmv_crop")) try_get([&]{
++            const int c = static_cast<int>(toml::find<std::int64_t>(v, "fmv_crop"));
++            if (c >= 0 && c <= 32) { s.fmv_crop = c; s.has_fmv_crop = true; }
++        });
+         if (v.contains("post_processing")) try_get([&]{
+             const auto m = toml::find<std::string>(v, "post_processing");
+             if (m == "off") { s.post_processing = 0; s.has_post_processing = true; }
+@@ -2695,6 +2705,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+         f << "texture_filtering_2d = " << (s.texture_filter_2d ? "true" : "false") << "\n";
+     if (s.has_post_processing)
+         f << "post_processing = \"" << (s.post_processing == 1 ? "fxaa" : "off") << "\"\n";
++    if (s.has_display_scaling)
++        f << "display_scaling = \"" << (s.display_scaling == 0 ? "nearest" : s.display_scaling == 1 ? "bilinear" : "sharp") << "\"\n";
++    if (s.has_fmv_crop)
++        f << "fmv_crop = " << s.fmv_crop << "\n";
+     if (s.has_fmv_filter)
+         f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
+     if (s.has_geometry_correction)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 37c90db7..fbe22882 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1215,6 +1215,16 @@ struct UserSettings {
+     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear
+     bool has_texture_filter_2d = false; bool texture_filter_2d = true; // filter 2D sprites/UI too
+     bool has_post_processing = false; int post_processing = 0; // 0=off,1=fxaa
++    // display_scaling: how the finished frame is scaled to the window.
++    // 0 nearest (true nearest at integer ratios, sharp-bilinear at a non-integer
++    // magnification), 1 bilinear, 2 sharp-bilinear. Unset -> follow antialiasing.
++    // DuckStation: Nearest / Bilinear (Smooth) / Bilinear (Sharp).
++    bool has_display_scaling = false; int display_scaling = 0;
++    // fmv_crop: native pixels trimmed from the top and bottom of a 24-bit FMV
++    // frame (and 4/3 as many from each side, so the movie stays 4:3) before
++    // it is fitted to the window - the overscan border a CRT never showed.
++    // 0 = off. DuckStation: Crop Mode = Overscan.
++    bool has_fmv_crop = false; int fmv_crop = 0;
+     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+     // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+     bool has_fmv_filter     = false; int  fmv_filter     = VIDEO_FMV_FILTER_DEFAULT;
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 3900ac54..b0975af1 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -121,6 +121,12 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+  * disp_x) straight to the window, no CPU readback. Returns 0 if no wide surface
+  * exists for disp_x (caller falls back to the CPU readout path). */
+ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear);
++/* [video] display_scaling: -1 follow antialiasing, 0 nearest, 1 bilinear, 2 sharp. */
++void gl_renderer_set_display_scaling(int mode);
++/* [video] fmv_crop: native rows trimmed top/bottom of an FMV frame (0 = off). */
++void gl_renderer_set_fmv_crop(int native_rows);
++int  gl_renderer_get_fmv_crop(void);
++int  gl_renderer_get_display_scaling(void);
+ 
+ /* Display aspect for the present letterbox (default 4:3). A wide aspect
+  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 1f2a3ce4..caea61d0 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3736,6 +3736,14 @@ void gl_renderer_shutdown(void) {
+  * force_4_3 pins the rect to native 4:3 regardless of the display aspect —
+  * FMVs are authored 4:3 and have no GTE squash to compensate a stretch, so
+  * widescreen presents them pillarboxed instead of distorted. */
++/* [video] fmv_crop: native rows trimmed from the top and bottom of a 24-bit
++ * FMV frame, and 4/3 as many columns from each side, before the frame is
++ * fitted to its 4:3 rect - the overscan border a CRT never showed, so the
++ * movie fills more of the window at the same aspect. 0 = off. */
++static int s_fmv_crop = 0;
++void gl_renderer_set_fmv_crop(int native_rows) { s_fmv_crop = native_rows < 0 ? 0 : native_rows; }
++int  gl_renderer_get_fmv_crop(void)            { return s_fmv_crop; }
++
+ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
+                          int force_4_3, int content_w) {
+     if (!s_ctx) return;
+@@ -3797,12 +3805,22 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
+     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+     present_set_sharp(filt_mode, src_w, src_h, lw, lh);
++    /* Overscan crop for FMV (force_4_3, full-height source only). */
++    int ocx = 0, ocy = 0;
++    if (force_4_3 && s_fmv_crop > 0 && src_h >= 192 && src_w > 0 &&
++        s_fmv_crop * 2 < src_h / 2) {
++        ocy = s_fmv_crop;
++        ocx = (s_fmv_crop * src_w) / src_h;   /* 4/3 of the rows at 320x240 */
++    }
+     if (crop) {
+         /* Cropped present keeps left-aligned content; still inset so linear
+          * AA does not blend the cut column with undefined border texels. */
+         float u0 = (src_w > 0) ? (0.5f / (float)src_w) : 0.f;
+         float v0 = (src_h > 0) ? (0.5f / (float)src_h) : 0.f;
+         p_glUniform4f(s_present_uUvRect, u0, v0, uv_x1 - u0, 1.f - v0);
++    } else if (ocx > 0 || ocy > 0) {
++        float u0 = ((float)ocx + 0.5f) / (float)src_w, v0 = ((float)ocy + 0.5f) / (float)src_h;
++        p_glUniform4f(s_present_uUvRect, u0, v0, 1.f - u0, 1.f - v0);
+     } else if (src_w > 0 && src_h > 0) {
+         /* Half-texel UV inset for both nearest and linear. Corner-mapped
+          * UV=1.0 grazes past the last texel (driver-dependent border sample);
+@@ -4946,10 +4964,24 @@ static void gl_swap_with_osd(void) {
+     }
+ }
+ 
++/* Display scaling policy for the scene present ([video] display_scaling):
++ * 0 nearest (true nearest at integer ratios, sharp-bilinear at non-integer
++ * magnification), 1 bilinear, 2 sharp-bilinear always. The legacy `linear`
++ * argument (antialiasing) still selects between 0 and 1 when the setting is
++ * unset (-1). DuckStation equivalents: Nearest / Bilinear (Smooth) / Bilinear
++ * (Sharp). */
++static int s_display_scaling = -1;
++void gl_renderer_set_display_scaling(int mode) { s_display_scaling = mode; }
++int  gl_renderer_get_display_scaling(void)     { return s_display_scaling; }
++
+ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+                                 int x, int y, int w, int h, int linear,
+                                 int lx, int ly, int lw, int lh, int v_flip) {
+     float u0, v0, u1, v1;
++    int force_sharp = 0;
++    if (s_display_scaling == 0)      linear = 0;
++    else if (s_display_scaling == 1) linear = 1;
++    else if (s_display_scaling == 2) { linear = 1; force_sharp = 1; }
+     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+     glViewport(lx, ly, lw, lh);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+@@ -5007,10 +5039,11 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+      * ramp confined to a one-output-pixel band, no beating. Integer ratios
+      * (1:1, 2:1 ...) keep true nearest - it is exact there. */
+     int sharp_mag = 0;
+-    if (!s_present_resolved && !linear && s_scale > 0 && w > 0 && lw > 0) {
++    if (!s_present_resolved && s_scale > 0 && w > 0 && lw > 0) {
+         const float mag = (float)lw / (float)(w * s_scale);
+         const float near_int = (float)(int)(mag + 0.5f);
+-        if (mag > 1.01f && (mag < near_int - 0.01f || mag > near_int + 0.01f)) {
++        const int non_integer = (mag > 1.01f && (mag < near_int - 0.01f || mag > near_int + 0.01f));
++        if ((force_sharp && mag > 1.0f) || (!linear && non_integer)) {
+             sharp_mag = 1;
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index a6937a3d..04140c19 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1183,6 +1183,18 @@ static bool          g_video_aa    = true;  /* linear present filtering */
+ /* FMV present reconstruction (VIDEO_FMV_FILTER_*), pushed to the GL renderer
+  * once the config is resolved. Only consulted while g_video_aa is on. */
+ static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
++/* [video] display_scaling (-1 = follow antialiasing; 0 nearest, 1 bilinear,
++ * 2 sharp) and fmv_crop (native rows trimmed top/bottom of an FMV frame). */
++static int           g_video_display_scaling = -1;
++static int           g_video_fmv_crop = 0;
++static void apply_display_scaling_settings(void) {
++#ifndef PSX_SDL_NO_RENDER
++    if (g_video_display_scaling >= 0)
++        g_video_aa = (g_video_display_scaling != 0);
++    gl_renderer_set_display_scaling(g_video_display_scaling);
++    gl_renderer_set_fmv_crop(g_video_fmv_crop);
++#endif
++}
+ 
+ /* recomp-ui stores this 1-based so a zero-initialized (older) host reads as
+  * "unset" rather than pinning nearest; the config enum is 0-based. Convert at
+@@ -1192,6 +1204,12 @@ static inline int launcher_fmv_filter_to_cfg(int ls_value) {
+         return PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+     return ls_value - 1;
+ }
++/* display_scaling: launcher 1 nearest / 2 bilinear / 3 sharp (0 unset);
++ * fmv_crop: launcher 1 off / 2 8px / 3 12px / 4 16px (0 unset). */
++static inline int cfg_display_scaling_to_launcher(int v) { return (v >= 0 && v <= 2) ? v + 1 : 0; }
++static inline int launcher_display_scaling_to_cfg(int v) { return (v >= 1 && v <= 3) ? v - 1 : -1; }
++static inline int cfg_fmv_crop_to_launcher(int px) { return px <= 0 ? 1 : px <= 8 ? 2 : px <= 12 ? 3 : 4; }
++static inline int launcher_fmv_crop_to_cfg(int v) { static const int t[5] = { 0, 0, 8, 12, 16 }; return (v >= 1 && v <= 4) ? t[v] : 0; }
+ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+     if (cfg_value < 0 || cfg_value >= PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
+         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+@@ -6155,6 +6173,16 @@ extern "C" {
+     float pgxp_tolerance(void);
+     void pgxp_set_tolerance(float t);
+ }
++static const char kDisplayScaling[]  = "graphics.display_scaling";
++static const char kFmvCrop[]         = "graphics.fmv_crop";
++static const char *const kDisplayScalingChoices[] = { "Nearest", "Bilinear", "Sharp bilinear" };
++static const char *const kFmvCropChoices[] = { "Off", "8 px", "12 px", "16 px" };
++static const int kFmvCropValues[] = { 0, 8, 12, 16 };
++static int fmv_crop_index(void) {
++    int best = 0;
++    for (int i = 1; i < 4; i++) if (abs(kFmvCropValues[i] - g_video_fmv_crop) < abs(kFmvCropValues[best] - g_video_fmv_crop)) best = i;
++    return best;
++}
+ static const char kPgxpGeometry[]    = "pgxp.geometry";
+ static const char kPgxpTexture[]     = "pgxp.texture";
+ static const char kPgxpCulling[]     = "pgxp.culling";
+@@ -6233,6 +6261,10 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+         *value_out = g_controller_ports_swapped ? 1 : 0;
+     else if (std::strncmp(item->key, "pgxp.", 5) == 0)
+         return pgxp_ui_get(item->key, value_out);
++    else if (std::strcmp(item->key, kDisplayScaling) == 0)
++        *value_out = g_video_display_scaling >= 0 ? g_video_display_scaling : (g_video_aa ? 1 : 0);
++    else if (std::strcmp(item->key, kFmvCrop) == 0)
++        *value_out = fmv_crop_index();
+     else
+         return 0;
+     return 1;
+@@ -6276,6 +6308,14 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+             controller_port_route_toggle();
+     } else if (std::strncmp(item->key, "pgxp.", 5) == 0) {
+         if (!pgxp_ui_set(item->key, value)) return 0;
++    } else if (std::strcmp(item->key, kDisplayScaling) == 0) {
++        if (value < 0 || value > 2) return 0;
++        g_video_display_scaling = value;
++        apply_display_scaling_settings();
++    } else if (std::strcmp(item->key, kFmvCrop) == 0) {
++        if (value < 0 || value > 3) return 0;
++        g_video_fmv_crop = kFmvCropValues[value];
++        apply_display_scaling_settings();
+     } else {
+         return 0;
+     }
+@@ -6302,6 +6342,12 @@ static void runtime_ui_save(void*) {
+     settings.has_texture_filter = true;
+     settings.volume = host_volume_get();
+     settings.has_volume = true;
++    if (g_video_display_scaling >= 0) {
++        settings.display_scaling = g_video_display_scaling;
++        settings.has_display_scaling = true;
++    }
++    settings.fmv_crop = g_video_fmv_crop;
++    settings.has_fmv_crop = true;
+     if (!PSXRecompV4::save_user_settings(g_runtime_settings_path, settings))
+         host_osd_push("Settings changed live but could not be saved", 2200);
+ }
+@@ -6402,6 +6448,12 @@ static void runtime_settings_ui_ensure_created(void) {
+         { kRuntimeDiscReinsert, "Disc", "Reinsert current disc",
+           "Signal a tray-open/close cycle without changing the mounted image.",
+           RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
++        { kDisplayScaling, "Graphics", "Display scaling",
++          "How the frame is fitted to the window (DS: Nearest / Bilinear Smooth / Sharp)",
++          RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, kDisplayScalingChoices, 3, nullptr },
++        { kFmvCrop, "Graphics", "FMV overscan crop",
++          "Trim the CRT overscan border of movies; keeps 4:3",
++          RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, kFmvCropChoices, 4, nullptr },
+         /* PGXP tuning - live, not persisted. The DuckStation knob set only:
+          * the runtime's own extra mechanisms stay debug-port-only (pgxp cmd). */
+         { kPgxpGeometry, "PGXP", "Geometry correction",
+@@ -6455,7 +6507,6 @@ static void runtime_settings_ui_ensure_created(void) {
+     config.features =
+         RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
+         RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE |
+-        RECOMP_RUNTIME_UI_STANDARD_LINEAR_FILTER |
+         RECOMP_RUNTIME_UI_STANDARD_TEXTURE_FILTER |
+         RECOMP_RUNTIME_UI_STANDARD_VOLUME |
+         RECOMP_RUNTIME_UI_STANDARD_RESUME;
+@@ -7039,6 +7090,7 @@ struct NetplayVblankEpilogue {
+ /* Called from gpu_vblank_tick() at each simulated vblank. */
+ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     NetplayVblankEpilogue ep{};
++    apply_display_scaling_settings();
+     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
+      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
+      * next tick has a live native chain under its dispatch again. */
+@@ -12506,6 +12558,8 @@ int main(int argc, char** argv) {
+         if (us.has_texture_filter_2d) g_video_texfilter_2d = us.texture_filter_2d ? 1 : 0;
+         if (us.has_post_processing) g_video_postfx = us.post_processing;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
++        if (us.has_display_scaling) g_video_display_scaling = us.display_scaling;
++        if (us.has_fmv_crop)       g_video_fmv_crop = us.fmv_crop;
+         if (us.has_geometry_correction)
+             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
+         if (us.has_perspective_texturing)
+@@ -13008,6 +13062,8 @@ int main(int argc, char** argv) {
+             seed.texture_filter_2d = (g_video_texfilter_2d != 0); seed.has_texture_filter_2d = true;
+             seed.post_processing = g_video_postfx;        seed.has_post_processing = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
++            if (g_video_display_scaling >= 0) { seed.display_scaling = g_video_display_scaling; seed.has_display_scaling = true; }
++            seed.fmv_crop = g_video_fmv_crop;             seed.has_fmv_crop = true;
+             /* Seeded (and marked present) so a launcher save round-trips the
+              * player's hand-edited value instead of dropping the key. */
+             seed.geometry_correction = (g_video_geometry_correction != 0);
+@@ -13199,6 +13255,10 @@ int main(int argc, char** argv) {
+             ls.texture_filter_2d  = seed.texture_filter_2d ? 1 : 0;
+             ls.post_processing    = seed.post_processing;
+             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++            ls.display_scaling    = seed.has_display_scaling ? cfg_display_scaling_to_launcher(seed.display_scaling) : 0;
++            ls.fmv_crop           = cfg_fmv_crop_to_launcher(seed.fmv_crop);
++#endif
+             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
+             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
+             ls.screen_kind        = seed.screen_kind;
+@@ -13437,6 +13497,10 @@ int main(int argc, char** argv) {
+                 seed.has_post_processing = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 seed.has_fmv_filter = true;
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++                if (ls.display_scaling >= 1) { seed.display_scaling = launcher_display_scaling_to_cfg(ls.display_scaling); seed.has_display_scaling = true; }
++                if (ls.fmv_crop >= 1) { seed.fmv_crop = launcher_fmv_crop_to_cfg(ls.fmv_crop); seed.has_fmv_crop = true; }
++#endif
+                 {
+                     const int n = std::min(PSX_MAX_PLAYERS, RECOMP_LAUNCHER_MAX_PLAYERS);
+                     const int un = std::min(n, PSXRecompV4::UserSettings::kMaxControllerPlayers);
+@@ -13484,6 +13548,10 @@ int main(int argc, char** argv) {
+                 seed.has_perspective_texturing = true;
+                 seed.fmv_filter            = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 seed.has_fmv_filter        = true;
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++                if (ls.display_scaling >= 1) { seed.display_scaling = launcher_display_scaling_to_cfg(ls.display_scaling); seed.has_display_scaling = true; }
++                if (ls.fmv_crop >= 1) { seed.fmv_crop = launcher_fmv_crop_to_cfg(ls.fmv_crop); seed.has_fmv_crop = true; }
++#endif
+                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
+                 seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
+                 seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
+@@ -13652,6 +13720,10 @@ int main(int argc, char** argv) {
+                         qs.has_post_processing = true;
+                         qs.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                         qs.has_fmv_filter = true;
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++                        if (ls.display_scaling >= 1) { qs.display_scaling = launcher_display_scaling_to_cfg(ls.display_scaling); qs.has_display_scaling = true; }
++                        if (ls.fmv_crop >= 1) { qs.fmv_crop = launcher_fmv_crop_to_cfg(ls.fmv_crop); qs.has_fmv_crop = true; }
++#endif
+                         qs.geometry_correction = ls.geometry_correction != 0;
+                         qs.has_geometry_correction = true;
+                         qs.perspective_texturing = ls.perspective_texturing != 0;
+@@ -13732,6 +13804,8 @@ int main(int argc, char** argv) {
+                 g_video_texfilter_2d = seed.texture_filter_2d ? 1 : 0;
+                 g_video_postfx = seed.post_processing;
+                 g_video_fmv_filter = seed.fmv_filter;
++                if (seed.has_display_scaling) g_video_display_scaling = seed.display_scaling;
++                if (seed.has_fmv_crop) g_video_fmv_crop = seed.fmv_crop;
+                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
+                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
+                 g_video_screen    = seed.screen_kind;
+@@ -15243,6 +15317,10 @@ soft_return_lobby:
+         ls.antialiasing = g_video_aa ? 1 : 0;
+         ls.texture_filter = g_video_texfilter;
+         ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++        ls.display_scaling = g_video_display_scaling >= 0 ? cfg_display_scaling_to_launcher(g_video_display_scaling) : 0;
++        ls.fmv_crop = cfg_fmv_crop_to_launcher(g_video_fmv_crop);
++#endif
+         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
+         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
+         ls.screen_kind = g_video_screen;
+@@ -15523,6 +15601,10 @@ soft_return_lobby:
+                 us.has_post_processing = true;
+                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 us.has_fmv_filter = true;
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++                if (ls.display_scaling >= 1) { us.display_scaling = launcher_display_scaling_to_cfg(ls.display_scaling); us.has_display_scaling = true; }
++                if (ls.fmv_crop >= 1) { us.fmv_crop = launcher_fmv_crop_to_cfg(ls.fmv_crop); us.has_fmv_crop = true; }
++#endif
+                 us.geometry_correction = ls.geometry_correction != 0;
+                 us.has_geometry_correction = true;
+                 us.perspective_texturing = ls.perspective_texturing != 0;
+@@ -15593,6 +15675,11 @@ soft_return_lobby:
+             gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
+             gl_renderer_set_post_processing(g_video_postfx);
+             g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
++#ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
++            if (ls.display_scaling >= 1) g_video_display_scaling = launcher_display_scaling_to_cfg(ls.display_scaling);
++            if (ls.fmv_crop >= 1) g_video_fmv_crop = launcher_fmv_crop_to_cfg(ls.fmv_crop);
++            apply_display_scaling_settings();
++#endif
+             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
+             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
+             g_video_screen = ls.screen_kind;
+-- 
+2.43.0
+

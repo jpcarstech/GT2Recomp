@@ -1,0 +1,112 @@
+diff --git a/runtime/include/dma_gpu_ll.h b/runtime/include/dma_gpu_ll.h
+index cd0a8f31..669a3ad3 100644
+--- a/runtime/include/dma_gpu_ll.h
++++ b/runtime/include/dma_gpu_ll.h
+@@ -19,6 +19,7 @@ typedef struct {
+     uint8_t phase;
+     uint8_t emit_node;
+     uint8_t hit_limit;
++    uint8_t bus_error;   /* next pointer left the 8 MB DRAM decode window */
+     uint32_t start_addr;
+     uint32_t current_addr;
+     uint32_t next_addr;
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index 3b83cd63..5b80ac26 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -234,6 +234,15 @@ static void raise_dma_irq_on_master_edge(uint32_t before) {
+     }
+ }
+ 
++static void dma_flag_bus_error(void) {
++    /* DICR bit 15: bus error — "raised when transferring to/from an address
++     * outside of RAM. Forces bit 31." (psx-spx). Reuses the master-edge IRQ
++     * latch so a game waiting on the DMA interrupt still wakes up. */
++    uint32_t before = dicr;
++    dicr |= (1u << 15);
++    raise_dma_irq_on_master_edge(before);
++}
++
+ static void start_cdrom_dma_capture(uint32_t requested_words) {
+     CDROMDebugState s;
+     cdrom_debug_snapshot(&s);
+@@ -717,8 +726,34 @@ static void gpu_ll_emit_word(void *opaque, uint32_t address, uint32_t word) {
+ 
+ static void gpu_ll_complete(void *opaque, int hit_limit) {
+     (void)opaque;
+-    channels[2].madr = hit_limit ? gpu_linked_list.current_addr
+-                                 : 0x00FFFFFFu;
++    if (gpu_linked_list.bus_error) {
++        /* Next pointer left the DRAM decode window: hardware stops the
++         * transfer with a DMA bus error (DICR bit 15 -> bit 31). */
++        dma_flag_bus_error();
++        channels[2].madr = gpu_linked_list.next_addr;
++    } else {
++        channels[2].madr = hit_limit ? gpu_linked_list.current_addr
++                                     : 0x00FFFFFFu;
++    }
++    if (hit_limit) {
++        /* MAX_NODES exhausted without an end marker or bus error: the
++         * display list loops back on itself. Real hardware would spin in
++         * this transfer forever (the game has corrupted its OT) — we
++         * truncate, but say so, because silence here cost a debugging
++         * session: the symptom presents downstream as garbage GP0
++         * opcodes / a frozen frame. */
++        static int ll_loop_warned = 0;
++        if (ll_loop_warned < 4) {
++            ll_loop_warned++;
++            fprintf(stderr,
++                    "[dma] GPU linked list exceeded %u nodes without an end"
++                    " marker (start 0x%06X, stopped at 0x%06X) — looping or"
++                    " corrupt ordering table, transfer truncated [%d/4]\n",
++                    gpu_linked_list.max_nodes,
++                    gpu_linked_list.start_addr & 0xFFFFFFu,
++                    gpu_linked_list.current_addr & 0xFFFFFFu, ll_loop_warned);
++        }
++    }
+     gpu_ws_end_linked_list();
+     complete_transfer(2);
+ }
+diff --git a/runtime/src/dma_gpu_ll.c b/runtime/src/dma_gpu_ll.c
+index 7882b273..a462ab93 100644
+--- a/runtime/src/dma_gpu_ll.c
++++ b/runtime/src/dma_gpu_ll.c
+@@ -10,6 +10,16 @@
+ #define DMA_GPU_LL_HEADER_CYCLES 8u
+ #define DMA_GPU_LL_SETUP_CYCLES  5u
+ 
++
++/* psx-spx: any next pointer outside the 8 MB DRAM decode window stops the
++ * transfer with a DMA bus error (DICR bit 15 -> bit 31); some games END their
++ * chains by toggling that high bit instead of writing the FFFFFFh marker.
++ * Masking it back into RAM and walking on turned one such tag into ~256k
++ * bogus nodes of GP0 spam per transfer. */
++static int next_is_bus_error(uint32_t next) {
++    return next != 0x00FFFFFFu && (next & 0x00800000u) != 0;
++}
++
+ static uint32_t resolve_address(const DMAGPULinkedListOps *ops, void *opaque,
+                                 uint32_t address) {
+     return ops->resolve_address ? ops->resolve_address(opaque, address) : address;
+@@ -89,6 +99,11 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+             finish(state, ops, opaque);
+             return;
+         }
++        if (next_is_bus_error(state->next_addr)) {
++            state->bus_error = 1;
++            finish(state, ops, opaque);
++            return;
++        }
+         state->current_addr = resolve_address(ops, opaque, state->next_addr);
+         state->cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
+         return;
+@@ -110,7 +125,8 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
+         }
+         state->total_words += state->word_count;
+ 
+-        if (state->next_addr == 0x00FFFFFFu) {
++        if (state->next_addr == 0x00FFFFFFu || next_is_bus_error(state->next_addr)) {
++            if (state->next_addr != 0x00FFFFFFu) state->bus_error = 1;
+             state->phase = DMA_GPU_LL_PHASE_COMPLETE;
+             state->cycles_remaining = state->word_count;
+             return;

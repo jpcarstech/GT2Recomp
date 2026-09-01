@@ -1,0 +1,30 @@
+From ce9597c0e5e541787bc1ecf76d127c81ee53522d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 07:50:29 +0000
+Subject: [PATCH] pgxp: keep gte_geometry_frame_advance out of cpu_state.h
+
+gpu.c already declares it locally at the one call site. Declaring it in
+cpu_state.h - which every generated shard includes - made a one-line runtime
+change invalidate all 611 shard objects, a multi-hour rebuild for the user and
+for the lab, for a declaration nothing in the shards uses. Header ABI is
+unchanged from the pin.
+---
+ runtime/include/cpu_state.h | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/runtime/include/cpu_state.h b/runtime/include/cpu_state.h
+index 03feefe8..66c1b786 100644
+--- a/runtime/include/cpu_state.h
++++ b/runtime/include/cpu_state.h
+@@ -211,11 +211,6 @@ extern void     gte_precision_tracking_set(int enabled);
+  * saturates SXY to integer screen pixels. Guest-visible GTE state is
+  * unchanged — this is a visual-only enhancement, default off. */
+ extern void     gte_geometry_correction_set(int enabled);
+-/* Frame boundary: the geometry table maps an integer screen position to the
+- * sub-pixel projection behind it, which is only valid within one frame. Called
+- * from gpu_vblank_tick so entries cannot accumulate across frames and latch
+- * false ambiguity. */
+-extern void     gte_geometry_frame_advance(void);
+ extern int      gte_geometry_correction_enabled(void);
+ /* Corrected vertices consumed since the last gte_geometry_correction_set —
+  * the "is this actually doing anything on this title" counter. */

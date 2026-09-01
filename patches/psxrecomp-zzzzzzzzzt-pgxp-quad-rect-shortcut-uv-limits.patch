@@ -1,0 +1,377 @@
+From e437ded11ee4368ca9b8fac7d072e28d3c138b8d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 15:33:20 +0000
+Subject: [PATCH] gpu: no rect shortcut for quads with PGXP provenance;
+ DuckStation polygon UV limits (max-1, quad-wide)
+
+THE trackside-wall seams / panel jitter (GT2 Tahiti Road chevron wall,
+'vertical lines between the wall textures' that open and close as the
+camera pans; DuckStation shows none on the same replay frame):
+
+gp0_exec_textured_quad drew any textured quad whose INTEGER corners form an
+axis-aligned rectangle through gr_draw_textured_rect(_scaled) - a 2D fast
+path that bypasses prepare_precise_triangle entirely. A 3D wall panel that
+happens to land on integer-rectangular corners this frame is therefore
+rasterized at native positions while its neighbours are sub-pixel placed:
+a 0.5-1 px gap at the joint, and a whole-pixel jump when the panel flips
+between the two paths from one frame to the next. Same for the
+semi-transparent axis-aligned mono-quad shortcut. Both shortcuts now
+require that no corner of the packet carries a PGXP shadow
+(quad_has_precise_provenance); true 2D quads (HUD, menus, no projection
+provenance) keep the fast path. Verified on the replay frame at 0:11.870,
+9x: the wall renders as one continuous strip, matching DuckStation.
+
+Also DuckStation ComputePolygonUVLimits parity: the per-axis sampled range
+is max-1 whenever min != max for every mapping direction (previously only
+axis-aligned ones), and both triangles of a textured quad share one limit
+rectangle over all four corners (gr_set_uv_limits, GL/VK/SW), so the
+diagonal edge is not clamped one texel short by the half lacking the
+quad's extreme uv.
+---
+ runtime/include/gpu_render.h      |  8 +++++
+ runtime/include/gpu_sw_renderer.h |  1 +
+ runtime/src/gpu.c                 | 51 +++++++++++++++++++++++++++++--
+ runtime/src/gpu_gl_renderer.c     | 19 ++++++++++--
+ runtime/src/gpu_render.c          |  4 +++
+ runtime/src/gpu_sw_renderer.c     | 10 ++++++
+ runtime/src/gpu_uv.h              | 27 +++++++++++++++-
+ runtime/src/gpu_vk_renderer.c     | 14 ++++++++-
+ 8 files changed, 128 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/include/gpu_render.h b/runtime/include/gpu_render.h
+index ffb00880..2d13799b 100644
+--- a/runtime/include/gpu_render.h
++++ b/runtime/include/gpu_render.h
+@@ -59,6 +59,13 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2);
+  * when `enabled`. Backends without depth support may leave the hook NULL. */
+ void gr_set_depth_triangle(int enabled, float z0, float z1, float z2);
+ 
++/* Quad-wide uv sampling bounds (inclusive, page-relative) for the textured
++ * triangles that follow, until cleared with enabled == 0. Both halves of a
++ * textured quad then clamp to ONE rectangle computed over all four corners
++ * (DuckStation ComputePolygonUVLimits), instead of each triangle's own.
++ * Optional hook; backends that ignore it derive per-triangle bounds. */
++void gr_set_uv_limits(int enabled, int lo_u, int lo_v, int hi_u, int hi_v);
++
+ /* Clear the depth buffer NOW, mid-frame, after everything queued so far has
+  * rasterized (DuckStation depth-clear threshold: the game moved to a farther
+  * drawing layer). NULL-safe like the depth hook. */
+@@ -152,6 +159,7 @@ typedef struct GpuRenderBackend {
+                                  int32_t x2, int32_t y2);
+     void (*set_perspective_triangle)(int enabled, float q0, float q1, float q2);
+     void (*set_depth_triangle)(int enabled, float z0, float z1, float z2);
++    void (*set_uv_limits)(int enabled, int lo_u, int lo_v, int hi_u, int hi_v);
+     void (*depth_clear)(void);
+     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
+     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
+diff --git a/runtime/include/gpu_sw_renderer.h b/runtime/include/gpu_sw_renderer.h
+index 4cf50109..5d827d5d 100644
+--- a/runtime/include/gpu_sw_renderer.h
++++ b/runtime/include/gpu_sw_renderer.h
+@@ -36,6 +36,7 @@ void sw_set_precise_triangle(int enabled,
+ 
+ /* Perspective-correct UV override for the next triangle. q values are the
+  * homogeneous interpolation weights associated with each screen vertex. */
++void sw_set_uv_limits(int enabled, int lo_u, int lo_v, int hi_u, int hi_v);
+ void sw_set_perspective_triangle(int enabled,
+                                  float q0, float q1, float q2);
+ uint32_t sw_perspective_triangle_count(void);
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 18ce8595..75c5e1a1 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -20,6 +20,7 @@
+ #include "gpu_sw_renderer.h"
+ #include "gpu_vram_dirty.h"
+ #include "gpu_render.h"
++#include "gpu_uv.h"
+ #include "text_xlate.h"
+ #include "crash_trace.h"
+ #include "debug_server.h"
+@@ -3622,6 +3623,8 @@ int gpu_pgxp_tri_ring_read(void *out, int max_recs, uint32_t *total) {
+ }
+ size_t gpu_pgxp_tri_rec_size(void) { return sizeof(PgxpTriRec); }
+ 
++static int quad_has_precise_provenance(const int *word_idx);
++
+ static void prepare_precise_triangle(int i0, int i1, int i2,
+                                      const int32_t vx[3], const int32_t vy[3]) {
+     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+@@ -4212,7 +4215,9 @@ static void gp0_exec_mono_quad(void) {
+     /* Semi axis-aligned mono quads (UI boxes/borders): one rect, not two tris.
+      * Thin semi borders (e.g. CTR name-entry OT-1144 teal 3×H) otherwise double-
+      * blend their shared diagonal — nearly the whole strip — and overpaint 3D. */
+-    if (semi_trans && ws_axis_aligned_quad(vx, vy)) {
++    static const int k_fq_words[4] = { 1, 2, 3, 4 };
++    if (semi_trans && ws_axis_aligned_quad(vx, vy) &&
++        !quad_has_precise_provenance(k_fq_words)) {
+         int32_t min_x = vx[0], max_x = vx[0], min_y = vy[0], max_y = vy[0];
+         for (int i = 1; i < 4; i++) {
+             if (vx[i] < min_x) min_x = vx[i];
+@@ -4393,6 +4398,31 @@ static void gp0_exec_textured_tri(void) {
+                               clut_x, clut_y, tpage);
+ }
+ 
++/* Does any corner of the current quad packet carry a PGXP precise shadow?
++ * The axis-aligned "draw as a rect" shortcuts below bypass
++ * prepare_precise_triangle entirely, so a 3D quad whose INTEGER corners
++ * happen to form a rectangle this frame is drawn at native positions while
++ * its neighbours are sub-pixel placed - a seam at the joint, and a whole-
++ * pixel jump when the quad flips between the two paths from one frame to
++ * the next (GT2 trackside walls: "vertical lines between the panels" that
++ * open and close as the camera pans). DuckStation has no such shortcut;
++ * every polygon takes the same PGXP path. Keep the shortcut only for quads
++ * with no projection provenance at all (true 2D: HUD, menus). */
++static int quad_has_precise_provenance(const int *word_idx) {
++    if (!gte_geometry_correction_enabled()) return 0;
++    if (gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
++    for (int i = 0; i < 4; i++) {
++        uint32_t word = gp0_cmd_buf[word_idx[i]];
++        int32_t raw_x, raw_y, px, py;
++        uint16_t sz = 0;
++        parse_vertex(word, &raw_x, &raw_y);
++        uint32_t addr = gp0_cmd_source_addr + (uint32_t)word_idx[i] * 4u;
++        if (pgxp_get_precise_vertex(addr, word, raw_x, raw_y, &px, &py, &sz) != PGXP_SRC_NATIVE)
++            return 1;
++    }
++    return 0;
++}
++
+ /* Execute textured quad (GP0 0x2C-0x2F) */
+ static void gp0_exec_textured_quad(void) {
+     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+@@ -4438,10 +4468,12 @@ static void gp0_exec_textured_quad(void) {
+ 
+     setup_textured_draw(color24, semi_trans, raw_texture);
+ 
++    static const int k_tq_words[4] = { 1, 3, 5, 7 };
+     if (vy[0] == vy[1] && vy[2] == vy[3] &&
+         vx[0] == vx[2] && vx[1] == vx[3] &&
+         u[0] == u[2] && u[1] == u[3] &&
+-        v[0] == v[1] && v[2] == v[3]) {
++        v[0] == v[1] && v[2] == v[3] &&
++        !quad_has_precise_provenance(k_tq_words)) {
+         int x = vx[0] < vx[1] ? vx[0] : vx[1];
+         int y = vy[0] < vy[2] ? vy[0] : vy[2];
+         int w = vx[0] < vx[1] ? vx[1] - vx[0] : vx[0] - vx[1];
+@@ -4463,6 +4495,13 @@ static void gp0_exec_textured_quad(void) {
+         }
+     }
+ 
++    /* Quad-wide uv bounds for both halves (DuckStation ComputePolygonUVLimits). */
++    {
++        int qx[4] = { vx[0], vx[1], vx[2], vx[3] }, qy[4] = { vy[0], vy[1], vy[2], vy[3] };
++        int qlim[4];
++        psx_uv_quad_limits(qx, qy, u, v, qlim);
++        gr_set_uv_limits(1, qlim[0], qlim[1], qlim[2], qlim[3]);
++    }
+     if (!rej_a) {
+         int32_t tx[3] = { vx[0], vx[1], vx[2] };
+         int32_t ty[3] = { vy[0], vy[1], vy[2] };
+@@ -4483,6 +4522,7 @@ static void gp0_exec_textured_quad(void) {
+                                   vx[3], vy[3], u[3], v[3],
+                                   clut_x, clut_y, tpage);
+     }
++    gr_set_uv_limits(0, 0, 0, 0, 0);
+ }
+ 
+ /* Execute shaded textured triangle (GP0 0x34-0x37) */
+@@ -4566,6 +4606,12 @@ static void gp0_exec_shaded_textured_quad(void) {
+     if (draw_area_out_bbox(vx, vy, 4)) return;
+ 
+     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
++    {
++        int qx[4] = { vx[0], vx[1], vx[2], vx[3] }, qy[4] = { vy[0], vy[1], vy[2], vy[3] };
++        int qlim[4];
++        psx_uv_quad_limits(qx, qy, u, v, qlim);
++        gr_set_uv_limits(1, qlim[0], qlim[1], qlim[2], qlim[3]);
++    }
+     if (!rej_a) {
+         int32_t tx[3] = { vx[0], vx[1], vx[2] };
+         int32_t ty[3] = { vy[0], vy[1], vy[2] };
+@@ -4586,6 +4632,7 @@ static void gp0_exec_shaded_textured_quad(void) {
+                                          vx[3], vy[3], u[3], v[3], c[3],
+                                          clut_x, clut_y, tpage, raw_texture);
+     }
++    gr_set_uv_limits(0, 0, 0, 0, 0);
+ }
+ 
+ /* Execute mono line (GP0 0x40-0x47) — Bresenham */
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 0d042084..1f2a3ce4 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -2489,6 +2489,10 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
+  * stencil (mask) write value is constant within each pass; the semi pass is
+  * also where PS1 blending applies. lim = uv sampling bounds (see
+  * tri_uv_limits); NULL computes them from the vertices. */
++/* Quad-wide uv bounds override (gr_set_uv_limits): see gpu_uv.h. */
++static int s_uv_lim_override = 0;
++static int s_uv_lim[4];
++
+ static void gpu_textured_triangle(const int *xs, const int *ys,
+                                   const int *us, const int *vs,
+                                   const float *col, uint16_t texpage,
+@@ -2527,10 +2531,15 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+     if (!lim) {
+         /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
+          * center-sampling mirror compensation (rect prims arrive with their
+-         * own precomputed lim and pre-bumped uvs). */
++         * own precomputed lim and pre-bumped uvs). A quad-wide override
++         * (gr_set_uv_limits) replaces the per-triangle bounds. */
+         int *mu = uv_buf, *mv = uv_buf + 3;
+         for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+-        psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
++        if (s_uv_lim_override) {
++            for (int i = 0; i < 4; i++) lim_buf[i] = s_uv_lim[i];
++        } else {
++            psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
++        }
+         psx_uv_tri_mirror_offset(xs, ys, mu, mv);
+         us = mu; vs = mv;
+         lim = lim_buf;
+@@ -2897,6 +2906,11 @@ static void glb_set_precise_triangle(int enabled,
+     }
+     sw_set_precise_triangle(enabled, x0,y0, x1,y1, x2,y2);
+ }
++static void glb_set_uv_limits(int enabled, int lo_u, int lo_v, int hi_u, int hi_v) {
++    s_uv_lim_override = enabled ? 1 : 0;
++    s_uv_lim[0] = lo_u; s_uv_lim[1] = lo_v; s_uv_lim[2] = hi_u; s_uv_lim[3] = hi_v;
++    sw_set_uv_limits(enabled, lo_u, lo_v, hi_u, hi_v);
++}
+ static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
+     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
+@@ -5415,6 +5429,7 @@ static const GpuRenderBackend GL_BACKEND = {
+     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
+     .set_precise_triangle = glb_set_precise_triangle,
+     .set_perspective_triangle = glb_set_perspective_triangle,
++    .set_uv_limits = glb_set_uv_limits,
+     .set_depth_triangle = glb_set_depth_triangle,
+     .depth_clear = glb_depth_clear,
+     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
+diff --git a/runtime/src/gpu_render.c b/runtime/src/gpu_render.c
+index 02e5ac1d..e6fa20d7 100644
+--- a/runtime/src/gpu_render.c
++++ b/runtime/src/gpu_render.c
+@@ -116,6 +116,10 @@ void gr_set_depth_triangle(int enabled, float z0, float z1, float z2) {
+     if (g_b->set_depth_triangle)
+         g_b->set_depth_triangle(enabled, z0, z1, z2);
+ }
++void gr_set_uv_limits(int enabled, int lo_u, int lo_v, int hi_u, int hi_v) {
++    if (g_b->set_uv_limits)
++        g_b->set_uv_limits(enabled, lo_u, lo_v, hi_u, hi_v);
++}
+ void gr_depth_clear(void) {
+     if (g_b->depth_clear)
+         g_b->depth_clear();
+diff --git a/runtime/src/gpu_sw_renderer.c b/runtime/src/gpu_sw_renderer.c
+index ff40acee..6f4ad7fe 100644
+--- a/runtime/src/gpu_sw_renderer.c
++++ b/runtime/src/gpu_sw_renderer.c
+@@ -442,8 +442,18 @@ static inline float bilinear_center_shift_for_target(const RTarget *t) {
+  * feed the bilinear-filter neighbour clamp. */
+ #include "gpu_uv.h"
+ 
++static int s_sw_uv_lim_override = 0;
++static int s_sw_uv_lim[4];
++void sw_set_uv_limits(int enabled, int lo_u, int lo_v, int hi_u, int hi_v) {
++    s_sw_uv_lim_override = enabled ? 1 : 0;
++    s_sw_uv_lim[0] = lo_u; s_sw_uv_lim[1] = lo_v; s_sw_uv_lim[2] = hi_u; s_sw_uv_lim[3] = hi_v;
++}
+ static void sw_tri_uv_limits(const int *xs, const int *ys,
+                              const int *us, const int *vs) {
++    if (s_sw_uv_lim_override) {
++        for (int i = 0; i < 4; i++) g_uv_lim[i] = s_sw_uv_lim[i];
++        return;
++    }
+     psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
+ }
+ 
+diff --git a/runtime/src/gpu_uv.h b/runtime/src/gpu_uv.h
+index 0c2d8568..4c010651 100644
+--- a/runtime/src/gpu_uv.h
++++ b/runtime/src/gpu_uv.h
+@@ -62,7 +62,15 @@ static inline void psx_uv_tri_dirs(const int *xs, const int *ys,
+  * (keep full min..max). */
+ static inline void psx_uv_axis_limits(int lo, int hi, long dir,
+                                       int *lim_lo, int *lim_hi) {
+-    if (dir > 0 && hi > lo) hi--;
++    /* DuckStation ComputePolygonUVLimits: max-1 whenever min != max. For a
++     * diagonal (3D) mapping neither end is provably exclusive, but the PS1
++     * DDA never reaches the far texel of a perspective-projected face
++     * either, and at S>1 the interpolated uv at the polygon's outer
++     * fragments DOES reach it - sampling the atlas column beyond the face
++     * (often the neighbouring cel's edge or a black/transparent border).
++     * On GT2's trackside walls that painted a see-through 1-texel seam at
++     * every panel joint that opened and closed with sub-pixel motion. */
++    if (dir >= 0 && hi > lo) hi--;
+     if (dir < 0 && hi > lo) lo++;
+     if ((lo >> 8) == (hi >> 8)) { lo &= 255; hi &= 255; }
+     else                        { lo = 0; hi = 255; }
+@@ -84,6 +92,23 @@ static inline void psx_uv_tri_limits(const int *xs, const int *ys,
+     psx_uv_axis_limits(lo_v, hi_v, dv, &lim[1], &lim[3]);
+ }
+ 
++/* Quad-wide bounds (DuckStation parity): the two triangles of a textured
++ * quad share ONE limit rectangle computed over all four corners, so the
++ * diagonal edge is not clamped one texel short by whichever triangle lacks
++ * the quad's extreme uv. Direction comes from the first triangle. */
++static inline void psx_uv_quad_limits(const int *xs, const int *ys,
++                                      const int *us, const int *vs, int lim[4]) {
++    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
++    for (int i = 1; i < 4; i++) {
++        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
++        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
++    }
++    long du, dv;
++    psx_uv_tri_dirs(xs, ys, us, vs, &du, &dv);
++    psx_uv_axis_limits(lo_u, hi_u, du, &lim[0], &lim[2]);
++    psx_uv_axis_limits(lo_v, hi_v, dv, &lim[1], &lim[3]);
++}
++
+ /* Inclusive sampled uv bounds for a rect prim, from its ORIGINAL uv corners
+  * (u0/v0 at the top-left raster corner; u1/v1 at the exclusive corner —
+  * u1 < u0 / v1 < v0 means mirrored). */
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index 9df1aa5a..aaac9c48 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -2760,6 +2760,13 @@ static void vkb_set_precise_triangle(int enabled,
+         s_pc_x[2] = (float)x2 / 65536.0f;  s_pc_y[2] = (float)y2 / 65536.0f;
+     }
+ }
++static int s_uv_lim_override = 0;
++static int s_uv_lim[4];
++static void vkb_set_uv_limits(int enabled, int lo_u, int lo_v, int hi_u, int hi_v) {
++    s_uv_lim_override = enabled ? 1 : 0;
++    s_uv_lim[0] = lo_u; s_uv_lim[1] = lo_v; s_uv_lim[2] = hi_u; s_uv_lim[3] = hi_v;
++    sw_set_uv_limits(enabled, lo_u, lo_v, hi_u, hi_v);
++}
+ static void vkb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
+     s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
+     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
+@@ -2968,7 +2975,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
+          * own precomputed lim and pre-bumped uvs). */
+         int *mu = uv_buf, *mv = uv_buf + 3;
+         for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+-        psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
++        if (s_uv_lim_override) {
++            for (int i = 0; i < 4; i++) lim_buf[i] = s_uv_lim[i];
++        } else {
++            psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
++        }
+         psx_uv_tri_mirror_offset(xs, ys, mu, mv);
+         us = mu; vs = mv;
+         lim = lim_buf;
+@@ -3283,6 +3294,7 @@ static const GpuRenderBackend VK_BACKEND = {
+     .set_color_modulation          = vkb_set_color_modulation,
+     .set_precise_triangle          = vkb_set_precise_triangle,
+     .set_perspective_triangle      = vkb_set_perspective_triangle,
++    .set_uv_limits                 = vkb_set_uv_limits,
+     .fill_rect                     = vkb_fill_rect,
+     .copy_rect                     = vkb_copy_rect,
+     .draw_flat_triangle            = vkb_draw_flat_triangle,
+-- 
+2.43.0
+

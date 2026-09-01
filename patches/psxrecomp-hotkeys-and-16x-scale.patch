@@ -1,0 +1,88 @@
+From 646a16ade7e06019350de338cef508e3310e44d9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 28 Aug 2026 02:13:19 +0000
+Subject: [PATCH] GT2Recomp carried: hotkey modifier matching + 16x GL
+ supersampling cap
+
+- host_keymap: binds store side-agnostic modifier pairs (KMOD_ALT =
+  LALT|RALT) but events carry the pressed side only; the equality
+  compare could never match, so Alt+Enter / Ctrl+F were dead. Normalize
+  both sides to the pairs before comparing.
+- internal scale: raise the offline GL hr-FBO cap from 4x to 16x
+  (PSX_GL_MAX_INTERNAL_SCALE; DuckStation parity). The software
+  rasterizer and netplay dual paths keep the 4x SW clamp.
+---
+ runtime/include/gpu_sw_renderer.h |  4 ++++
+ runtime/src/host_keymap.c         | 16 ++++++++++++++--
+ runtime/src/main.cpp              |  2 +-
+ 3 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/include/gpu_sw_renderer.h b/runtime/include/gpu_sw_renderer.h
+index b8cea0e3..4cf50109 100644
+--- a/runtime/include/gpu_sw_renderer.h
++++ b/runtime/include/gpu_sw_renderer.h
+@@ -9,6 +9,10 @@ extern "C" {
+ 
+ /* Maximum internal-resolution supersampling factor (linear, per axis). */
+ #define SW_MAX_INTERNAL_SCALE 4
++/* GL hr-FBO path cap: 16x (1024*16 = 16384 wide FBO — within GL_MAX_TEXTURE_SIZE
++ * on current desktop GPUs; gr_set_scale falls back on allocation failure). The
++ * software rasterizer keeps its own SW_MAX_INTERNAL_SCALE clamp. */
++#define PSX_GL_MAX_INTERNAL_SCALE 16
+ 
+ /* Initialize software renderer */
+ void sw_renderer_init(uint16_t* vram);
+diff --git a/runtime/src/host_keymap.c b/runtime/src/host_keymap.c
+index 5f66e0a9..63103686 100644
+--- a/runtime/src/host_keymap.c
++++ b/runtime/src/host_keymap.c
+@@ -213,6 +213,18 @@ void host_keymap_load(const char *config_ini_path) {
+     apply_defaults();
+ }
+ 
++/* SDL reports the pressed SIDE (KMOD_LALT / KMOD_RALT), while binds store the
++ * side-agnostic pair (KMOD_ALT == LALT|RALT). Comparing them for equality can
++ * never match a real keypress, so Alt+Enter / Ctrl+F were dead. Normalize both
++ * to the side-agnostic pairs before comparing. */
++static int norm_mods(int mod) {
++    int n = 0;
++    if (mod & KMOD_CTRL)  n |= (int)KMOD_CTRL;
++    if (mod & KMOD_ALT)   n |= (int)KMOD_ALT;
++    if (mod & KMOD_SHIFT) n |= (int)KMOD_SHIFT;
++    return n;
++}
++
+ int host_keymap_match_event(HostKeymapAction action, int keycode,
+                             int scancode, int mod) {
+     const HostKeyAction *a;
+@@ -224,7 +236,7 @@ int host_keymap_match_event(HostKeymapAction action, int keycode,
+         if (a->binds[i].keycode != keycode &&
+             (scancode <= 0 || a->binds[i].scancode != scancode))
+             continue;
+-        if ((mod & relevant) == a->binds[i].mods) return 1;
++        if (norm_mods(mod) == norm_mods(a->binds[i].mods)) return 1;
+     }
+     return 0;
+ }
+@@ -243,7 +255,7 @@ int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod) {
+         const int sc = a->binds[i].scancode;
+         if (sc <= 0 || sc >= SDL_NUM_SCANCODES) continue;
+         if (!keys[sc]) continue;
+-        if ((mod & relevant) == a->binds[i].mods) return 1;
++        if (norm_mods(mod) == norm_mods(a->binds[i].mods)) return 1;
+     }
+     return 0;
+ }
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 7ecafbb1..b9d5f2bd 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -13737,7 +13737,7 @@ session_reboot:
+      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
+      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
+     if (g_video_scale < 1) g_video_scale = 1;
+-    if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
++    if (g_video_scale > PSX_GL_MAX_INTERNAL_SCALE) g_video_scale = PSX_GL_MAX_INTERNAL_SCALE;
+     if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
+         gr_set_scale(g_video_scale);
+         if (g_video_scale > 1) {

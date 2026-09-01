@@ -1,0 +1,127 @@
+From f2c7e26532f803130279fcf465bd5cd7fa9b7a22 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 06:02:32 +0000
+Subject: [PATCH] pgxp: one-shot shadow invalidate + per-frame wipe toggle
+ (diagnostic)
+
+Toggling ANY pgxp feature over the debug server calls pgxp_set_enabled(),
+which calls pgxp_invalidate_all() and wipes the entire dataflow shadow. That
+side effect confounded every feature A/B run this session: 'geom on repairs
+the picture' does not mean geometry correction is the fix, it may mean the
+shadow going stale is the fault.
+
+The shadow is address-keyed and validated by an exact match on the packed SXY
+word - but that word is only the INTEGER screen position, so a stale entry
+left at a display-list address by an earlier frame is believed whenever a new
+vertex lands on the same integer pixel, handing it the previous frame's
+fraction. Nothing retires the shadow during normal play.
+
+Adds two knobs so this can be separated without a rebuild per guess:
+  {"cmd":"pgxp","invalidate":1}     wipe once, touching nothing else
+  {"cmd":"pgxp","framewipe":0|1}    retire the shadow every guest frame
+and reports framewipe + the invalidation count in the pgxp reply.
+
+framewipe is a toggle rather than the default because a game that builds its
+display list on frame N and consumes it on frame N+1 needs the shadow to
+survive that handoff; this measures whether GT2 does.
+---
+ runtime/src/debug_server.c | 23 +++++++++++++++++++++--
+ runtime/src/gpu.c          |  2 ++
+ runtime/src/pgxp.cpp       | 23 +++++++++++++++++++++++
+ 3 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index e1a5be13..16f3e3bf 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5303,6 +5303,21 @@ static void handle_pgxp(int id, const char *json)
+     int cm = json_get_int(json, "cpu_mode", -1);
+     if (cm >= 0)
+         pgxp_set_cpu_mode(cm != 0);
++    /* One-shot wipe of the PGXP dataflow shadow, with NOTHING else touched.
++     * Toggling any PGXP feature already does this as a side effect (via
++     * pgxp_set_enabled -> pgxp_invalidate_all), which confounded every
++     * feature A/B: if this alone repairs the scene, the shadow going stale is
++     * the fault, not the feature that was toggled. */
++    if (json_get_int(json, "invalidate", 0) != 0) {
++        extern void pgxp_invalidate_all(void);
++        pgxp_invalidate_all();
++    }
++    /* Retire the shadow on every guest frame (see pgxp_set_frame_wipe). */
++    int fw = json_get_int(json, "framewipe", -1);
++    if (fw >= 0) {
++        extern void pgxp_set_frame_wipe(int mode);
++        pgxp_set_frame_wipe(fw);
++    }
+     /* Depth-buffer live tuning: enable/disable, and the near-band ceiling
+      * (SZ3 units) below which proven-depth triangles are Z-tested. Lets the
+      * near/far boundary be dialed in against a live scene instead of a
+@@ -5398,7 +5413,8 @@ static void handle_pgxp(int id, const char *json)
+              "\"transparent_depth\":%d,\"culling\":%d,\"color\":%d,"
+              "\"disable_2d\":%d,\"vertex_cache\":%d,\"preserve\":%d,"
+              "\"dilate\":%d,\"texture\":%d,\"gapfill\":%d,\"whole\":%d,"
+-             "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d}",
++             "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d,"
++             "\"framewipe\":%d,\"invalidations\":%u}",
+              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+              (unsigned)pgxp_test_suppress_depth(), pgxp_test_active(),
+              gpu_pgxp_depth_enabled(),
+@@ -5427,7 +5443,10 @@ static void handle_pgxp(int id, const char *json)
+                 int m = 0; (void)gl_renderer_gapfill_status(&m); m; }),
+              ({ extern float gl_renderer_get_gf_thr(void); (double)gl_renderer_get_gf_thr(); }),
+              ({ extern float gl_renderer_get_gf_sim(void); (double)gl_renderer_get_gf_sim(); }),
+-             ({ extern int gl_renderer_get_gf_rad(void); gl_renderer_get_gf_rad(); }));
++             ({ extern int gl_renderer_get_gf_rad(void); gl_renderer_get_gf_rad(); }),
++             ({ extern int pgxp_frame_wipe(void); pgxp_frame_wipe(); }),
++             ({ extern uint32_t pgxp_invalidate_calls(void);
++                (unsigned)pgxp_invalidate_calls(); }));
+ }
+ 
+ /* pgxp_tri — vertex-coverage census: triangles by number of precise corners
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index d6e26969..ec8ba7a3 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3023,6 +3023,8 @@ void gpu_vblank_tick(void) {
+     {
+         extern void gte_geometry_frame_advance(void);
+         gte_geometry_frame_advance();
++        extern void pgxp_frame_boundary(void);
++        pgxp_frame_boundary();
+     }
+     /* Trusted package-selected plugins run on guest VBlank, independent of
+      * host presentation, pacing, turbo, or skipped frames. */
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 776b2297..58687c8e 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -129,6 +129,29 @@ extern "C" void pgxp_set_enabled(int enabled) {
+ 
+ extern "C" int pgxp_enabled(void) { return s_enabled; }
+ 
++/* Per-frame retirement of the dataflow shadow (diagnostic toggle).
++ *
++ * The RAM shadow is address-keyed and validated by an exact match on the
++ * packed SXY word. That word is only the INTEGER screen position, so a stale
++ * entry left at the same display-list address by an earlier frame is believed
++ * whenever a new vertex lands on the same integer pixel - handing it a
++ * previous frame's sub-pixel fraction. Nothing retires the shadow during
++ * normal play: pgxp_invalidate_all() is reached only from a timeline
++ * invalidate or from pgxp_set_enabled(), which is why toggling a PGXP feature
++ * visibly repairs the scene for a few seconds and it then decays again.
++ *
++ * mode 0 = off (current behaviour)
++ * mode 1 = invalidate every frame
++ * Kept behind a toggle because a game that builds its display list on frame N
++ * and lets the GPU consume it on frame N+1 (double-buffered ordering tables)
++ * needs the shadow to survive that handoff; mode 1 tells us whether GT2 does. */
++static int s_frame_wipe = 0;
++extern "C" void pgxp_set_frame_wipe(int mode) { s_frame_wipe = mode ? 1 : 0; }
++extern "C" int  pgxp_frame_wipe(void) { return s_frame_wipe; }
++extern "C" void pgxp_frame_boundary(void) {
++    if (s_frame_wipe && s_enabled) pgxp_invalidate_all();
++}
++
+ extern "C" void pgxp_set_cpu_mode(int enabled) { s_cpu_mode = enabled ? 1 : 0; }
+ extern "C" int  pgxp_cpu_mode(void) { return s_cpu_mode; }
+ 

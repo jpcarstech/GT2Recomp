@@ -1,0 +1,146 @@
+From 9477197335eb85f5064607e5f0a99ae3c6f3c88a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 00:29:38 +0000
+Subject: [PATCH] =?UTF-8?q?GT2Recomp=20carried:=20texture=20filter=20modes?=
+ =?UTF-8?q?=20=E2=80=94=20nearest/bilinear/3-point(N64)/trilinear?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ runtime/src/gpu_gl_renderer.c | 69 ++++++++++++++++++++++++++++++++++-
+ runtime/src/main.cpp          | 13 ++++---
+ 2 files changed, 75 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index d0ccc3d5..1131a7c3 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -1048,7 +1048,7 @@ static const char *TEX_FS =
+     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
+     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
+     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
+-    "uniform int u_filter;    /* 1 = bilinear */\n"
++    "uniform int u_filter;    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */\n"
+     "uniform float u_shift;\n"
+     "int vram_at(int x, int y){\n"
+     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
+@@ -1085,6 +1085,40 @@ static const char *TEX_FS =
+     "    if (raw == 0) discard;\n"
+     "    rgb = col5(raw);\n"
+     "    stp = (raw >> 15) & 1;\n"
++    "  } else if (u_filter == 2) {\n"
++    "    /* N64 three-point (the RDP TF_BILERP triangle filter, per the\n"
++    "     * GlideN64/angrylion formulation): the texel-center lattice cell\n"
++    "     * containing the sample splits along its diagonal; the sample blends\n"
++    "     * the cell's shared right/upper corners with the lower-left corner\n"
++    "     * below the diagonal (s+t < 1) or the upper-right corner above it,\n"
++    "     * with barycentric weights. Cutout/STP authority stays with the\n"
++    "     * CONTAINING texel (always one of the three), and transparent-texel\n"
++    "     * weights are gated + renormalised like the bilinear path. */\n"
++    "    uv += vec2(u_shift);\n"
++    "    int nu = int(floor(uv.x)), nv = int(floor(uv.y));\n"
++    "    int cA = fetch_texel(nu, nv);\n"
++    "    if (cA == 0) discard;\n"
++    "    vec2 tc = uv - vec2(0.5);\n"
++    "    int bu = int(floor(tc.x)), bv = int(floor(tc.y));\n"
++    "    float fs = tc.x - float(bu), ft = tc.y - float(bv);\n"
++    "    int up = (fs + ft >= 1.0) ? 1 : 0;\n"
++    "    int cB = fetch_texel(bu + up, bv + up);\n"
++    "    int cR = fetch_texel(bu + 1, bv);\n"
++    "    int cU = fetch_texel(bu, bv + 1);\n"
++    "    float wB = (up == 0) ? (1.0 - fs - ft) : (fs + ft - 1.0);\n"
++    "    float wR = (up == 0) ? fs : (1.0 - ft);\n"
++    "    float wU = (up == 0) ? ft : (1.0 - fs);\n"
++    "    wB *= (cB == 0 ? 0.0 : 1.0);\n"
++    "    wR *= (cR == 0 ? 0.0 : 1.0);\n"
++    "    wU *= (cU == 0 ? 0.0 : 1.0);\n"
++    "    float opac = wB + wR + wU;\n"
++    "    if (opac <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
++    "    else {\n"
++    "      rgb = (col5(cB)*wB + col5(cR)*wR + col5(cU)*wU) / opac;\n"
++    "      float stpf = (float((cB >> 15) & 1)*wB + float((cR >> 15) & 1)*wR\n"
++    "                  + float((cU >> 15) & 1)*wU) / opac;\n"
++    "      stp = stpf >= 0.5 ? 1 : 0;\n"
++    "    }\n"
+     "  } else {\n"
+     "    /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base\n"
+     "     * (cutout + STP authority), the neighbours lie toward the sub-texel\n"
+@@ -1111,6 +1145,31 @@ static const char *TEX_FS =
+     "    rgb = (col5(c00)*w00 + col5(c10)*w10 + col5(c01)*w01 + col5(c11)*w11) / opac;\n"
+     "    float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10\n"
+     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
++    "    /* Trilinear: PS1 textures have no mip chain (CLUT data cannot be\n"
++    "     * pre-averaged), so approximate the next level with a 2-texel-wide\n"
++    "     * tent at the same weights and blend by the screen-space LOD --\n"
++    "     * identical to bilinear at magnification, softens minification\n"
++    "     * shimmer the way mip level 1 would. */\n"
++    "    if (u_filter == 3) {\n"
++    "      float lod = clamp(log2(max(fwidth(uv.x), fwidth(uv.y))), 0.0, 1.0);\n"
++    "      if (lod > 0.0) {\n"
++    "        int d10 = fetch_texel(iu + 2*sx, iv);\n"
++    "        int d01 = fetch_texel(iu, iv + 2*sy);\n"
++    "        int d11 = fetch_texel(iu + 2*sx, iv + 2*sy);\n"
++    "        float v10 = (d10 == 0 ? 0.0 : 1.0) * fx * (1.0 - fy);\n"
++    "        float v01 = (d01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
++    "        float v11 = (d11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
++    "        float opac2 = w00 + v10 + v01 + v11;\n"
++    "        if (opac2 > 0.0) {\n"
++    "          vec3 rgb2 = (col5(c00)*w00 + col5(d10)*v10 + col5(d01)*v01\n"
++    "                     + col5(d11)*v11) / opac2;\n"
++    "          float stpf2 = (float((c00 >> 15) & 1)*w00 + float((d10 >> 15) & 1)*v10\n"
++    "                       + float((d01 >> 15) & 1)*v01 + float((d11 >> 15) & 1)*v11) / opac2;\n"
++    "          rgb = mix(rgb, rgb2, lod);\n"
++    "          stpf = mix(stpf, stpf2, lod);\n"
++    "        }\n"
++    "      }\n"
++    "    }\n"
+     "    stp = stpf >= 0.5 ? 1 : 0;\n"
+     "  }\n"
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+@@ -2264,7 +2323,13 @@ static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (w
+                                                       native-wide CPU present path + gr_scale() callers
+                                                       need the true scale — the FBO-direct present is
+                                                       unaffected since it never reads gr_scale()) */
+-static void glb_set_texture_filter(int b) { s_tex_filter = b ? 1 : 0; sw_set_texture_filter(b); }
++static void glb_set_texture_filter(int b) {
++    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear; the software
++     * rasterizer only knows nearest/bilinear — any filtered mode maps to
++     * its bilinear. */
++    s_tex_filter = (b >= 0 && b <= 3) ? b : (b ? 1 : 0);
++    sw_set_texture_filter(b != 0);
++}
+ static int  glb_texture_filter(void) { return s_tex_filter; }
+ 
+ static void glb_set_semi_transparency(int e, int m) { s_semi_en = e; s_semi_mode = m & 3; sw_set_semi_transparency(e, m); }
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index a437567b..bc514467 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1197,7 +1197,7 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+     return cfg_value + 1;
+ }
+-static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
++static int           g_video_texfilter = 0; /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */
+ /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
+  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
+  * SXY readback are untouched. Default off = the faithful floor. */
+@@ -13170,10 +13170,13 @@ int main(int argc, char** argv) {
+                 }
+                 seed.has_aspect_ratio = true;
+                 /* has_texture_filter is on (PSX profile) so the launcher edits
+-                 * ls.texture_filter directly (0=nearest,1=bilinear); ls.linear_filter
+-                 * is the legacy fallback field for consoles without the cap and is
+-                 * left unused here. */
+-                seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
++                 * ls.texture_filter directly (0=nearest 1=bilinear 2=3-point(N64)
++                 * 3=trilinear); ls.linear_filter is the legacy fallback field for
++                 * consoles without the cap and is left unused here. */
++                seed.texture_filter =
++                    (ls.texture_filter >= 0 && ls.texture_filter <= 3)
++                        ? ls.texture_filter : (ls.texture_filter ? 1 : 0);
++                seed.has_texture_filter = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+                 seed.has_fmv_filter = true;
+                 {

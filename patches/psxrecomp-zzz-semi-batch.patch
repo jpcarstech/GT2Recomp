@@ -1,0 +1,25 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 9089ac80..e4996bd5 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -2149,7 +2149,19 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
+          * semi-transparent textured prim: drain the open batch, draw this
+          * prim alone (composited fully before the next), let opaque prims
+          * keep batching. Cost is one draw per semi prim. */
+-        int isolate = (semi >= 0);
++        /* Isolation is only REQUIRED where a batch draws in two passes over
++         * its whole vertex range (mode 2's subtract equation, or any semi
++         * with mask-check on): pass 1 of a later prim could paint under an
++         * earlier prim's pass 2. The dual-source path (batch_semi == 4:
++         * modes 0/1/3, mask-check off) composites each fragment in ONE
++         * ordered pass with per-fragment opaque-vs-semi factors — GL
++         * rasterizes primitives of a draw in submission order, so a run of
++         * such prims batches safely. Opaque prims live on a different key
++         * (-1), so opaque<->semi transitions still flush in order. (The CTR
++         * particle/flap bug this isolation was added for came from COALESCING
++         * OPAQUE prims into the dual-source key — prevented above by keeping
++         * opaque at -1 — not from semi-with-semi batching.) */
++        int isolate = (semi >= 0) && (batch_semi != 4);
+         int reason = -1;
+         if (s_tb_n > 0) {
+             if (isolate) reason = 0;

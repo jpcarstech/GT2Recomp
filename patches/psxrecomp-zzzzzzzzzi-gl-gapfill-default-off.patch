@@ -1,0 +1,43 @@
+From 94eab448a514496a1d48b9d11d6d2b5eea08e277 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 13:16:55 +0000
+Subject: [PATCH] gl: crack fill off by default - the cracks were a PGXP
+ provenance bug, now fixed at the source
+
+With the SXYP FIFO push modelled in the GTE register shadows, neighbouring
+polygons agree about their shared corners and the sub-pixel seams the
+present-time crack fill was papering over no longer exist. What remains for
+the fill to act on is false positives: on a GT2 Tahiti frame mode 3 rewrites
+~8% of the presented pixels, all thin texture detail on trackside billboards,
+sign faces, posts, wires and car livery, and the set changes frame to frame -
+visible as wobble on trackside objects and texture crawl on the car. Default
+0; the toggle stays for A/B.
+---
+ runtime/src/gpu_gl_renderer.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 5b117cd4..eae9d13b 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -2226,8 +2226,18 @@ static uint32_t s_cov_ord = 0, s_cov_ord_prev = 256;
+  * never worse than mode 1 across six samples and better on some frames, and
+  * the texture-cutout safety property is identical (a discarded texel still
+  * stamps coverage, so sky seen THROUGH a fence or canopy texture is inside a
+- * covered region and is never mistaken for a crack). */
+-static int    s_gapfill = 3;
++ * covered region and is never mistaken for a crack).
++ *
++ * Default 0 (OFF). The cracks this was built to hide were a PGXP provenance
++ * bug (the SXYP FIFO push was not modelled, so neighbouring polygons resolved
++ * a shared corner to different positions); with that fixed the seams are gone
++ * at the source and the fill only has false positives left to act on. Measured
++ * at a GT2 Tahiti race frame: mode 3 rewrites ~8% of the presented pixels, all
++ * of them thin texture detail on trackside billboards, sign faces, posts,
++ * wires and car livery, and the set changes every frame as objects move -
++ * visible as wobble/crawl on exactly those objects. Kept as a live toggle
++ * (debug `pgxp` gapfill=0..3) for A/B only. */
++static int    s_gapfill = 0;
+ void gl_renderer_set_gapfill(int on) { s_gapfill = (on >= 0 && on <= 3) ? on : 1; }
+ int  gl_renderer_get_gapfill(void)   { return s_gapfill; }
+ 

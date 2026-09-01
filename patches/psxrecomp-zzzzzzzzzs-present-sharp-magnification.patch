@@ -1,0 +1,108 @@
+From e73ac0f7c18d90129d1f6f4f428947ddec2f77de Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 13:25:12 +0000
+Subject: [PATCH 2/2] GL present: sharp-bilinear for non-integer nearest
+ magnification; completion default off
+
+A 9x scene (2880 wide) point-sampled into a 3840-wide window is a 1.333:1
+nearest blow-up: every third source column is doubled, so anything moving
+by sub-source-pixel amounts (PGXP geometry, every frame) hops between the
+doubled and single columns - distant poles, billboard text and fence mesh
+jitter by an output pixel at the frame rate while the rendered scene is
+steady. Field captures of a 3840 window showed +-1.2 px/frame alternation on
+far features; a window at exactly the internal size showed none, and
+DuckStation never shows it because its display scaling is bilinear-smooth
+regardless of the texture filter. With antialiasing=false and a
+non-integer magnification, present_target_quad now uses the existing
+sharp-bilinear mode (flat texel interiors, ramp confined to one output
+pixel); integer ratios keep true nearest; minification keeps the mip
+resolve.
+
+Also: mixed-primitive completion defaults OFF (DuckStation has no such
+step; field A/B saw no difference) - still available via the debug port.
+---
+ runtime/src/gpu.c             |  6 +++++-
+ runtime/src/gpu_gl_renderer.c | 35 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index b3e8ccb3..18ce8595 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3427,7 +3427,11 @@ int  gpu_pgxp_color_correction(void)       { return s_pgxp_color_correction; }
+  * completion is this port's extension and a candidate seam SOURCE (an
+  * ambiguity-tolerant table lookup can assign a corner a fraction its
+  * neighbouring polygon's identical corner does not get). */
+-int gpu_pgxp_completion_enabled_flag = 1;
++/* Default OFF (DuckStation parity): DS has no completion step - a corner the
++ * shadow cannot vouch for renders at its native position. Field A/B on GT2
++ * (2026-09-02) saw no visible difference either way; keep it a debug-port
++ * knob ("pgxp" completion:1) rather than a default. */
++int gpu_pgxp_completion_enabled_flag = 0;
+ 
+ /* DEFAULT OFF - superseded by the renderer's coverage-based crack fill
+  * (gpu_gl_renderer.c cov_pass_draw / PRESENT_FS gap_fill), which closes the
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 3e00ae49..0d042084 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -4978,6 +4978,30 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+         }
+         s_present_resolved = did_mip;
+     }
++    /* NON-INTEGER MAGNIFICATION with the nearest present ([video]
++     * antialiasing=false): a 9x scene (2880 wide) shown in a 3840-wide window
++     * is a 1.333:1 point-sampled blow-up - every third source column is
++     * doubled. Anything that moves by sub-source-pixel amounts (PGXP's
++     * sub-pixel geometry does, every frame) hops between the doubled and the
++     * single columns, so distant poles, billboard text and fence mesh jitter by
++     * an output pixel at the frame rate while the rendered scene itself is
++     * steady. Measured in the field: +-1.2 px/frame alternation on far
++     * features in 1920x1080 captures of a 3840-wide window, and none in a
++     * window that is exactly the internal size. DuckStation never shows this
++     * because its display scaling is bilinear-smooth regardless of the texture
++     * filter. Use sharp-bilinear there: flat texel interiors like nearest, the
++     * ramp confined to a one-output-pixel band, no beating. Integer ratios
++     * (1:1, 2:1 ...) keep true nearest - it is exact there. */
++    int sharp_mag = 0;
++    if (!s_present_resolved && !linear && s_scale > 0 && w > 0 && lw > 0) {
++        const float mag = (float)lw / (float)(w * s_scale);
++        const float near_int = (float)(int)(mag + 0.5f);
++        if (mag > 1.01f && (mag < near_int - 0.01f || mag > near_int + 0.01f)) {
++            sharp_mag = 1;
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        }
++    }
+     p_glUseProgram(s_present_prog);
+     p_glUniform1i(s_present_uTex, 0);
+     /* PGXP crack fill: active when presenting either the canonical hires scene
+@@ -5027,6 +5051,13 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+                         s_present_resolved ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+         present_set_sharp(3, tex_w * s_scale, tex_h * s_scale, lw, lh);
++    } else if (sharp_mag) {
++        /* u_sharp_scale = output px per texel of the DISPLAYED region:
++         * present_set_sharp derives it as out_w/tex_w over the whole texture,
++         * so hand it an out_w scaled to the full texture width. */
++        present_set_sharp(1, tex_w * s_scale, tex_h * s_scale,
++                          (int)((long long)lw * tex_w / w),
++                          (int)((long long)lh * tex_h / h));
+     } else {
+         present_set_sharp(0, 0, 0, 0, 0);
+     }
+@@ -5055,8 +5086,10 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+     p_glUseProgram(0);
+     /* Leave the texture non-mipmapped for every other consumer (blits, hold
+      * captures, pack) — they bind it expecting a single-level sample. */
+-    if (s_present_resolved)
++    if (s_present_resolved || sharp_mag) {
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
++    }
+ }
+ 
+ /* Bezel art: a still image behind the frame, filling whatever the letterbox or
+-- 
+2.43.0
+

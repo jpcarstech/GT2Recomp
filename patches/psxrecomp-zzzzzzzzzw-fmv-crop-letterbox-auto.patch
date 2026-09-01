@@ -1,0 +1,328 @@
+From aa82b582c9389b85e1be3bbf55161a8d2cf1f77a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 17:09:25 +0000
+Subject: [PATCH] video: Crop FMVs - letterbox-band removal at pixel aspect,
+ toggle in launcher/F1/settings
+
+fmv_crop becomes a toggle (settings.toml `fmv_crop = true|false`; older
+0/8/12/16 row counts still parse, any non-zero = on). On, the GL FMV present
+detects the pure-black letterbox rows a 24-bit movie carries inside its own
+frame (GT2's Polyphony logo: 24 top/bottom, the intro: 28) and drops them
+together with an 8-row CRT overscan trim, then fits the remaining picture at
+the aspect it would have on a 4:3 CRT with those rows cut off - pixel aspect
+preserved, so a widescreen movie fills the height of a 16:9 window with
+narrow pillars at any resolution instead of a 4:3 rect with black bands
+inside it. Detection is stable by construction (symmetric min(top,bottom),
+frames without a picture in the outer quarter rejected, min over the last 60
+accepted frames, history cleared between movies). Applies to every 24-bit
+frame (main.cpp marks the present with gl_renderer_set_present_fmv), pinned
+4:3 or not; letterbox_rect_aspect does its products in 64-bit.
+---
+ recompiler/src/config_loader.cpp  |  11 ++-
+ recompiler/src/config_loader.h    |   9 ++-
+ runtime/include/gpu_gl_renderer.h |   3 +
+ runtime/src/gpu_gl_renderer.c     | 118 ++++++++++++++++++++++++++----
+ runtime/src/main.cpp              |  27 +++----
+ 5 files changed, 130 insertions(+), 38 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index a0997806..914d84ed 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2355,8 +2355,13 @@ UserSettings load_user_settings(const fs::path& path) {
+             else if (m == "sharp") { s.display_scaling = 2; s.has_display_scaling = true; }
+         });
+         if (v.contains("fmv_crop")) try_get([&]{
+-            const int c = static_cast<int>(toml::find<std::int64_t>(v, "fmv_crop"));
+-            if (c >= 0 && c <= 32) { s.fmv_crop = c; s.has_fmv_crop = true; }
++            /* Boolean (current) or a row count (earlier builds wrote 0/8/12/16). */
++            const auto &fc = toml::find(v, "fmv_crop");
++            if (fc.is_boolean()) { s.fmv_crop = toml::get<bool>(fc) ? 8 : 0; s.has_fmv_crop = true; }
++            else {
++                const int c = static_cast<int>(toml::get<std::int64_t>(fc));
++                if (c >= 0 && c <= 32) { s.fmv_crop = c; s.has_fmv_crop = true; }
++            }
+         });
+         if (v.contains("post_processing")) try_get([&]{
+             const auto m = toml::find<std::string>(v, "post_processing");
+@@ -2708,7 +2713,7 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+     if (s.has_display_scaling)
+         f << "display_scaling = \"" << (s.display_scaling == 0 ? "nearest" : s.display_scaling == 1 ? "bilinear" : "sharp") << "\"\n";
+     if (s.has_fmv_crop)
+-        f << "fmv_crop = " << s.fmv_crop << "\n";
++        f << "fmv_crop = " << (s.fmv_crop > 0 ? "true" : "false") << "\n";
+     if (s.has_fmv_filter)
+         f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
+     if (s.has_geometry_correction)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index fbe22882..4970af40 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1220,10 +1220,11 @@ struct UserSettings {
+     // magnification), 1 bilinear, 2 sharp-bilinear. Unset -> follow antialiasing.
+     // DuckStation: Nearest / Bilinear (Smooth) / Bilinear (Sharp).
+     bool has_display_scaling = false; int display_scaling = 0;
+-    // fmv_crop: native pixels trimmed from the top and bottom of a 24-bit FMV
+-    // frame (and 4/3 as many from each side, so the movie stays 4:3) before
+-    // it is fitted to the window - the overscan border a CRT never showed.
+-    // 0 = off. DuckStation: Crop Mode = Overscan.
++    // fmv_crop: Crop FMVs. Written as a boolean; kept as the overscan row
++    // count internally (true = 8, false = 0; older files may carry 8/12/16).
++    // On: the black letterbox rows inside a 24-bit movie frame are removed
++    // and the CRT overscan border trimmed, then the picture is fitted at its
++    // own pixel aspect. DuckStation: Crop Mode = Overscan.
+     bool has_fmv_crop = false; int fmv_crop = 0;
+     // FMV present reconstruction (VIDEO_FMV_FILTER_*). Only consulted when
+     // antialiasing is on. See RuntimeConfig::video_fmv_filter.
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index b0975af1..2b5ed1b7 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -125,6 +125,9 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+ void gl_renderer_set_display_scaling(int mode);
+ /* [video] fmv_crop: native rows trimmed top/bottom of an FMV frame (0 = off). */
+ void gl_renderer_set_fmv_crop(int native_rows);
++/* Marks the next CPU present as a 24-bit (FMV) frame; fmv_crop applies only
++ * to those, pinned or not. Cleared after each gl_renderer_present. */
++void gl_renderer_set_present_fmv(int is_fmv);
+ int  gl_renderer_get_fmv_crop(void);
+ int  gl_renderer_get_display_scaling(void);
+ 
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index caea61d0..c2d04778 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3279,8 +3279,9 @@ void gl_renderer_set_display_aspect(int num, int den) {
+ /* Letterbox: largest num:den rect centered in the drawable. */
+ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
+                                   int *x, int *y, int *w, int *h) {
+-    int dw = ww, dh = (ww * den) / num;
+-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
++    /* 64-bit products: fmv_crop passes num/den scaled by source dimensions. */
++    int dw = ww, dh = (int)(((int64_t)ww * den) / num);
++    if (dh > wh) { dh = wh; dw = (int)(((int64_t)wh * num) / den); }
+     *x = (ww - dw) / 2;
+     *y = (wh - dh) / 2;
+     *w = dw; *h = dh;
+@@ -3743,7 +3744,70 @@ void gl_renderer_shutdown(void) {
+ static int s_fmv_crop = 0;
+ void gl_renderer_set_fmv_crop(int native_rows) { s_fmv_crop = native_rows < 0 ? 0 : native_rows; }
+ int  gl_renderer_get_fmv_crop(void)            { return s_fmv_crop; }
+-
++static int s_present_is_fmv = 0;
++void gl_renderer_set_present_fmv(int is_fmv) { s_present_is_fmv = is_fmv ? 1 : 0; }
++
++/* Letterbox-band removal (part of fmv_crop). Many PS1 movies are authored
++ * wider than 4:3 and padded to the 240-line frame with pure-black rows (GT2:
++ * the Polyphony logo has 24 black rows top and bottom, the intro 28). Those
++ * rows are part of the picture data, so a fixed overscan trim never reaches
++ * them and the movie kept a black band above and below in the window.
++ * Detect them per frame - a row is black when every channel of every pixel
++ * is < 8 (MDEC black decodes to 0..3) - and drop them from the presented
++ * region. The remaining picture keeps its pixel aspect: it is fitted to the
++ * window at the aspect it would have had on a 4:3 CRT with the bands cut
++ * off, so a 16:9 movie fills the height of a 16:9 window with narrow pillars
++ * instead of sitting in a 4:3 rect with black bands inside it.
++ *
++ * Stability (bands are constant within a movie; only a dim or empty frame
++ * can fool a per-frame scan, and always towards MORE band):
++ *   - bands are symmetric, so the estimate for both sides is min(top, bottom)
++ *     - a black sky over a lit road never crops the road;
++ *   - a frame whose picture does not start within the top/bottom quarter
++ *     (a fade to black, a small object on black) is rejected and keeps the
++ *     previous value;
++ *   - the presented band is the minimum over the last 60 accepted frames, so
++ *     an over-estimate from a dim frame is overruled by any brighter frame
++ *     within a second, while a cut to a taller picture applies immediately;
++ *   - 15 consecutive rejected frames (a fade to black between movies) or a
++ *     gap in FMV presents clear the history, so the next movie starts fresh
++ *     instead of inheriting the previous one's bands. */
++#define FMV_BAND_HIST 60
++static int      s_fmv_band_hist[FMV_BAND_HIST];
++static int      s_fmv_band_n = 0, s_fmv_band_idx = 0, s_fmv_band_rejects = 0;
++static uint64_t s_fmv_band_last_frame = 0;
++static int      s_fmv_band_w = 0, s_fmv_band_h = 0;
++static int fmv_row_black(const uint32_t *row, int w) {
++    for (int x = 0; x < w; x++)
++        if (row[x] & 0x00F8F8F8u) return 0;
++    return 1;
++}
++static void fmv_letterbox_bands(const uint32_t *px, int w, int h, int *top, int *bot) {
++    *top = 0; *bot = 0;
++    if (!px || w <= 0 || h <= 0) return;
++    if (w != s_fmv_band_w || h != s_fmv_band_h ||
++        s_frame_count - s_fmv_band_last_frame > 30) {
++        s_fmv_band_n = 0; s_fmv_band_idx = 0; s_fmv_band_rejects = 0;
++        s_fmv_band_w = w; s_fmv_band_h = h;
++    }
++    s_fmv_band_last_frame = s_frame_count;
++    int lim = h / 4, t = 0, b = 0;
++    while (t < lim && fmv_row_black(px + (size_t)t * w, w)) t++;
++    while (b < lim && fmv_row_black(px + (size_t)(h - 1 - b) * w, w)) b++;
++    if (t < lim && b < lim) {
++        s_fmv_band_hist[s_fmv_band_idx] = t < b ? t : b;
++        s_fmv_band_idx = (s_fmv_band_idx + 1) % FMV_BAND_HIST;
++        if (s_fmv_band_n < FMV_BAND_HIST) s_fmv_band_n++;
++        s_fmv_band_rejects = 0;
++    } else if (++s_fmv_band_rejects >= 15) {
++        s_fmv_band_n = 0; s_fmv_band_idx = 0;      /* between movies */
++    }
++    if (s_fmv_band_n == 0) return;
++    int m = h;
++    for (int i = 0; i < s_fmv_band_n; i++)
++        if (s_fmv_band_hist[i] < m) m = s_fmv_band_hist[i];
++    *top = m; *bot = m;
++}
+ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
+                          int force_4_3, int content_w) {
+     if (!s_ctx) return;
+@@ -3753,7 +3817,34 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     glViewport(0, 0, ww, wh);
+     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+     int lx, ly, lw, lh;
+-    if (force_4_3)
++    /* fmv_crop: the presented source region [fx0,fx1)x[fy0,fy1) after the
++     * overscan trim and letterbox-band removal; the rect is then fitted at
++     * the aspect that region has on a 4:3 frame (pixel aspect preserved). */
++    int fmv_region = 0, fx0 = 0, fy0 = 0, fx1 = src_w, fy1 = src_h;
++    const int is_fmv = s_present_is_fmv; s_present_is_fmv = 0;
++    /* Base aspect of the whole frame: pinned 4:3, else the display aspect
++     * (a plain 4:3 window presents an unpinned FMV at 4:3 as well). */
++    const int base_num = force_4_3 ? 4 : s_aspect_num;
++    const int base_den = force_4_3 ? 3 : s_aspect_den;
++    if ((is_fmv || force_4_3) && s_fmv_crop > 0 && src_h >= 192 && src_w > 0 &&
++        s_fmv_crop * 2 < src_h / 2) {
++        int bt = 0, bb = 0;
++        fmv_letterbox_bands(pixels, src_w, src_h, &bt, &bb);
++        int ocx = (s_fmv_crop * src_w) / src_h;   /* 4/3 of the rows at 320x240 */
++        fx0 = ocx; fx1 = src_w - ocx;
++        fy0 = bt > s_fmv_crop ? bt : s_fmv_crop;  /* band, or at least the overscan trim */
++        fy1 = src_h - (bb > s_fmv_crop ? bb : s_fmv_crop);
++        if (content_w > 0 && content_w < src_w && content_w - ocx > fx0 + 16)
++            fx1 = content_w - ocx;                /* depth24 margin: trailing garbage */
++        if (fx1 - fx0 >= 16 && fy1 - fy0 >= 16) fmv_region = 1;
++        else { fx0 = 0; fy0 = 0; fx1 = src_w; fy1 = src_h; }
++    }
++    if (fmv_region) {
++        /* Aspect of the region as it would appear on a screen of the base
++         * aspect showing the whole frame: base * ((fx1-fx0)/src_w) / ((fy1-fy0)/src_h). */
++        letterbox_rect_aspect(ww, wh, base_num * (fx1 - fx0) * src_h,
++                              base_den * src_w * (fy1 - fy0), &lx, &ly, &lw, &lh);
++    } else if (force_4_3)
+         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+     else
+         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+@@ -3775,7 +3866,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     /* Optional trailing-column crop (depth24 margin): shrink the draw width
+      * left-aligned so cleared black remains on the right — never stretch. */
+     float uv_x1 = 1.f;
+-    int crop = (content_w > 0 && content_w < src_w && src_w > 0);
++    int crop = (content_w > 0 && content_w < src_w && src_w > 0 && !fmv_region);
+     if (crop) {
+         uv_x1 = (float)content_w / (float)src_w;
+         lw = (lw * content_w) / src_w;
+@@ -3805,22 +3896,17 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
+     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+     present_set_sharp(filt_mode, src_w, src_h, lw, lh);
+-    /* Overscan crop for FMV (force_4_3, full-height source only). */
+-    int ocx = 0, ocy = 0;
+-    if (force_4_3 && s_fmv_crop > 0 && src_h >= 192 && src_w > 0 &&
+-        s_fmv_crop * 2 < src_h / 2) {
+-        ocy = s_fmv_crop;
+-        ocx = (s_fmv_crop * src_w) / src_h;   /* 4/3 of the rows at 320x240 */
+-    }
+-    if (crop) {
++    if (fmv_region) {
++        /* Overscan trim + letterbox bands removed (half-texel inset). */
++        p_glUniform4f(s_present_uUvRect,
++                      ((float)fx0 + 0.5f) / (float)src_w, ((float)fy0 + 0.5f) / (float)src_h,
++                      ((float)fx1 - 0.5f) / (float)src_w, ((float)fy1 - 0.5f) / (float)src_h);
++    } else if (crop) {
+         /* Cropped present keeps left-aligned content; still inset so linear
+          * AA does not blend the cut column with undefined border texels. */
+         float u0 = (src_w > 0) ? (0.5f / (float)src_w) : 0.f;
+         float v0 = (src_h > 0) ? (0.5f / (float)src_h) : 0.f;
+         p_glUniform4f(s_present_uUvRect, u0, v0, uv_x1 - u0, 1.f - v0);
+-    } else if (ocx > 0 || ocy > 0) {
+-        float u0 = ((float)ocx + 0.5f) / (float)src_w, v0 = ((float)ocy + 0.5f) / (float)src_h;
+-        p_glUniform4f(s_present_uUvRect, u0, v0, 1.f - u0, 1.f - v0);
+     } else if (src_w > 0 && src_h > 0) {
+         /* Half-texel UV inset for both nearest and linear. Corner-mapped
+          * UV=1.0 grazes past the last texel (driver-dependent border sample);
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 04140c19..677e75bc 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1208,8 +1208,8 @@ static inline int launcher_fmv_filter_to_cfg(int ls_value) {
+  * fmv_crop: launcher 1 off / 2 8px / 3 12px / 4 16px (0 unset). */
+ static inline int cfg_display_scaling_to_launcher(int v) { return (v >= 0 && v <= 2) ? v + 1 : 0; }
+ static inline int launcher_display_scaling_to_cfg(int v) { return (v >= 1 && v <= 3) ? v - 1 : -1; }
+-static inline int cfg_fmv_crop_to_launcher(int px) { return px <= 0 ? 1 : px <= 8 ? 2 : px <= 12 ? 3 : 4; }
+-static inline int launcher_fmv_crop_to_cfg(int v) { static const int t[5] = { 0, 0, 8, 12, 16 }; return (v >= 1 && v <= 4) ? t[v] : 0; }
++static inline int cfg_fmv_crop_to_launcher(int px) { return px <= 0 ? 1 : 2; }        /* 1 off, 2 on */
++static inline int launcher_fmv_crop_to_cfg(int v) { return v >= 2 ? 8 : 0; }            /* older 3/4 = on */
+ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+     if (cfg_value < 0 || cfg_value >= PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
+         cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+@@ -6176,13 +6176,9 @@ extern "C" {
+ static const char kDisplayScaling[]  = "graphics.display_scaling";
+ static const char kFmvCrop[]         = "graphics.fmv_crop";
+ static const char *const kDisplayScalingChoices[] = { "Nearest", "Bilinear", "Sharp bilinear" };
+-static const char *const kFmvCropChoices[] = { "Off", "8 px", "12 px", "16 px" };
+-static const int kFmvCropValues[] = { 0, 8, 12, 16 };
+-static int fmv_crop_index(void) {
+-    int best = 0;
+-    for (int i = 1; i < 4; i++) if (abs(kFmvCropValues[i] - g_video_fmv_crop) < abs(kFmvCropValues[best] - g_video_fmv_crop)) best = i;
+-    return best;
+-}
++/* Crop FMVs is a toggle: on = letterbox-band removal + an 8-row CRT overscan
++ * trim (DuckStation Crop Mode = Overscan); the row count is not user-facing. */
++static const int kFmvCropOnRows = 8;
+ static const char kPgxpGeometry[]    = "pgxp.geometry";
+ static const char kPgxpTexture[]     = "pgxp.texture";
+ static const char kPgxpCulling[]     = "pgxp.culling";
+@@ -6264,7 +6260,7 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+     else if (std::strcmp(item->key, kDisplayScaling) == 0)
+         *value_out = g_video_display_scaling >= 0 ? g_video_display_scaling : (g_video_aa ? 1 : 0);
+     else if (std::strcmp(item->key, kFmvCrop) == 0)
+-        *value_out = fmv_crop_index();
++        *value_out = g_video_fmv_crop > 0 ? 1 : 0;
+     else
+         return 0;
+     return 1;
+@@ -6313,8 +6309,8 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+         g_video_display_scaling = value;
+         apply_display_scaling_settings();
+     } else if (std::strcmp(item->key, kFmvCrop) == 0) {
+-        if (value < 0 || value > 3) return 0;
+-        g_video_fmv_crop = kFmvCropValues[value];
++        if (value < 0 || value > 1) return 0;
++        g_video_fmv_crop = value ? kFmvCropOnRows : 0;
+         apply_display_scaling_settings();
+     } else {
+         return 0;
+@@ -6451,9 +6447,9 @@ static void runtime_settings_ui_ensure_created(void) {
+         { kDisplayScaling, "Graphics", "Display scaling",
+           "How the frame is fitted to the window (DS: Nearest / Bilinear Smooth / Sharp)",
+           RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, kDisplayScalingChoices, 3, nullptr },
+-        { kFmvCrop, "Graphics", "FMV overscan crop",
+-          "Trim the CRT overscan border of movies; keeps 4:3",
+-          RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, kFmvCropChoices, 4, nullptr },
++        { kFmvCrop, "Graphics", "Crop FMVs",
++          "Drop the black bars inside movie frames + CRT overscan; pixel aspect kept",
++          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+         /* PGXP tuning - live, not persisted. The DuckStation knob set only:
+          * the runtime's own extra mechanisms stay debug-port-only (pgxp cmd). */
+         { kPgxpGeometry, "PGXP", "Geometry correction",
+@@ -8136,6 +8132,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+          * right-edge jump the old comment describes is 0 with filtering on.
+          * Set video AA off to get nearest back. */
+         gl_renderer_set_fmv_filter(g_video_fmv_filter);
++        gl_renderer_set_present_fmv(depth24_frame ? 1 : 0);
+         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
+                             g_video_aa ? 1 : 0,
+                             pin_43 ? 1 : 0, 0 /* full width */);
+-- 
+2.43.0
+

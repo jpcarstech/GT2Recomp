@@ -1,0 +1,116 @@
+From 75b22e75b4a48b5a1e20b133ebb89ae475fc2881 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 13:16:36 +0000
+Subject: [PATCH] debug: tri ring records frame, per-corner depth/resolve state
+ and the perspective decision
+
+Lets the offline analysis separate frames, tell affine from perspective-
+mapped textured triangles, and match a corner's depth without a second
+lookup. Diagnostic only; the pgxp_tris CSV gains eight trailing columns.
+---
+ runtime/src/debug_server.c |  8 +++++++-
+ runtime/src/gpu.c          | 22 +++++++++++++++++++---
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index b546317b..6eeed017 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -6487,6 +6487,10 @@ static void handle_pgxp_tris(int id, const char *json)
+         int16_t  ix[3], iy[3];
+         int32_t  fx[3], fy[3];
+         uint8_t  tier[3], any;
++        uint32_t frame;
++        uint16_t sz[3];
++        uint8_t  rst[3];
++        uint8_t  persp;
+     } Rec;
+     extern int gpu_pgxp_tri_ring_read(void *out, int max_recs, uint32_t *total);
+     extern size_t gpu_pgxp_tri_rec_size(void);
+@@ -6501,13 +6505,15 @@ static void handle_pgxp_tris(int id, const char *json)
+     int n = gpu_pgxp_tri_ring_read(recs, 8192, &total);
+     FILE *f = fopen(path, "w");
+     if (!f) { free(recs); send_err(id, "cannot open file"); return; }
+-    fprintf(f, "seq,src,cmd0,any,ix0,iy0,fx0,fy0,t0,ix1,iy1,fx1,fy1,t1,ix2,iy2,fx2,fy2,t2\n");
++    fprintf(f, "seq,src,cmd0,any,ix0,iy0,fx0,fy0,t0,ix1,iy1,fx1,fy1,t1,ix2,iy2,fx2,fy2,t2,frame,sz0,sz1,sz2,r0,r1,r2,persp\n");
+     for (int i = 0; i < n; i++) {
+         const Rec *r = &recs[i];
+         fprintf(f, "%u,0x%08X,0x%08X,%u", r->seq, r->src, r->cmd0, (unsigned)r->any);
+         for (int k = 0; k < 3; k++)
+             fprintf(f, ",%d,%d,%d,%d,%u", (int)r->ix[k], (int)r->iy[k],
+                     (int)r->fx[k], (int)r->fy[k], (unsigned)r->tier[k]);
++        fprintf(f, ",%u,%u,%u,%u,%u,%u,%u,%u", r->frame, r->sz[0], r->sz[1], r->sz[2],
++                r->rst[0], r->rst[1], r->rst[2], (unsigned)r->persp);
+         fputc('\n', f);
+     }
+     fclose(f);
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 8272ee7e..d266e1c4 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3565,6 +3565,10 @@ typedef struct {
+     int16_t  ix[3], iy[3];     /* integer corners (post draw-offset)          */
+     int32_t  fx[3], fy[3];     /* resolved 16.16 corners (== ix<<16 if native) */
+     uint8_t  tier[3], any;
++    uint32_t frame;            /* s_frame_count at prepare time               */
++    uint16_t sz[3];            /* validated projection depth per corner (0=none) */
++    uint8_t  rst[3];           /* resolve state per corner (see pgxp.cpp)     */
++    uint8_t  persp;            /* perspective-correct UVs armed for this tri  */
+ } PgxpTriRec;
+ #define PGXP_TRI_RING 8192
+ static PgxpTriRec s_tri_ring[PGXP_TRI_RING];
+@@ -3572,7 +3576,8 @@ static uint32_t   s_tri_ring_w = 0;
+ static uint32_t   s_tri_seq = 0;
+ static inline void tri_ring_note(uint32_t src, const int32_t vx[3], const int32_t vy[3],
+                                  const int32_t fx[3], const int32_t fy[3],
+-                                 const int tier[3], int any) {
++                                 const int tier[3], int any,
++                                 const uint16_t sz[3], const uint8_t rst[3]) {
+     PgxpTriRec *r = &s_tri_ring[s_tri_ring_w & (PGXP_TRI_RING - 1)];
+     s_tri_ring_w++;
+     r->seq = ++s_tri_seq; r->src = src; r->cmd0 = gp0_cmd_buf[0];
+@@ -3581,8 +3586,18 @@ static inline void tri_ring_note(uint32_t src, const int32_t vx[3], const int32_
+         r->fx[i] = any ? fx[i] : (vx[i] << 16);
+         r->fy[i] = any ? fy[i] : (vy[i] << 16);
+         r->tier[i] = (uint8_t)tier[i];
++        r->sz[i] = sz[i];
++        r->rst[i] = rst[i];
+     }
+     r->any = (uint8_t)any;
++    r->frame = (uint32_t)s_frame_count;
++    r->persp = 0;
++}
++/* prepare_texture_triangle runs after prepare_precise_triangle for the same
++ * triangle; it stamps the perspective decision onto the record just noted. */
++static inline void tri_ring_mark_persp(int on) {
++    if (s_tri_ring_w)
++        s_tri_ring[(s_tri_ring_w - 1) & (PGXP_TRI_RING - 1)].persp = (uint8_t)on;
+ }
+ int gpu_pgxp_tri_ring_read(void *out, int max_recs, uint32_t *total) {
+     int n = s_tri_ring_w < PGXP_TRI_RING ? (int)s_tri_ring_w : PGXP_TRI_RING;
+@@ -3806,7 +3821,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+     if (s_pgxp_disable_2d && (!sz[0] || !sz[1] || !sz[2]))
+         any_precise = 0;
+     if (!any_precise) {
+-        tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 0);
++        tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 0, sz, rst);
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
+         return;
+     }
+@@ -3864,7 +3879,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+             }
+         }
+     }
+-    tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 1);
++    tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 1, sz, rst);
+     gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
+     /* Depth rides only on triangles whose three vertices carry a validated
+      * projection depth - anything else keeps pure painter's order. Two
+@@ -3942,6 +3957,7 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
+     if (qmax <= 0.0f) { s_texcorr.no_depth++; return; }
+     s_texcorr.armed++;
+     gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
++    tri_ring_mark_persp(1);
+ }
+ 
+ /* Write a single pixel to VRAM with draw area clipping and mask bit handling */

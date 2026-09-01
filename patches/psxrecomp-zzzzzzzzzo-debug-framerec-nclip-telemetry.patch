@@ -1,0 +1,450 @@
+From c884b01ca3fef8ffdbbcd4eae0c8c9fd265d03fd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 00:13:31 +0000
+Subject: [PATCH] debug: present-synchronized frame recorder + PGXP culling
+ diagnostics
+
+Lab diagnostics only - no rendering behavior changes.
+
+framerec: {"cmd":"framerec","dir":D,"count":N,"div":K} captures the next N
+presented frames from the completed backbuffer right before SwapWindow,
+box-downsampled by K (default 2) and written as frame_NNNNN.png. Unlike
+screenshot_hires (which reads the render target and can catch a half-drawn
+frame), every file is exactly what the player saw for one game frame - the
+tool for capturing per-frame wobble on a user's machine.
+
+NCLIP culling-correction telemetry in the "pgxp" reply: nclip_precise /
+nclip_gated counters, nclip_gate_why[dead,no-xy,no-z,value] classifying why
+a vertex fell back to the integer winding, a lab-only nclip_noz toggle
+(accept no-z vertices; measured: no effect), and noz_dump (ring of no-z
+gated slots with writer provenance). Tri-ring records gain per-vertex
+write age and writer pc; dead-LWC2 probe reports write provenance.
+---
+ runtime/src/debug_server.c    | 98 ++++++++++++++++++++++++++++++++---
+ runtime/src/gpu.c             | 18 +++++--
+ runtime/src/gpu_gl_renderer.c | 57 ++++++++++++++++++++
+ runtime/src/gte.cpp           |  1 +
+ runtime/src/pgxp.cpp          | 47 +++++++++++++----
+ 5 files changed, 203 insertions(+), 18 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 4bc80df3..921cc7a4 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5407,6 +5407,12 @@ static void handle_pgxp(int id, const char *json)
+                 gl_renderer_set_gapfill(gp);
+         }
+     }
++    /* LAB: accept no-z vertices in the culling-correction gate (diagnostic). */
++    {
++        extern int g_nclip_accept_noz;
++        int nz = json_get_int(json, "nclip_noz", -1);
++        if (nz >= 0) g_nclip_accept_noz = nz ? 1 : 0;
++    }
+     /* tolerance is fractional (sub-pixel), so scan it directly — json_get_int
+      * would truncate 0.5 to 0. */
+     const char *p = strstr(json, "\"tolerance\"");
+@@ -5423,7 +5429,9 @@ static void handle_pgxp(int id, const char *json)
+              "\"disable_2d\":%d,\"vertex_cache\":%d,\"preserve\":%d,"
+              "\"dilate\":%d,\"texture\":%d,\"gapfill\":%d,\"whole\":%d,"
+              "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d,"
+-             "\"framewipe\":%d,\"invalidations\":%u}",
++             "\"framewipe\":%d,\"invalidations\":%u,"
++             "\"nclip_precise\":%llu,\"nclip_gated\":%llu,"
++             "\"nclip_gate_why\":[%llu,%llu,%llu,%llu]}",
+              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+              (unsigned)pgxp_test_suppress_depth(), pgxp_test_active(),
+              gpu_pgxp_depth_enabled(),
+@@ -5455,7 +5463,19 @@ static void handle_pgxp(int id, const char *json)
+              ({ extern int gl_renderer_get_gf_rad(void); gl_renderer_get_gf_rad(); }),
+              ({ extern int pgxp_frame_wipe(void); pgxp_frame_wipe(); }),
+              ({ extern uint32_t pgxp_invalidate_calls(void);
+-                (unsigned)pgxp_invalidate_calls(); }));
++                (unsigned)pgxp_invalidate_calls(); }),
++             ({ extern uint64_t g_nclip_precise;
++                (unsigned long long)g_nclip_precise; }),
++             ({ extern uint64_t g_nclip_gated;
++                (unsigned long long)g_nclip_gated; }),
++             ({ extern uint64_t g_nclip_gate_why[4];
++                (unsigned long long)g_nclip_gate_why[0]; }),
++             ({ extern uint64_t g_nclip_gate_why[4];
++                (unsigned long long)g_nclip_gate_why[1]; }),
++             ({ extern uint64_t g_nclip_gate_why[4];
++                (unsigned long long)g_nclip_gate_why[2]; }),
++             ({ extern uint64_t g_nclip_gate_why[4];
++                (unsigned long long)g_nclip_gate_why[3]; }));
+ }
+ 
+ /* pgxp_tri — vertex-coverage census: triangles by number of precise corners
+@@ -5553,6 +5573,29 @@ typedef struct { uint32_t pc, instr, value; uint8_t kind; uint32_t frame;
+                  uint32_t src_flags, src_live, src_value; } DbgTrapHit;
+ extern int pgxp_trap_read(void *out, int max);
+ extern int pgxp_trap_total(void);
++/* LAB: dump the ring of no-z gated NCLIP slots (value-matching only) as CSV. */
++static void handle_noz_dump(int id, const char *json)
++{
++    typedef struct { uint32_t value, wr_pc, wr_instr, flags; } NozRec;
++    extern NozRec g_noz_ring[256]; extern uint32_t g_noz_n;
++    char path[512];
++    if (!json_get_str(json, "path", path, sizeof path)) {
++        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"path\"}", id); return;
++    }
++    FILE *f = fopen(path, "w");
++    if (!f) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"open\"}", id); return; }
++    fprintf(f, "value,wr_pc,wr_instr,flags\n");
++    uint32_t n = g_noz_n > 256 ? 256 : g_noz_n;
++    for (uint32_t i = 0; i < n; i++) {
++        NozRec *r = &g_noz_ring[i];
++        fprintf(f, "0x%08X,0x%08X,0x%08X,0x%X\n",
++                r->value, r->wr_pc, r->wr_instr, r->flags);
++    }
++    fclose(f);
++    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"dumped\":%u}",
++             id, (unsigned)g_noz_n, (unsigned)n);
++}
++
+ static void handle_pgxp_probe(int id, const char *json)
+ {
+     char tstr[32];
+@@ -5571,7 +5614,7 @@ static void handle_pgxp_probe(int id, const char *json)
+                 live, fl, val, ram, x16, y16, z);
+         }
+     }
+-    typedef struct { uint32_t addr, value; uint8_t live; } DbgDeadLwc2;
++    typedef struct { uint32_t addr, value, wr_instr, wr_pc; uint8_t live; } DbgDeadLwc2;
+     extern uint32_t pgxp_dead_lwc2(void *out, int max);
+     DbgDeadLwc2 dl[32];
+     uint32_t dret = pgxp_dead_lwc2(dl, 32);
+@@ -5579,8 +5622,8 @@ static void handle_pgxp_probe(int id, const char *json)
+     char db[1600]; int doff = 0; db[0] = 0;
+     for (int i = 0; i < dn; i++) {
+         doff += snprintf(db + doff, sizeof db - (size_t)doff,
+-            "%s{\"a\":\"0x%08X\",\"w\":\"0x%08X\",\"lv\":%u}",
+-            i ? "," : "", dl[i].addr, dl[i].value, dl[i].live);
++            "%s{\"a\":\"0x%08X\",\"w\":\"0x%08X\",\"lv\":%u,\"wi\":\"0x%08X\",\"wp\":\"0x%08X\"}",
++            i ? "," : "", dl[i].addr, dl[i].value, dl[i].live, dl[i].wr_instr, dl[i].wr_pc);
+         if (doff >= (int)sizeof db - 100) break;
+     }
+     DbgTrapHit hits[16];
+@@ -6491,6 +6534,9 @@ static void handle_pgxp_tris(int id, const char *json)
+         uint16_t sz[3];
+         uint8_t  rst[3];
+         uint8_t  persp;
++        uint8_t  age[3];
++        uint8_t  pad0;
++        uint32_t wrpc[3];
+     } Rec;
+     extern int gpu_pgxp_tri_ring_read(void *out, int max_recs, uint32_t *total);
+     extern size_t gpu_pgxp_tri_rec_size(void);
+@@ -6505,7 +6551,7 @@ static void handle_pgxp_tris(int id, const char *json)
+     int n = gpu_pgxp_tri_ring_read(recs, 8192, &total);
+     FILE *f = fopen(path, "w");
+     if (!f) { free(recs); send_err(id, "cannot open file"); return; }
+-    fprintf(f, "seq,src,cmd0,any,ix0,iy0,fx0,fy0,t0,ix1,iy1,fx1,fy1,t1,ix2,iy2,fx2,fy2,t2,frame,sz0,sz1,sz2,r0,r1,r2,persp\n");
++    fprintf(f, "seq,src,cmd0,any,ix0,iy0,fx0,fy0,t0,ix1,iy1,fx1,fy1,t1,ix2,iy2,fx2,fy2,t2,frame,sz0,sz1,sz2,r0,r1,r2,persp,age0,age1,age2,wrpc0,wrpc1,wrpc2\n");
+     for (int i = 0; i < n; i++) {
+         const Rec *r = &recs[i];
+         fprintf(f, "%u,0x%08X,0x%08X,%u", r->seq, r->src, r->cmd0, (unsigned)r->any);
+@@ -6514,6 +6560,8 @@ static void handle_pgxp_tris(int id, const char *json)
+                     (int)r->fx[k], (int)r->fy[k], (unsigned)r->tier[k]);
+         fprintf(f, ",%u,%u,%u,%u,%u,%u,%u,%u", r->frame, r->sz[0], r->sz[1], r->sz[2],
+                 r->rst[0], r->rst[1], r->rst[2], (unsigned)r->persp);
++        fprintf(f, ",%u,%u,%u,0x%08X,0x%08X,0x%08X", r->age[0], r->age[1], r->age[2],
++                r->wrpc[0], r->wrpc[1], r->wrpc[2]);
+         fputc('\n', f);
+     }
+     fclose(f);
+@@ -8974,6 +9022,42 @@ static void handle_get_snapshots(int id, const char *json)
+  * — which keeps the self-contained static runtime self-contained. */
+ #include "png_write.h"   /* png_write_rgb + zlib/CRC helpers (shared with Beetle) */
+ 
++/* LAB diagnostic: present-synchronized frame burst state (consumed by the GL
++ * renderer right before SwapWindow — see gl_swap_with_osd). Armed with the
++ * "framerec" command: {"cmd":"framerec","dir":"/path","count":N}. */
++volatile int g_framerec_n = 0;
++int g_framerec_div = 2;
++char g_framerec_dir[256] = "/tmp";
++unsigned g_framerec_seq = 0;
++int gl_framerec_write_png(const char *path, const unsigned char *rgb,
++                          int w, int h)
++{
++    FILE *f = fopen(path, "wb");
++    int ok;
++    if (!f) return 0;
++    ok = png_write_rgb(f, rgb, w, h);
++    fclose(f);
++    return ok;
++}
++static void handle_framerec(int id, const char *json)
++{
++    char dir[256];
++    if (json_get_str(json, "dir", dir, sizeof dir)) {
++        snprintf(g_framerec_dir, sizeof g_framerec_dir, "%s", dir);
++        g_framerec_seq = 0;
++    }
++    {
++        int dv = json_get_int(json, "div", -1);
++        if (dv >= 1 && dv <= 8) g_framerec_div = dv;
++        int n = json_get_int(json, "count", -1);
++        if (n >= 0) g_framerec_n = n;
++    }
++    send_fmt("{\"id\":%d,\"ok\":true,\"remaining\":%d,\"seq\":%u,\"div\":%d,"
++             "\"frame\":%llu,\"dir\":\"%s\"}",
++             id, g_framerec_n, g_framerec_seq, g_framerec_div,
++             (unsigned long long)s_frame_count, g_framerec_dir);
++}
++
+ /* Canonical screenshot: writes an 8-bit RGB PNG of the current PSX display to
+  * "path" (default psx_screenshot.png in the runtime cwd) and answers with a
+  * single metadata line. Registered as "screenshot_file"; the user-facing
+@@ -14155,6 +14239,8 @@ static const CmdEntry s_commands[] = {
+     { "pgxp",              handle_pgxp },
+     { "pgxp_tri",          handle_pgxp_tri },
+     { "pgxp_probe",        handle_pgxp_probe },
++    { "noz_dump",          handle_noz_dump },
++    { "framerec",          handle_framerec },
+     { "ws_aspect_cone_site", handle_ws_aspect_cone_site },
+     { "ws_margin",         handle_ws_margin },
+     { "ws_hud_mode",       handle_ws_hud_mode },
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index d266e1c4..b3e8ccb3 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3569,6 +3569,9 @@ typedef struct {
+     uint16_t sz[3];            /* validated projection depth per corner (0=none) */
+     uint8_t  rst[3];           /* resolve state per corner (see pgxp.cpp)     */
+     uint8_t  persp;            /* perspective-correct UVs armed for this tri  */
++    uint8_t  age[3];           /* presents since the slot's last HOOKED write (255 = never/old) */
++    uint8_t  pad0;
++    uint32_t wrpc[3];          /* last hooked writer pc of the slot           */
+ } PgxpTriRec;
+ #define PGXP_TRI_RING 8192
+ static PgxpTriRec s_tri_ring[PGXP_TRI_RING];
+@@ -3577,7 +3580,8 @@ static uint32_t   s_tri_seq = 0;
+ static inline void tri_ring_note(uint32_t src, const int32_t vx[3], const int32_t vy[3],
+                                  const int32_t fx[3], const int32_t fy[3],
+                                  const int tier[3], int any,
+-                                 const uint16_t sz[3], const uint8_t rst[3]) {
++                                 const uint16_t sz[3], const uint8_t rst[3],
++                                 const uint32_t age[3], const uint32_t wrpc[3]) {
+     PgxpTriRec *r = &s_tri_ring[s_tri_ring_w & (PGXP_TRI_RING - 1)];
+     s_tri_ring_w++;
+     r->seq = ++s_tri_seq; r->src = src; r->cmd0 = gp0_cmd_buf[0];
+@@ -3588,7 +3592,10 @@ static inline void tri_ring_note(uint32_t src, const int32_t vx[3], const int32_
+         r->tier[i] = (uint8_t)tier[i];
+         r->sz[i] = sz[i];
+         r->rst[i] = rst[i];
++        r->age[i] = (uint8_t)(age[i] > 254u ? 255u : age[i]);
++        r->wrpc[i] = wrpc[i];
+     }
++    r->pad0 = 0;
+     r->any = (uint8_t)any;
+     r->frame = (uint32_t)s_frame_count;
+     r->persp = 0;
+@@ -3625,6 +3632,8 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+     int any_precise = 0, n_precise = 0;
+     int tier[3] = { 0, 0, 0 };
+     uint8_t rst[3] = { 0, 0, 0 };
++    uint32_t age[3] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
++    uint32_t wrpc[3] = { 0, 0, 0 };
+     uint32_t vaddr[3] = { 0, 0, 0 };
+     for (int i = 0; i < 3; i++) {
+         uint32_t word = gp0_cmd_buf[idx[i]];
+@@ -3638,7 +3647,10 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+                                           &px, &py, &sz[i]);
+         {
+             extern uint8_t pgxp_last_resolve_state(void);
++            extern uint32_t pgxp_last_wr_age(void);
++            extern uint32_t pgxp_last_wr_pc(void);
+             rst[i] = pgxp_last_resolve_state();
++            if (tier[i] == PGXP_SRC_DATAFLOW) { age[i] = pgxp_last_wr_age(); wrpc[i] = pgxp_last_wr_pc(); }
+         }
+         vaddr[i] = addr;
+         if (tier[i] != PGXP_SRC_NATIVE) { any_precise = 1; n_precise++; }
+@@ -3821,7 +3833,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+     if (s_pgxp_disable_2d && (!sz[0] || !sz[1] || !sz[2]))
+         any_precise = 0;
+     if (!any_precise) {
+-        tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 0, sz, rst);
++        tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 0, sz, rst, age, wrpc);
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
+         return;
+     }
+@@ -3879,7 +3891,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+             }
+         }
+     }
+-    tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 1, sz, rst);
++    tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 1, sz, rst, age, wrpc);
+     gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
+     /* Depth rides only on triangles whose three vertices carry a validated
+      * projection depth - anything else keeps pure painter's order. Two
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 315ef06c..6c391c04 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -4858,6 +4858,63 @@ static void gl_swap_with_osd(void) {
+             present_shot_done(wrote);
+         }
+     }
++    /* LAB diagnostic: present-synchronized frame burst. Armed via the debug
++     * server ("framerec"); captures the completed backbuffer right before the
++     * swap, so every file is a full presented frame (unlike screenshot_hires,
++     * which can read mid-frame). */
++    {
++        extern volatile int g_framerec_n;
++        extern int g_framerec_div;
++        extern char g_framerec_dir[256];
++        extern unsigned g_framerec_seq;
++        extern int gl_framerec_write_png(const char *path,
++                                         const unsigned char *rgb, int w, int h);
++        if (g_framerec_n > 0) {
++            int ww = 0, wh = 0;
++            SDL_GL_GetDrawableSize(s_win, &ww, &wh);
++            if (ww > 0 && wh > 0) {
++                unsigned char *rgb = (unsigned char *)malloc((size_t)ww * wh * 3);
++                if (rgb) {
++                    /* div x div box downsample before the PNG write (the encoder
++                     * writes stored blocks, so a full 4K frame would be ~25MB).
++                     * Rows are flipped here too (GL reads bottom-up). */
++                    char path[320];
++                    int dv = g_framerec_div < 1 ? 1 : g_framerec_div;
++                    int dw = ww / dv, dh = wh / dv;
++                    unsigned char *g =
++                        (unsigned char *)malloc((size_t)dw * dh * 3);
++                    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
++                    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++                    glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
++                    if (g) {
++                        const unsigned n = (unsigned)(dv * dv);
++                        for (int y = 0; y < dh; y++) {
++                            unsigned char *o = g + (size_t)y * dw * 3;
++                            for (int x = 0; x < dw; x++) {
++                                unsigned acc[3] = { 0, 0, 0 };
++                                for (int sy = 0; sy < dv; sy++) {
++                                    const unsigned char *row =
++                                        rgb + (size_t)(wh - 1 - (y * dv + sy)) * ww * 3
++                                            + (size_t)x * dv * 3;
++                                    for (int sx = 0; sx < dv; sx++)
++                                        for (int c = 0; c < 3; c++)
++                                            acc[c] += row[sx * 3 + c];
++                                }
++                                for (int c = 0; c < 3; c++)
++                                    o[x * 3 + c] = (unsigned char)(acc[c] / n);
++                            }
++                        }
++                        snprintf(path, sizeof path, "%s/frame_%05u.png",
++                                 g_framerec_dir, g_framerec_seq++);
++                        gl_framerec_write_png(path, g, dw, dh);
++                        free(g);
++                        g_framerec_n--;
++                    }
++                    free(rgb);
++                }
++            }
++        }
++    }
+     {
+         /* Wall time blocked inside the swap: under driver vsync with a deep
+          * GPU queue this is where a CPU-side stall surfaces (frame_perf
+diff --git a/runtime/src/gte.cpp b/runtime/src/gte.cpp
+index dbf5124e..73be01dc 100644
+--- a/runtime/src/gte.cpp
++++ b/runtime/src/gte.cpp
+@@ -1067,6 +1067,7 @@ extern "C" int gte_nclip_precise_bltz(int32_t native_mac0) {
+     return s_nclip_last_precise_sign < 0;
+ }
+ 
++extern "C" { uint64_t g_nclip_precise = 0, g_nclip_gated = 0; }
+ void gte_nclip(GTEState* gte, uint32_t instr) {
+     gte->FLAG = 0;
+     int32_t sx0 = static_cast<int16_t>(gte->SXY[0] & 0xFFFF);
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 87a1004e..8a6c5107 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -475,13 +475,18 @@ extern "C" void pgxp_cop2_counts(uint32_t out[4]) {
+ }
+ /* Ring of recent LWC2 loads whose source shadow was dead/flagless: these are
+  * the cache slots feeding untracked vertices. */
+-typedef struct { uint32_t addr, value; uint8_t live; } DeadLwc2;
++typedef struct { uint32_t addr, value, wr_instr, wr_pc; uint8_t live; } DeadLwc2;
+ static DeadLwc2 s_dead_lwc2[32];
+ static uint32_t s_dead_lwc2_n = 0;
+-static inline void dead_lwc2_note(uint32_t addr, uint32_t value, uint8_t live) {
++static inline void dead_lwc2_note2(uint32_t addr, uint32_t value, uint8_t live,
++                                   uint32_t wr_instr, uint32_t wr_pc) {
+     DeadLwc2 *e = &s_dead_lwc2[s_dead_lwc2_n & 31];
+     s_dead_lwc2_n++;
+     e->addr = addr; e->value = value; e->live = live;
++    e->wr_instr = wr_instr; e->wr_pc = wr_pc;
++}
++static inline void dead_lwc2_note(uint32_t addr, uint32_t value, uint8_t live) {
++    dead_lwc2_note2(addr, value, live, 0, 0);
+ }
+ extern "C" uint32_t pgxp_dead_lwc2(void *out, int max) {
+     int n = s_dead_lwc2_n < 32 ? (int)s_dead_lwc2_n : 32;
+@@ -514,7 +519,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+             pv_validate(src, value);
+             tmp = *src;
+             if (!(src->flags & PGXP_F_VXY) && rt >= 12 && rt <= 15)
+-                dead_lwc2_note(addr, value, 1);   /* live but flagless */
++                dead_lwc2_note2(addr, value, 1, src->wr_instr, src->wr_pc);
+         } else {
+             pv_reset(&tmp, value);
+             if (rt >= 12 && rt <= 15)
+@@ -578,8 +583,12 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+             uint32_t rd = f_rd(instr);
+             if (rd >= 12 && rd <= 15 &&
+                 !(rt != 0 && gen_live(s_gpr[rt].gen) &&
+-                  (s_gpr[rt].flags & PGXP_F_VXY)))
+-                dead_lwc2_note(0xFFFF0000u | rd, value, 2);
++                  (s_gpr[rt].flags & PGXP_F_VXY))) {
++                extern uint32_t g_debug_last_store_pc;
++                dead_lwc2_note2(0xFFFF0000u | rd, value, 2,
++                                (rt != 0) ? s_gpr[rt].flags : 0xDEADu,
++                                cpu ? cpu->pc : 0);
++            }
+             PGXPValue tmp = {};
+             if (rt != 0 && gen_live(s_gpr[rt].gen)) {
+                 pv_validate(&s_gpr[rt], value);
+@@ -1008,15 +1017,35 @@ extern "C" int pgxp_get_gte_sxy_checked(uint32_t index, uint32_t expect,
+  * precise winding is only trusted when the shadow carries a validated
+  * projection DEPTH as well - a game-CONSTRUCTED screen position (2D UI,
+  * CPU-packed vertices) has no Z and must take the faithful integer NCLIP. */
++extern "C" { uint64_t g_nclip_gate_why[4]; }  /* 0 dead 1 no-xy 2 no-z 3 value */
++/* LAB diagnostic: when set, a vertex gated ONLY for a missing Z (value still
++ * matching) counts as precise anyway. Isolates whether residual blinking
++ * faces are no-z-gated NCLIPs (a tracking-fidelity gap vs DS) or unrelated. */
++extern "C" { int g_nclip_accept_noz = 0; }
++/* LAB diagnostic: ring of no-z gated slots with their write provenance. */
++typedef struct { uint32_t value; uint32_t wr_pc; uint32_t wr_instr; uint32_t flags; } NozRec;
++extern "C" { NozRec g_noz_ring[256]; uint32_t g_noz_n = 0; }
+ extern "C" int pgxp_get_gte_sxyz_checked(uint32_t index, uint32_t expect,
+                                          int32_t *x16, int32_t *y16) {
+     if (index >= 4) return 0;
+     const PGXPValue *pv = &s_gte[12 + index];
+-    if (!pv_live(pv) ||
+-        (pv->flags & (PGXP_F_VXY | PGXP_F_VZ)) != (PGXP_F_VXY | PGXP_F_VZ))
+-        return 0;
+-    if (pv->value != expect)
++    if (!pv_live(pv)) { g_nclip_gate_why[0]++; return 0; }
++    if ((pv->flags & PGXP_F_VXY) != PGXP_F_VXY) { g_nclip_gate_why[1]++; return 0; }
++    if (!(pv->flags & PGXP_F_VZ)) {
++        g_nclip_gate_why[2]++;
++        if (pv->value == expect) {
++            NozRec *nr = &g_noz_ring[(g_noz_n++) & 255u];
++            nr->value = pv->value; nr->wr_pc = pv->wr_pc;
++            nr->wr_instr = pv->wr_instr; nr->flags = pv->flags;
++            if (g_nclip_accept_noz) {
++                if (x16) *x16 = pv->x16;
++                if (y16) *y16 = pv->y16;
++                return 1;
++            }
++        }
+         return 0;
++    }
++    if (pv->value != expect) { g_nclip_gate_why[3]++; return 0; }
+     if (x16) *x16 = pv->x16;
+     if (y16) *y16 = pv->y16;
+     return 1;

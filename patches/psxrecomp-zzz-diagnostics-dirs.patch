@@ -1,0 +1,214 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 23746749..abdfb3ed 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -386,6 +386,29 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         rt.mods_dir     = name;
+         rt.has_mods_dir = true;
+     }
++    for (const char *key : { "diagnostics_dir", "dumps_dir" }) {
++        /* Where the runtime writes its own diagnostic files (crash report +
++         * freeze heartbeat under diagnostics_dir; multi-MB freeze dumps under
++         * dumps_dir) instead of scattering them beside the exe. Same plain-
++         * name rule as mods_dir. Default: exe dir (upstream behavior). */
++        if (!runtime.contains(key)) continue;
++        const auto name = toml::find<std::string>(runtime, key);
++        if (name.empty() ||
++            name.find('/') != std::string::npos ||
++            name.find('\\') != std::string::npos ||
++            name == "." || name == "..") {
++            throw std::runtime_error(fmt::format(
++                "[runtime] {} must be a plain directory name, got '{}'",
++                key, name));
++        }
++        if (std::string(key) == "diagnostics_dir") {
++            rt.diagnostics_dir     = name;
++            rt.has_diagnostics_dir = true;
++        } else {
++            rt.dumps_dir     = name;
++            rt.has_dumps_dir = true;
++        }
++    }
+     if (runtime.contains("instant_max_per_frame")) {
+         const auto n = toml::find<int64_t>(runtime, "instant_max_per_frame");
+         if (n < 1 || n > 4096) {
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 1dcbfd66..37c90db7 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -189,6 +189,15 @@ struct RuntimeConfig {
+     bool                  has_mods_dir = false;
+     std::string           mods_dir = "mods";
+ 
++    // diagnostics_dir / dumps_dir: where the runtime writes its crash report
++    // + freeze heartbeat (diagnostics_dir) and multi-MB freeze dumps
++    // (dumps_dir). Plain directory names resolved against the exe dir,
++    // created on demand; default empty = exe dir (upstream behavior).
++    bool                  has_diagnostics_dir = false;
++    std::string           diagnostics_dir;
++    bool                  has_dumps_dir = false;
++    std::string           dumps_dir;
++
+     // disc_speed: "1x" (default) | "2x" | "4x" | "instant"
+     // Controls how quickly CD-ROM timing delays fire. "instant" collapses all
+     // seek/read delays to 1 cycle — correct INT sequence, no artificial wait.
+diff --git a/runtime/include/crash_trace.h b/runtime/include/crash_trace.h
+index 2c6b8a87..a0187246 100644
+--- a/runtime/include/crash_trace.h
++++ b/runtime/include/crash_trace.h
+@@ -14,6 +14,12 @@ void psx_crash_trace_install_handlers(void);
+  * the trigger (e.g. "fail_fast_unknown_dispatch", "trap_crash"). On
+  * Windows, `seh_info` is the EXCEPTION_POINTERS* from the SEH filter or
+  * NULL. Writes to psx_last_run_report.json (overwrite). */
++
++/* Optional: write the report into this directory (plain path, must exist)
++ * instead of the working directory. Call once at startup, before any crash
++ * can happen — the full path is prebuilt so the signal-context writer never
++ * assembles paths. */
++void crash_trace_set_report_dir(const char *dir);
+ void psx_crash_trace_dump(const char *reason, void *seh_info);
+ 
+ /* Tag a deliberate exit() so the atexit report can attribute it
+diff --git a/runtime/include/freeze_heartbeat.h b/runtime/include/freeze_heartbeat.h
+index e8586982..9c883d4c 100644
+--- a/runtime/include/freeze_heartbeat.h
++++ b/runtime/include/freeze_heartbeat.h
+@@ -19,6 +19,12 @@
+ extern "C" {
+ #endif
+ 
++/* Optional: place the heartbeat file (diag_dir) and the multi-MB freeze
++ * dumps (dump_dir) into these directories (plain paths, must exist) instead
++ * of the working directory. Call once at startup, before the heartbeat
++ * thread starts. Either may be NULL/empty to keep the default. */
++void freeze_heartbeat_set_dirs(const char *diag_dir, const char *dump_dir);
++
+ /* Spawn the heartbeat thread. Idempotent — second call is a no-op.
+  * `backend_label` is written into the heartbeat JSON as "backend"
+  * (e.g. "psx-runtime" or "psx-beetle") so a reader can tell which
+diff --git a/runtime/src/crash_trace.c b/runtime/src/crash_trace.c
+index 34bcc4db..dc40f367 100644
+--- a/runtime/src/crash_trace.c
++++ b/runtime/src/crash_trace.c
+@@ -44,8 +44,17 @@
+ #include "autocompile.h"   /* autocompile_degraded_reason — stamp a degraded
+                             * (interpreter-only) run into its own report */
+ 
+-/* Output path — overwritten per dump. */
+-static const char *kReportPath = "psx_last_run_report.json";
++/* Output path — overwritten per dump. Prebuilt at config time (the crash
++ * writer runs in signal/SEH context, so no allocation or path assembly
++ * happens there); default stays the exe-dir filename. */
++static char s_report_path[512] = "psx_last_run_report.json";
++static const char *kReportPath = s_report_path;
++
++void crash_trace_set_report_dir(const char *dir) {
++    if (!dir || !*dir) return;
++    snprintf(s_report_path, sizeof(s_report_path),
++             "%s/psx_last_run_report.json", dir);
++}
+ 
+ /* Build identity, embedded into every report so a user-submitted crash can be
+  * correlated to an exact build (issue #1 reports had no version field). The git
+diff --git a/runtime/src/freeze_heartbeat.c b/runtime/src/freeze_heartbeat.c
+index 8dcdea03..d5f9a127 100644
+--- a/runtime/src/freeze_heartbeat.c
++++ b/runtime/src/freeze_heartbeat.c
+@@ -85,6 +85,18 @@ static int    s_sym_initialized = 0;
+ #endif
+ 
+ #define HB_FILE        "psx_freeze_heartbeat.json"
++/* Configurable output locations (default: working directory, upstream
++ * behavior). Prebuilt at startup — the dump path prefix is later used from
++ * watchdog context, so no assembly happens there. */
++static char s_hb_path[512]  = HB_FILE;
++static char s_dump_prefix[448] = "";
++
++void freeze_heartbeat_set_dirs(const char *diag_dir, const char *dump_dir) {
++    if (diag_dir && *diag_dir)
++        snprintf(s_hb_path, sizeof(s_hb_path), "%s/" HB_FILE, diag_dir);
++    if (dump_dir && *dump_dir)
++        snprintf(s_dump_prefix, sizeof(s_dump_prefix), "%s/", dump_dir);
++}
+ #define HB_INTERVAL_MS 100u
+ 
+ /* Wedge detection.
+@@ -485,12 +497,15 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
+         return 0;
+ #endif
+ 
+-    char path[128];
++    char path[512];
++    char name[128];
+     uint32_t sequence = s_dump_sequence++;
+-    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
++    if (!freeze_dump_format_path(name, sizeof(name), s_backend, wall, sequence)) {
+         freeze_dump_unlock();
+         return 0;
+     }
++    /* [runtime] dumps_dir: land the dump under the configured directory. */
++    snprintf(path, sizeof(path), "%s%s", s_dump_prefix, name);
+ 
+     FILE *f = fopen(path, "wb");
+     if (!f) { freeze_dump_unlock(); return 0; }
+@@ -1072,8 +1087,8 @@ static void heartbeat_write(void) {
+     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
+      * mid-write file and parsing partial JSON. Cheap on Windows
+      * (MoveFileEx with REPLACE_EXISTING). */
+-    char tmp_path[64];
+-    snprintf(tmp_path, sizeof(tmp_path), HB_FILE ".tmp");
++    char tmp_path[520];
++    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s_hb_path);
+ 
+     FILE *f = fopen(tmp_path, "wb");
+     if (!f) return;
+@@ -1081,10 +1096,10 @@ static void heartbeat_write(void) {
+     fclose(f);
+ 
+ #ifdef _WIN32
+-    MoveFileExA(tmp_path, HB_FILE,
++    MoveFileExA(tmp_path, s_hb_path,
+                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+ #else
+-    rename(tmp_path, HB_FILE);
++    rename(tmp_path, s_hb_path);
+ #endif
+ }
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index fc82e59b..9ade123d 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -11837,6 +11837,32 @@ int main(int argc, char** argv) {
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+             if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
+                 mods_dir_name = gc.runtime.mods_dir;
++            /* [runtime] diagnostics_dir / dumps_dir: route the runtime's own
++             * diagnostic files (crash report + freeze heartbeat, and the
++             * multi-MB freeze dumps) into subdirectories instead of littering
++             * the exe folder. Created on demand; paths are prebuilt in the
++             * writers so crash/watchdog contexts never assemble them. */
++            {
++                const auto exe_dir = exe_dir_from_argv(argv[0]);
++                std::string diag_abs, dumps_abs;
++                std::error_code ec;
++                if (gc.runtime.has_diagnostics_dir) {
++                    auto p = exe_dir / gc.runtime.diagnostics_dir;
++                    std::filesystem::create_directories(p, ec);
++                    if (!ec) diag_abs = p.string();
++                }
++                if (gc.runtime.has_dumps_dir) {
++                    auto p = exe_dir / gc.runtime.dumps_dir;
++                    std::filesystem::create_directories(p, ec);
++                    if (!ec) dumps_abs = p.string();
++                }
++                if (!diag_abs.empty())
++                    crash_trace_set_report_dir(diag_abs.c_str());
++                if (!diag_abs.empty() || !dumps_abs.empty())
++                    freeze_heartbeat_set_dirs(
++                        diag_abs.empty() ? nullptr : diag_abs.c_str(),
++                        dumps_abs.empty() ? nullptr : dumps_abs.c_str());
++            }
+             /* On-the-fly string translation / localization (framework feature —
+              * text_xlate.cpp): load translations/ *.toml under the project root
+              * and select the language. Capture inventory is always-on; APPLY is

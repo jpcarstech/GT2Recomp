@@ -1,0 +1,83 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 3afc3798..c4378d93 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -368,6 +368,24 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+         rt.has_disc_speed = true;
+     }
++    if (runtime.contains("mods_dir")) {
++        /* Name of the mod-package directory next to the exe (default "mods").
++         * A port whose launcher presents its packages under different top-level
++         * names (e.g. GT2's Patches/Cheats split) can make the on-disk folder
++         * match its UI. Plain directory name, resolved against the exe dir at
++         * runtime - path separators are rejected so it cannot escape it. */
++        const auto name = toml::find<std::string>(runtime, "mods_dir");
++        if (name.empty() ||
++            name.find('/') != std::string::npos ||
++            name.find('\\') != std::string::npos ||
++            name == "." || name == "..") {
++            throw std::runtime_error(fmt::format(
++                "[runtime] mods_dir must be a plain directory name, got '{}'",
++                name));
++        }
++        rt.mods_dir     = name;
++        rt.has_mods_dir = true;
++    }
+     if (runtime.contains("instant_max_per_frame")) {
+         const auto n = toml::find<int64_t>(runtime, "instant_max_per_frame");
+         if (n < 1 || n > 4096) {
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index ded393e3..3ebde655 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -182,6 +182,13 @@ struct RuntimeConfig {
+     bool                  has_memcard_dir = false;
+     std::filesystem::path memcard_dir;     // absolute path (resolved against project root)
+ 
++    // mods_dir: name of the mod-package directory next to the exe (default
++    // "mods"). Plain directory name only - resolved against the exe dir at
++    // runtime, so a port can name the folder after what its launcher calls
++    // the content (e.g. "patches").
++    bool                  has_mods_dir = false;
++    std::string           mods_dir = "mods";
++
+     // disc_speed: "1x" (default) | "2x" | "4x" | "instant"
+     // Controls how quickly CD-ROM timing delays fire. "instant" collapses all
+     // seek/read delays to 1 cycle — correct INT sequence, no artificial wait.
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index d18db8d4..7ecafbb1 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -11725,6 +11725,9 @@ int main(int argc, char** argv) {
+     std::string deferred_overlay_ac_tcc;
+     bool deferred_overlay_capture_history = false;
+     std::string deferred_overlay_capture_persist_dir;
++    /* [runtime] mods_dir (default "mods"): name of the mod-package directory
++     * next to the exe, consumed at mod_runtime_initialize below. */
++    std::string mods_dir_name = "mods";
+ 
+     if (game_config_path) {
+         try {
+@@ -11779,6 +11782,8 @@ int main(int argc, char** argv) {
+             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
++            if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
++                mods_dir_name = gc.runtime.mods_dir;
+             /* On-the-fly string translation / localization (framework feature —
+              * text_xlate.cpp): load translations/ *.toml under the project root
+              * and select the language. Capture inventory is always-on; APPLY is
+@@ -12512,8 +12517,11 @@ int main(int argc, char** argv) {
+      * psx_mod_set_* callbacks — is inert until this runs. */
+     {
+         std::string mod_error;
++        /* Directory name is configurable ([runtime] mods_dir, default "mods")
++         * so a port can match the folder to what its launcher calls the
++         * content (e.g. GT2's Patches/Cheats split ships a "patches" dir). */
+         if (!PSXRecompV4::mod_runtime_initialize(
+-                exe_dir_from_argv(argv[0]) / "mods", game_id,
++                exe_dir_from_argv(argv[0]) / mods_dir_name, game_id,
+                 game_entry_pc, text_guard_exe_path, &mod_error)) {
+             std::fprintf(stderr, "psxrecomp: mods unavailable: %s\n",
+                          mod_error.c_str());

@@ -1,0 +1,150 @@
+From f9d30af564eb9fb91437b944d7a544c3106bc1a3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 31 Aug 2026 07:48:57 +0000
+Subject: [PATCH] pgxp: resolved-corner ring + pgxp_tris CSV dump
+
+Records, for every triangle the PGXP path prepares, the INTEGER corners the
+game supplied and the SUB-PIXEL corners we resolved them to (16.16) with each
+corner's tier; last 8192 triangles (several frames). {"cmd":"pgxp_tris",
+"path":...} writes it as CSV.
+
+Offline, group corners by integer pixel: a pixel two triangles resolved to
+DIFFERENT sub-pixel positions is a seam by construction - either one copy
+resolved and the other fell back (mixed), or both resolved to different
+fractions (divergent). Truncation agreement bounds every correction to <1px,
+so this disagreement is exactly the <=1-PS1-pixel gap that becomes a 16px
+line at 16x. Measures the mechanism from data; needs no screenshot and no GPU.
+---
+ runtime/src/debug_server.c | 40 +++++++++++++++++++++++++++++++++
+ runtime/src/gpu.c          | 46 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index e9bde475..293b7ecf 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -6461,6 +6461,45 @@ static void handle_pgxp_trap(int id, const char *json)
+     send_fmt("%s", buf);
+ }
+ 
++/* pgxp_tris - dump the resolved-corner ring (see gpu.c tri_ring_note) as CSV
++ * to a file: {"cmd":"pgxp_tris","path":"..."}. One row per triangle:
++ * seq,src,cmd0,any, then per corner ix,iy,fx,fy,tier. Analysed offline. */
++static void handle_pgxp_tris(int id, const char *json)
++{
++    typedef struct {
++        uint32_t seq, src, cmd0;
++        int16_t  ix[3], iy[3];
++        int32_t  fx[3], fy[3];
++        uint8_t  tier[3], any;
++    } Rec;
++    extern int gpu_pgxp_tri_ring_read(void *out, int max_recs, uint32_t *total);
++    extern size_t gpu_pgxp_tri_rec_size(void);
++    if (gpu_pgxp_tri_rec_size() != sizeof(Rec)) { send_err(id, "rec size mismatch"); return; }
++    char path[512];
++    if (!json_get_str(json, "path", path, sizeof(path)))
++        strncpy(path, "pgxp_tris.csv", sizeof(path) - 1);
++    path[sizeof(path) - 1] = '\0';
++    Rec *recs = (Rec *)malloc(8192 * sizeof(Rec));
++    if (!recs) { send_err(id, "alloc failed"); return; }
++    uint32_t total = 0;
++    int n = gpu_pgxp_tri_ring_read(recs, 8192, &total);
++    FILE *f = fopen(path, "w");
++    if (!f) { free(recs); send_err(id, "cannot open file"); return; }
++    fprintf(f, "seq,src,cmd0,any,ix0,iy0,fx0,fy0,t0,ix1,iy1,fx1,fy1,t1,ix2,iy2,fx2,fy2,t2\n");
++    for (int i = 0; i < n; i++) {
++        const Rec *r = &recs[i];
++        fprintf(f, "%u,0x%08X,0x%08X,%u", r->seq, r->src, r->cmd0, (unsigned)r->any);
++        for (int k = 0; k < 3; k++)
++            fprintf(f, ",%d,%d,%d,%d,%u", (int)r->ix[k], (int)r->iy[k],
++                    (int)r->fx[k], (int)r->fy[k], (unsigned)r->tier[k]);
++        fputc('\n', f);
++    }
++    fclose(f);
++    free(recs);
++    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"rows\":%d,\"total_seen\":%u}",
++             id, path, n, total);
++}
++
+ /* pgxp_mixed - triangles by resolve pattern, and the native corners of MIXED
+  * triangles (the seam mechanism). See pgxp_mixed_note. */
+ static void handle_pgxp_mixed(int id, const char *json)
+@@ -14275,6 +14314,7 @@ static const CmdEntry s_commands[] = {
+     { "wide_full",         handle_wide_full },
+     { "wide_shot",         handle_wide_shot },
+     { "pgxp_trap",         handle_pgxp_trap },
++    { "pgxp_tris",         handle_pgxp_tris },
+     { "pgxp_mixed",        handle_pgxp_mixed },
+     { "pgxp_flagless",     handle_pgxp_flagless },
+     { "gpu_opcodes",       handle_gpu_opcodes },
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index e3f830a3..8272ee7e 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3552,6 +3552,50 @@ void gpu_pgxp_mixed_reset(void) { s_mixed_ring_n = 0; }
+  * it, so shared edges between neighbouring triangles cannot disagree by more
+  * than the sub-pixel fraction. The integer delta folds in draw offsets and
+  * any widescreen adjustment already applied by the caller. */
++/* Resolved-corner ring: every triangle the PGXP path prepares, with the
++ * INTEGER corner the game supplied and the SUB-PIXEL corner we resolved it to
++ * (16.16), per corner tier. Holds a few frames. Read back over the debug
++ * server (pgxp_tris) and analysed offline: group corners by integer pixel; a
++ * pixel where two triangles resolved to DIFFERENT sub-pixel positions is a
++ * seam candidate by construction - either one copy resolved and the other
++ * fell back (mixed), or both resolved to different fractions. This measures
++ * the mechanism directly, from data, without needing a screenshot. */
++typedef struct {
++    uint32_t seq, src, cmd0;
++    int16_t  ix[3], iy[3];     /* integer corners (post draw-offset)          */
++    int32_t  fx[3], fy[3];     /* resolved 16.16 corners (== ix<<16 if native) */
++    uint8_t  tier[3], any;
++} PgxpTriRec;
++#define PGXP_TRI_RING 8192
++static PgxpTriRec s_tri_ring[PGXP_TRI_RING];
++static uint32_t   s_tri_ring_w = 0;
++static uint32_t   s_tri_seq = 0;
++static inline void tri_ring_note(uint32_t src, const int32_t vx[3], const int32_t vy[3],
++                                 const int32_t fx[3], const int32_t fy[3],
++                                 const int tier[3], int any) {
++    PgxpTriRec *r = &s_tri_ring[s_tri_ring_w & (PGXP_TRI_RING - 1)];
++    s_tri_ring_w++;
++    r->seq = ++s_tri_seq; r->src = src; r->cmd0 = gp0_cmd_buf[0];
++    for (int i = 0; i < 3; i++) {
++        r->ix[i] = (int16_t)vx[i]; r->iy[i] = (int16_t)vy[i];
++        r->fx[i] = any ? fx[i] : (vx[i] << 16);
++        r->fy[i] = any ? fy[i] : (vy[i] << 16);
++        r->tier[i] = (uint8_t)tier[i];
++    }
++    r->any = (uint8_t)any;
++}
++int gpu_pgxp_tri_ring_read(void *out, int max_recs, uint32_t *total) {
++    int n = s_tri_ring_w < PGXP_TRI_RING ? (int)s_tri_ring_w : PGXP_TRI_RING;
++    if (n > max_recs) n = max_recs;
++    /* oldest-first */
++    uint32_t start = (s_tri_ring_w >= PGXP_TRI_RING) ? (s_tri_ring_w - PGXP_TRI_RING) : 0;
++    PgxpTriRec *o = (PgxpTriRec *)out;
++    for (int i = 0; i < n; i++) o[i] = s_tri_ring[(start + (uint32_t)i) & (PGXP_TRI_RING - 1)];
++    if (total) *total = s_tri_ring_w;
++    return n;
++}
++size_t gpu_pgxp_tri_rec_size(void) { return sizeof(PgxpTriRec); }
++
+ static void prepare_precise_triangle(int i0, int i1, int i2,
+                                      const int32_t vx[3], const int32_t vy[3]) {
+     gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+@@ -3762,6 +3806,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+     if (s_pgxp_disable_2d && (!sz[0] || !sz[1] || !sz[2]))
+         any_precise = 0;
+     if (!any_precise) {
++        tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 0);
+         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
+         return;
+     }
+@@ -3819,6 +3864,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
+             }
+         }
+     }
++    tri_ring_note(gp0_cmd_source_addr, vx, vy, fx, fy, tier, 1);
+     gr_set_precise_triangle(1, fx[0],fy[0], fx[1],fy[1], fx[2],fy[2]);
+     /* Depth rides only on triangles whose three vertices carry a validated
+      * projection depth - anything else keeps pure painter's order. Two

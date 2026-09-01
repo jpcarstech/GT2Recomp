@@ -1,6 +1,6 @@
 # Building GT2Recomp
 
-The player version is in the [README](../README.md#how-to-install-no-technical-knowledge-needed):
+The player version is in the [README](../README.md#install):
 unzip `GT2Recomp-setup.zip` next to your GT2 Combined Disc image and
 double-click `Setup GT2.cmd`. This page is the long version — what each step
 does, how to run it by hand, and how to build on Linux.
@@ -176,3 +176,24 @@ resulting exe imports only Windows system DLLs.
 - **The game exits by itself after ~4 s on a screen with no movement** — the
   starvation watchdog. Report it with `starvation_dump.jsonl` from the game folder;
   `PSX_STARVATION_TIMEOUT_US=0` in the environment disables it meanwhile.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `game.toml` | Game identity + recompiler config (build variant) |
+| `tools-win/local-build/game.runtime.toml` | The `game.toml` installed beside the exe (runtime variant) |
+| `seeds/ghidra_funcs.txt` | Function seeds for the boot EXE (entry + JAL scan) |
+| `CMakeLists.txt`, `codegen_setup.*` | Game runtime target (`psxrecomp_add_game_runtime`) |
+| `mods_gt2_silent.c`, `mods/` | The enhancement package: Silent's codes as runtime patch plugins |
+| `psxrecomp/`, `recomp-ui/` | Framework and launcher submodules, pinned to upstream commits |
+| `patches/` | Everything this port changes in the framework, applied at build time ([`patches/README.md`](../patches/README.md)) |
+| `tools-win/` | The build scripts, player helpers, and `dev/` diagnostics |
+| `docs/` | This file, [`BRINGUP.md`](BRINGUP.md), the PGXP write-up |
+
+Framework changes are carried as patches, never as submodule forks, so anyone
+can see exactly what differs from upstream PSXRecomp and the fixes can go
+back upstream one at a time.
+
+Bug reports are most useful with `diagnostics\psx_last_run_report.json`, the
+player's `settings.toml`, and the output of `tools\run_logged.ps1`.

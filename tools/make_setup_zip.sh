@@ -32,13 +32,14 @@ STEP 3 - Double-click "Setup GT2.cmd"  (30-60 minutes, all automatic)
   - If it offers to rename your game image, press Enter.
   - Leave the black window alone until it prints DONE.
 
-PLAY: double-click "Play GT2.cmd". The first start opens a settings window -
-plug in your controller, pick resolution and patches (widescreen, 60 FPS...),
-hit Play. In game: F1 = graphics menu, F7 = save states, F8 = rewind.
+PLAY: double-click "Gran Turismo 2 Recompiled.exe" (make a desktop shortcut
+if you like). The first start opens a settings window - plug in your
+controller, pick resolution and patches (widescreen, 60 FPS...), hit Play.
+In game: F1 = graphics menu, F7 = save states, F8 = rewind.
 
 Good to know:
-  - The game gets FASTER over your first few sessions (it converts more of
-    itself to PC code each time you quit - that's the second window).
+  - The game gets FASTER over your first few sessions (it quietly converts
+    more of itself to PC code while you play and briefly after you quit).
   - Re-run "Setup GT2.cmd" any time to update (minutes, not an hour).
   - Nothing is uploaded anywhere; everything is built from your own discs.
   - Optional: put your own PS1 BIOS dump (scph1001.bin) in the folder before

@@ -81,14 +81,15 @@ combined game image from Step 1 in it (the big `.bin` and its `.cue`).
 
 ### Play
 
-Double-click **`Play GT2.cmd`** in your game folder. The first start opens a
-settings window — plug in your controller, pick your resolution and any
-patches (widescreen, 60 FPS...), and hit Play. In the game, **F1** opens the
-graphics menu, **F7** save states, **F8** rewinds.
+Double-click **`Gran Turismo 2 Recompiled.exe`** in your game folder (make a
+desktop shortcut if you like). The first start opens a settings window — plug
+in your controller, pick your resolution and any patches (widescreen,
+60 FPS...), and hit Play. In the game, **F1** opens the graphics menu, **F7**
+save states, **F8** rewinds.
 
 Two good things to know: the game keeps getting *faster* over your first few
-play sessions (it converts more of the game to native PC code each time you
-quit — that's the second window `Play GT2.cmd` opens), and you can re-run
+play sessions (it quietly converts more of the game to native PC code while
+you play and for a little while after you quit), and you can re-run
 `Setup GT2.cmd` any time to update to the newest version (that takes minutes,
 not an hour).
 
@@ -108,8 +109,9 @@ PC can build it from what you own.
 - **A warning about the image's size or MD5** — your combined image was made
   from a different disc version (e.g. PAL or GT2 Plus). Only the regular
   NTSC-U discs are supported right now.
-- **The game starts but runs poorly at first** — expected; see above. Play a
-  couple of sessions or let the second window of `Play GT2.cmd` finish.
+- **The game starts but runs poorly at first** — expected; see above. It
+  speeds up over the first few sessions (or run `tools\compile_cache.ps1`
+  once with the game closed to convert everything in one go).
 - More details: [docs/BUILDING.md](docs/BUILDING.md#troubleshooting).
 
 </details>
@@ -140,8 +142,8 @@ Your game folder ends up looking like this:
 
 ```
 GT2\
-  Gran Turismo 2 Recompiled.exe     built by you
-  Play GT2.cmd                      launcher (game + cache top-up)
+  Gran Turismo 2 Recompiled.exe     built by you - this is the game, launch it
+  Play GT2.cmd                      optional wrapper (game + full cache top-up on exit)
   Setup GT2.cmd, setup_and_build.ps1, local_build.sh   rebuild / update
   Gran Turismo 2 Combined.bin/.cue  your disc image
   game.toml                         runtime config (safe to edit)

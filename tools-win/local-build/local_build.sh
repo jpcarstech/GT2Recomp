@@ -224,7 +224,7 @@ if [ ! -f "$TK/tcc/tcc.exe" ]; then
 fi
 echo
 echo "DONE. 'Gran Turismo 2 Recompiled.exe' is installed in: $GAME_DIR"
-echo "Start it with 'Play GT2.cmd' (launches the game, then compiles newly seen code)."
+echo "Double-click 'Gran Turismo 2 Recompiled.exe' to play."
 
 # ---- optional: retail-geometry TEST exe (developer A/B) ----------------------
 # GT2_RETAIL_TEST=1 builds the SAME tree with -DPSX_EXPANDED_RAM=OFF into a

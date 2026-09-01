@@ -48,6 +48,9 @@ GT2 Combined Disc (see the README). No game code is distributed.
 ### Runtime / launcher
 - Save states (F7), rewind (F8), turbo (Tab), fast boot, performance overlay,
   controller/keyboard rebinding, memory cards as `.mcd`.
+- Launching the exe directly is the whole player flow: the runtime finds the
+  MSYS2 gcc itself and finishes the native-code backlog in a detached
+  background process after you quit (no wrapper script needed).
 - Starvation watchdog no longer kills the boot-time BIOS memory-card load.
 
 ### Framework

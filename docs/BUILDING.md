@@ -86,12 +86,14 @@ Optional: `GT2_RETAIL_TEST=1` additionally builds a retail-memory-map exe into
 
 ## Running the game
 
-`Play GT2.cmd` → `tools\play_gt2.ps1`: starts the exe with the MSYS2 gcc on
-`PATH` (so background compiles use gcc), waits for it to exit, then runs
-`tools\compile_cache.ps1` to compile that session's newly captured code with
-all cores. Launching the exe directly also works — the runtime compiles in
-the background with a lighter job count, and falls back to TinyCC if no gcc is
-found.
+Launch `Gran Turismo 2 Recompiled.exe` directly — that's the player flow.
+The runtime finds the MSYS2 gcc itself (appended to its own PATH when nothing
+else resolves), compiles newly captured code in the background while you play,
+and on exit hands the remaining backlog to a detached low-priority finisher
+(log: `compile_cache.txt`; disable with `PSX_OVERLAY_EXIT_COMPILE=0`).
+`Play GT2.cmd` remains as an optional wrapper that runs the full-backlog
+`tools\compile_cache.ps1` in the foreground after you quit; TinyCC is the
+fallback compiler when no gcc exists at all.
 
 First launch opens the launcher: renderer, internal scale, display scaling,
 Crop FMVs, texture filtering, controller setup, BIOS choice, and the

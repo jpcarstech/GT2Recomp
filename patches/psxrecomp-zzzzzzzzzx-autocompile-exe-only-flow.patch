@@ -1,0 +1,260 @@
+From 8eacc14238df745d83b3eebe0a6f85c92f90d694 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 1 Sep 2026 20:09:22 +0000
+Subject: [PATCH] autocompile: plain double-click of the exe is enough (MSYS2
+ gcc discovery + exit finisher)
+
+Two behaviors only the Play GT2.cmd wrapper provided move into the runtime.
+autocompile_toolchain_available() now appends the fixed MSYS2 MinGW bin dir
+to the process PATH (never prepending) when no compiler resolves and gcc.exe
+exists there, so the spawned compile tree uses the real gcc from a bare
+double-click. And a clean shutdown spawns ONE detached copy of the compile
+command after the captures file is written - hidden window, below-normal
+priority, log appended to compile_cache.txt, pid lockfile so the next
+session's in-game compile defers while it runs - so hot-region shards that
+outlast a play session finally complete instead of restarting from scratch
+every session. PSX_OVERLAY_EXIT_COMPILE=0 disables.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NxMCZTBx1i7VUd7SkdD9Sx
+---
+ runtime/include/autocompile.h |   8 ++
+ runtime/src/autocompile.c     | 172 +++++++++++++++++++++++++++++++++-
+ runtime/src/main.cpp          |   4 +
+ 3 files changed, 181 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/include/autocompile.h b/runtime/include/autocompile.h
+index 0db386ec..015c962c 100644
+--- a/runtime/include/autocompile.h
++++ b/runtime/include/autocompile.h
+@@ -44,6 +44,14 @@ int  autocompile_request(void);
+  * Must be called from the same thread that owns the overlay loader. */
+ void autocompile_poll_main(void);
+ 
++/* Clean-exit hand-off (Windows): spawn ONE detached copy of the configured
++ * compile command so the pending capture backlog finishes AFTER the game
++ * closes (hidden window, below-normal priority, log appended to
++ * compile_cache.txt, pid lockfile guards the next session). Call after the
++ * captures file has been written. No-op elsewhere / when disabled via
++ * PSX_OVERLAY_EXIT_COMPILE=0. */
++void autocompile_spawn_exit_finisher(void);
++
+ /* Process-shutdown teardown, emu thread only: stops the publication pipeline,
+  * kills the compiler process tree (job object), and JOINS the watcher and
+  * preparer threads — waiting out any in-flight LoadLibrary rather than
+diff --git a/runtime/src/autocompile.c b/runtime/src/autocompile.c
+index a9b2a79e..50bf85dd 100644
+--- a/runtime/src/autocompile.c
++++ b/runtime/src/autocompile.c
+@@ -782,9 +782,7 @@ int autocompile_busy(void)       { return ac_state_load() != AC_IDLE; }
+  * overlay_autocompile_cmd, so it can't tell a dev box from a toolchain-less
+  * player. This opens each candidate exe in each PATH dir — the actual "can we
+  * compile a shard" signal. Memoized (PATH doesn't change mid-run). */
+-int autocompile_toolchain_available(void) {
+-    static int s_cached = -1;
+-    if (s_cached >= 0) return s_cached;
++static int autocompile_probe_path_compiler(void) {
+     const char *path = getenv("PATH");
+     int found = 0;
+     if (path && *path) {
+@@ -811,14 +809,182 @@ int autocompile_toolchain_available(void) {
+             p = e + 1;
+         }
+     }
++    return found;
++}
++
++int autocompile_toolchain_available(void) {
++    static int s_cached = -1;
++    if (s_cached >= 0) return s_cached;
++    int found = autocompile_probe_path_compiler();
++#ifdef _WIN32
++    if (!found) {
++        /* Player boxes built by setup_and_build.ps1 carry the MinGW toolchain
++         * at the fixed MSYS2 install location but not on the user PATH, so a
++         * plain double-click of the exe used to fall back to TinyCC (or need
++         * the Play GT2.cmd wrapper). Append it - never prepend: nothing that
++         * already resolves may be shadowed - so the spawned compile tree
++         * (which inherits this process env) can use the real gcc. */
++        static const char kMingwBin[] = "C:\\msys64\\mingw64\\bin";
++        char probe[MAX_PATH];
++        snprintf(probe, sizeof probe, "%s\\gcc.exe", kMingwBin);
++        if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
++            const char *cur = getenv("PATH");
++            size_t need = (cur ? strlen(cur) : 0) + sizeof(kMingwBin) + 2;
++            char *np = (char *)malloc(need);
++            if (np) {
++                snprintf(np, need, "%s%s%s", cur ? cur : "",
++                         (cur && *cur) ? ";" : "", kMingwBin);
++                _putenv_s("PATH", np);   /* CRT + Win32 env; children inherit */
++                free(np);
++                found = autocompile_probe_path_compiler();
++                if (found)
++                    fprintf(stdout, "psxrecomp: overlay compile: using gcc "
++                                    "from %s (appended to PATH)\n", kMingwBin);
++            }
++        }
++    }
++#endif
+     s_cached = found;
+     return found;
+ }
+ 
++#ifdef _WIN32
++/* ---- exit finisher ---------------------------------------------------------
++ * The in-game background compile is killed the moment the player quits (the
++ * kill-on-close job), so a hot-region shard that outlasts a session restarted
++ * from scratch every time and never went native - the reason the Play GT2.cmd
++ * wrapper existed. Instead, a clean shutdown now spawns ONE detached copy of
++ * the same compile command (no job object, below-normal priority, hidden
++ * window, output appended to compile_cache.txt beside the captures file) and
++ * lets it run to completion after the game closes. A pid lockfile beside the
++ * captures file keeps the next game session's in-game compile - and the next
++ * exit - from competing with a finisher that is still running; the compile
++ * itself is per-shard idempotent, so worst-case overlap only wastes CPU.
++ * PSX_OVERLAY_EXIT_COMPILE=0 disables. */
++static void finisher_sibling_path(char *dst, size_t cap, const char *name) {
++    dst[0] = '\0';
++    const char *base = s_captures[0] ? s_captures : NULL;
++    if (base) {
++        const char *sl = strrchr(base, '\\');
++        const char *sl2 = strrchr(base, '/');
++        if (sl2 > sl) sl = sl2;
++        if (sl) {
++            snprintf(dst, cap, "%.*s%s", (int)(sl - base + 1), base, name);
++            return;
++        }
++    }
++    if (s_cwd[0]) snprintf(dst, cap, "%s\\%s", s_cwd, name);
++    else snprintf(dst, cap, "%s", name);
++}
++
++static int autocompile_finisher_active(void) {
++    char lock[600];
++    finisher_sibling_path(lock, sizeof lock, "cache_finisher.lock");
++    if (!lock[0]) return 0;
++    FILE *f = fopen(lock, "rb");
++    if (!f) return 0;
++    char buf[32] = {0};
++    fread(buf, 1, sizeof buf - 1, f);
++    fclose(f);
++    DWORD pid = (DWORD)strtoul(buf, NULL, 10);
++    if (pid) {
++        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++        if (h) {
++            DWORD code = 0;
++            int alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
++            CloseHandle(h);
++            if (alive) return 1;
++        }
++    }
++    DeleteFileA(lock);   /* stale */
++    return 0;
++}
++#endif
++
++void autocompile_spawn_exit_finisher(void) {
++#ifdef _WIN32
++    const char *dis = getenv("PSX_OVERLAY_EXIT_COMPILE");
++    if (dis && dis[0] == '0') return;
++    if (!s_cmd[0]) return;
++    if (!s_captures[0] ||
++        GetFileAttributesA(s_captures) == INVALID_FILE_ATTRIBUTES) return;
++    if (autocompile_finisher_active()) return;
++    /* Same pinned environment as the live spawn (see autocompile_request). */
++    if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
++    if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
++    SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
++    {
++        char flavor_buf[16];
++        snprintf(flavor_buf, sizeof flavor_buf, "%d", (int)PSX_OVERLAY_FLAVOR);
++        SetEnvironmentVariableA("PSX_OVERLAY_FLAVOR", flavor_buf);
++    }
++    (void)autocompile_toolchain_available();   /* PATH augmentation for gcc */
++    char logp[600];
++    finisher_sibling_path(logp, sizeof logp, "compile_cache.txt");
++    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
++    HANDLE log = CreateFileA(logp, FILE_APPEND_DATA,
++                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
++                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    char full[4200];
++    snprintf(full, sizeof(full), "cmd.exe /C \"%s\"", s_cmd);
++    STARTUPINFOA si;
++    memset(&si, 0, sizeof(si));
++    si.cb = sizeof(si);
++    if (log != INVALID_HANDLE_VALUE) {
++        si.dwFlags = STARTF_USESTDHANDLES;
++        si.hStdOutput = log;
++        si.hStdError  = log;
++    }
++    PROCESS_INFORMATION pi;
++    memset(&pi, 0, sizeof(pi));
++    DWORD flags = CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS;
++    /* If this process runs inside a kill-on-close job (a launcher wrapper),
++     * the finisher must break away or it dies with us; retry without the flag
++     * where breakaway is not permitted. */
++    BOOL ok = CreateProcessA(NULL, full, NULL, NULL,
++                             log != INVALID_HANDLE_VALUE,
++                             flags | CREATE_BREAKAWAY_FROM_JOB,
++                             NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
++    if (!ok)
++        ok = CreateProcessA(NULL, full, NULL, NULL,
++                            log != INVALID_HANDLE_VALUE, flags,
++                            NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
++    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
++    if (!ok) return;
++    char lock[600];
++    finisher_sibling_path(lock, sizeof lock, "cache_finisher.lock");
++    if (lock[0]) {
++        FILE *lf = fopen(lock, "wb");
++        if (lf) { fprintf(lf, "%lu", (unsigned long)pi.dwProcessId); fclose(lf); }
++    }
++    fprintf(stdout, "psxrecomp: overlay compile: finishing the pending "
++                    "native-code backlog in the background (pid %lu; log: "
++                    "compile_cache.txt)\n", (unsigned long)pi.dwProcessId);
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++#endif
++}
++
+ int autocompile_request(void) {
+     /* DONE owns an unconsumed cache rescan/result. Only the emulation-thread
+      * poll may return it to IDLE; never overwrite it with another child. */
+     if (!autocompile_configured() || ac_state_load() != AC_IDLE) return 0;
++#ifdef _WIN32
++    /* A finisher from the previous session still owns the cache dir. */
++    {
++        static int s_deferred_logged = 0;
++        if (autocompile_finisher_active()) {
++            if (!s_deferred_logged) {
++                s_deferred_logged = 1;
++                fprintf(stdout, "psxrecomp: overlay compile deferred - the "
++                                "previous session's cache finisher is still "
++                                "running\n");
++            }
++            return 0;
++        }
++        s_deferred_logged = 0;
++    }
++#endif
+     if (s_retry_not_before_ms &&
+         autocompile_now_ms() < s_retry_not_before_ms) return 0;
+ #ifdef _WIN32
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 677e75bc..fbed82a7 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -3147,6 +3147,10 @@ static void shutdown_runtime(void) {
+     overlay_autocapture_shutdown();
+     overlay_capture_wait_pending();
+     overlay_capture_write_json();
++    /* The captures file is final for this session - hand the backlog to a
++     * detached finisher so hot-region shards that outlast a play session
++     * still complete (no wrapper script needed; see autocompile.h). */
++    autocompile_spawn_exit_finisher();
+     if (sdl_audio_device) {
+         psx_sdl_audio_clear(sdl_audio_device);
+         psx_sdl_audio_close(sdl_audio_device);   /* stops the pull callback */
+-- 
+2.43.0
+

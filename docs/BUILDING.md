@@ -1,9 +1,9 @@
 # Building GT2Recomp
 
-The short version is in the [README](../README.md#building-and-installing-windows):
-put your GT2 Combined Disc image in a folder, clone this repo into it as
-`GT2Recomp-src`, run `setup_and_build.ps1`. This page is the long version —
-what each step does, how to run it by hand, and how to build on Linux.
+The player version is in the [README](../README.md#how-to-install-no-technical-knowledge-needed):
+unzip `GT2Recomp-setup.zip` next to your GT2 Combined Disc image and
+double-click `Setup GT2.cmd`. This page is the long version — what each step
+does, how to run it by hand, and how to build on Linux.
 
 ## Inputs you provide
 

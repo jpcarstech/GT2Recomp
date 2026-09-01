@@ -8,24 +8,43 @@ tmp=$(mktemp -d)
 cp "tools-win/local-build/Setup GT2.cmd" tools-win/local-build/setup_and_build.ps1 \
    tools-win/local-build/local_build.sh tools-win/extract_gt2_exe.ps1 "$tmp/"
 cat > "$tmp/README.txt" <<'TXT'
-GT2Recomp setup - Gran Turismo 2 recompiled for PC
-===================================================
+GRAN TURISMO 2 ON YOUR PC - SETUP
+==================================
 
-1. Build the GT2 Combined Disc from your own Arcade + Simulation disc dumps:
-   https://github.com/CookiePLMonster/GT2-Combined-Disc
-2. Put these files in the same folder as the image, e.g.
-   D:\Gran Turismo 2 Recompilation\
-       Gran Turismo 2 Combined.bin   (+ .cue)
-       scph1001.bin                  (optional: your own BIOS dump)
-       Setup GT2.cmd, setup_and_build.ps1, local_build.sh, extract_gt2_exe.ps1
-3. Double-click "Setup GT2.cmd". First run: installs the build tools (MSYS2,
-   via winget), fetches the source from GitHub, extracts the boot EXE from
-   your image and recompiles the game. 30-60 minutes; ~6 GB RAM, ~15 GB disk.
-4. Play with "Play GT2.cmd" (created by the build). The launcher opens on
-   first start: pick controller, resolution, renderer and patches.
+What you need: a Windows 10/11 PC, ~15 GB free space, internet, and your own
+GT2 discs (both: Arcade and Simulation) saved as .bin + .cue files.
 
-Re-run "Setup GT2.cmd" any time to update to the latest version (minutes).
-Full docs: https://github.com/jpcarstech/GT2Recomp
+STEP 1 - Combine your two discs into one game image (~15 minutes)
+  a. Install Python from python.org/downloads
+     (tick "Add python.exe to PATH" in its installer).
+  b. Download Silent's Combined Disc tool:
+     github.com/CookiePLMonster/GT2-Combined-Disc/releases/latest
+  c. Unzip it, double-click setup.py, pick your two disc images, wait.
+  d. You get a new ~1 GB game image (plus a small .cue). Keep those two.
+
+STEP 2 - Make a game folder
+  Create a folder anywhere (e.g. C:\Games\GT2) and put the combined image
+  (.bin and .cue) from Step 1 in it, together with the five files from this
+  zip (you probably already did that).
+
+STEP 3 - Double-click "Setup GT2.cmd"  (30-60 minutes, all automatic)
+  - If Windows asks to allow changes, click Yes (build tools installing).
+  - If it offers to rename your game image, press Enter.
+  - Leave the black window alone until it prints DONE.
+
+PLAY: double-click "Play GT2.cmd". The first start opens a settings window -
+plug in your controller, pick resolution and patches (widescreen, 60 FPS...),
+hit Play. In game: F1 = graphics menu, F7 = save states, F8 = rewind.
+
+Good to know:
+  - The game gets FASTER over your first few sessions (it converts more of
+    itself to PC code each time you quit - that's the second window).
+  - Re-run "Setup GT2.cmd" any time to update (minutes, not an hour).
+  - Nothing is uploaded anywhere; everything is built from your own discs.
+  - Optional: put your own PS1 BIOS dump (scph1001.bin) in the folder before
+    setup. Not required - a free BIOS is included.
+
+Problems? github.com/jpcarstech/GT2Recomp - full guide + report an issue.
 TXT
 rm -f "$out"
 out="$(realpath -m "$out")"

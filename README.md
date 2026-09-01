@@ -41,77 +41,105 @@ your discs.
 Tested on Windows 11 x64. The Linux build compiles from the same tree (Steam
 Deck is planned, not yet packaged).
 
-## Before you start: build the GT2 Combined Disc
+## How to install (no technical knowledge needed)
 
-This port is built from **Silent's GT2 Combined Disc** — the Arcade and
-Simulation discs merged into one image with a menu to switch modes. You make
-that image yourself from your two dumps; it takes a few minutes.
+**What you need:** a Windows 10 or 11 PC (64-bit), about 15 GB of free space,
+an internet connection, and your own *Gran Turismo 2* discs — both of them,
+Arcade and Simulation — saved on your PC as `.bin` + `.cue` files. Setup takes
+about an hour, almost all of it waiting.
 
-1. Dump both of your *Gran Turismo 2* discs (Arcade and Simulation) to
-   `.bin`/`.cue`. Any release works except NTSC-J v1.0; this port has been
-   verified with the NTSC-U base (Simulation disc SCUS-94488).
-2. Follow the instructions in
-   [CookiePLMonster/GT2-Combined-Disc](https://github.com/CookiePLMonster/GT2-Combined-Disc)
-   (Python 3.8+; run `setup.py`, point it at the two images, wait for the
-   repack). Take the **full** output with FMVs, not the "lite" burnable one.
-3. Name the result `Gran Turismo 2 Combined.bin` (+ `.cue`). The build script
-   offers to rename a single large `.bin` for you and rewrites the `.cue` if
-   it points at another file name.
+### Step 1 — Combine your two discs into one game image (~15 min)
 
-The image this project was built from is 1,033,459,392 bytes,
-MD5 `70ecd6e788501eb69a220d2a96e624c4` (NTSC-U 1.1 Simulation base, boot EXE
-`SCUS_944.88`). The build checks this and warns if yours differs — a different
-base (GT2 Plus, PAL) has a different boot EXE and would need its own function
-seeds.
+GT2 shipped on two discs. This port uses the fan-made **Combined Disc**, which
+merges them into one game with both modes on the menu. You make it yourself:
 
-## Quick start (players)
+1. Install Python from [python.org/downloads](https://www.python.org/downloads/)
+   (run the installer, tick **"Add python.exe to PATH"**, click Install).
+2. Download Silent's Combined Disc tool from
+   [its download page](https://github.com/CookiePLMonster/GT2-Combined-Disc/releases/latest)
+   and unzip it anywhere.
+3. Double-click **`setup.py`** in the unzipped folder. It asks you to pick your
+   two disc images, then works for a few minutes.
+4. You end up with a new game image of about **1 GB** (plus a small `.cue`
+   file). That's the one this port uses — keep it, you can delete the rest.
 
-1. Build your GT2 Combined Disc (previous section) and put it in a folder of
-   its own, e.g. `D:\Gran Turismo 2 Recompilation\` — `Gran Turismo 2 Combined.bin`
-   + `.cue`, and optionally your BIOS dump as `scph1001.bin`.
-2. Download **`GT2Recomp-setup.zip`** from the
-   [latest release](https://github.com/jpcarstech/GT2Recomp/releases/latest)
-   and unzip its five files into that same folder.
-3. Double-click **`Setup GT2.cmd`**. It installs the build tools (MSYS2 via
-   winget), fetches this repository, extracts the boot EXE from your image and
-   recompiles the game — 30–60 minutes the first time, ~6 GB RAM, ~15 GB disk.
-4. Play with **`Play GT2.cmd`**. Re-run `Setup GT2.cmd` any time to update.
+### Step 2 — Make a game folder
 
-Nothing is downloaded that contains game code: the recompilation happens on
-your machine from your own disc.
+Create a new folder anywhere you like, for example `C:\Games\GT2`, and put the
+combined game image from Step 1 in it (the big `.bin` and its `.cue`).
 
-## Building and installing (Windows, from a checkout)
+### Step 3 — Run the installer (30–60 min, all automatic)
 
-Requirements: Windows 10/11 x64, ~6 GB free RAM during the build, ~15 GB of
-disk, Git for Windows (or any `git`), and about an hour the first time. The
-script installs MSYS2 and the MinGW-w64 toolchain for you with `winget`.
+1. Download **`GT2Recomp-setup.zip`** from the
+   [latest release](https://github.com/jpcarstech/GT2Recomp/releases/latest).
+2. Open the zip and drag its five files into your game folder from Step 2.
+3. Double-click **`Setup GT2.cmd`**. A black window opens and starts working.
+   - If Windows asks *"Do you want to allow this app to make changes?"*, click
+     **Yes** — that's the free build tools installing.
+   - If it offers to rename your game image, press **Enter** to accept.
+   - Leave the window alone until it prints **DONE**, then close it.
 
-1. Make a game folder, e.g. `D:\Gran Turismo 2 Recompilation`, and put
-   `Gran Turismo 2 Combined.bin` / `.cue` in it. Optionally add your own BIOS
-   dump as `scph1001.bin` (the bundled OpenBIOS works without it).
-2. Clone this repository **into that folder** as `GT2Recomp-src`:
-   ```
-   cd "D:\Gran Turismo 2 Recompilation"
-   git clone https://github.com/jpcarstech/GT2Recomp.git GT2Recomp-src
-   ```
-   (No `--recursive` needed; the build fetches the pinned submodules itself.)
-3. Double-click `GT2Recomp-src\tools-win\local-build\Setup GT2.cmd` (or run
-   `setup_and_build.ps1` there with PowerShell).
-   It verifies the disc image, extracts the boot EXE into `extracted\`,
-   installs the toolchain, applies the framework patches, recompiles the game
-   (the long step) and installs everything into the game folder.
-4. Play with **`Play GT2.cmd`** in the game folder. It starts the game and,
-   when you quit, compiles whatever new code that session captured so the next
-   launch runs more of the game natively. The first launch opens the launcher:
-   pick your controller, resolution, renderer and patches there.
+### Play
 
-To update later: `git pull` inside `GT2Recomp-src` and run
-`setup_and_build.ps1` again (incremental; minutes, not an hour).
+Double-click **`Play GT2.cmd`** in your game folder. The first start opens a
+settings window — plug in your controller, pick your resolution and any
+patches (widescreen, 60 FPS...), and hit Play. In the game, **F1** opens the
+graphics menu, **F7** save states, **F8** rewinds.
+
+Two good things to know: the game keeps getting *faster* over your first few
+play sessions (it converts more of the game to native PC code each time you
+quit — that's the second window `Play GT2.cmd` opens), and you can re-run
+`Setup GT2.cmd` any time to update to the newest version (that takes minutes,
+not an hour).
+
+Nothing about your discs or game is ever uploaded anywhere: the conversion
+happens entirely on your PC, from your own discs. That is also why there is no
+plain download of the finished game — it legally can't be handed out, but your
+PC can build it from what you own.
+
+<details>
+<summary><b>If something goes wrong</b></summary>
+
+- **The black window closes instantly or shows red text** — run
+  `Setup GT2.cmd` again; if it repeats, take a photo/screenshot of the text
+  and [open an issue](https://github.com/jpcarstech/GT2Recomp/issues).
+- **"Could not find 'Gran Turismo 2 Combined.bin'"** — the five zip files and
+  your game image are not in the same folder.
+- **A warning about the image's size or MD5** — your combined image was made
+  from a different disc version (e.g. PAL or GT2 Plus). Only the regular
+  NTSC-U discs are supported right now.
+- **The game starts but runs poorly at first** — expected; see above. Play a
+  couple of sessions or let the second window of `Play GT2.cmd` finish.
+- More details: [docs/BUILDING.md](docs/BUILDING.md#troubleshooting).
+
+</details>
+
+## For developers
+
+<details>
+<summary><b>Disc image details, building from a checkout, Linux</b></summary>
+
+The base image is Silent's **GT2 Combined Disc** (any GT2 release except
+NTSC-J v1.0 can build it; this port is verified against the NTSC-U base,
+Simulation disc SCUS-94488). The image this project was built from is
+1,033,459,392 bytes, MD5 `70ecd6e788501eb69a220d2a96e624c4` (boot EXE
+`SCUS_944.88`). `setup_and_build.ps1` checks size and MD5 and warns on a
+mismatch — a different base image has a different boot EXE and would need its
+own function seeds.
+
+To build from a checkout instead of the setup zip: clone this repository into
+the game folder as `GT2Recomp-src` (no `--recursive`; the build fetches the
+pinned submodules itself) and double-click
+`GT2Recomp-src\tools-win\local-build\Setup GT2.cmd`. Update later with
+`git pull` + the same script (incremental, minutes). The build verifies the
+disc image, extracts the boot EXE into `extracted\`, installs the MSYS2
+toolchain, applies the framework patches, recompiles the game and installs
+everything into the game folder.
 
 Your game folder ends up looking like this:
 
 ```
-Gran Turismo 2 Recompilation\
+GT2\
   Gran Turismo 2 Recompiled.exe     built by you
   Play GT2.cmd                      launcher (game + cache top-up)
   Setup GT2.cmd, setup_and_build.ps1, local_build.sh   rebuild / update
@@ -119,17 +147,24 @@ Gran Turismo 2 Recompilation\
   game.toml                         runtime config (safe to edit)
   settings.toml, input.ini, keybinds.ini   launcher settings
   extracted\SCUS_944.88             boot EXE, extracted from your disc
-  bios\                             openbios.bin (bundled) + your scph1001.bin
+  bios\                             openbios.bin (bundled free BIOS) + optionally your scph1001.bin
   patches\                          the enhancement packages + their enable state
   saves\                            memory cards (card1.mcd / card2.mcd)
   cache\, overlay_captures.json     native-code cache built from your play
   overlay_toolchain\                the background compiler
   tools\                            helper scripts
-  GT2Recomp-src\                    this repository
+  GT2Recomp-src\                    this repository (checkout flow)
 ```
 
-Details, the Linux command line, and what each step does are in
-[`docs/BUILDING.md`](docs/BUILDING.md).
+A retail BIOS is never required or distributed: the bundled
+[OpenBIOS](https://github.com/grumpycoders/pcsx-redux) (free, clean-room)
+is the default; a personal `scph1001.bin` dump placed in the game folder
+becomes selectable in the launcher.
+
+The full walk-through of every build step, the Linux build, and
+troubleshooting live in [`docs/BUILDING.md`](docs/BUILDING.md).
+
+</details>
 
 ## Playing
 

@@ -8,7 +8,7 @@ correction. **No game data lives in this repository or its downloads.**
 
 ## Install
 
-**You need:** a Windows 10/11 PC (64-bit), ~15 GB free space, internet, and
+**You need:** a Windows 10/11 PC (64-bit), and
 the **GT2 Combined Disc** — the fan-made image that merges your own Arcade and
 Simulation disc dumps into one game. Make it first by following the
 instructions at

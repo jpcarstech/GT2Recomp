@@ -174,7 +174,7 @@ mkdir -p "$GAME_DIR/patches"
 cp -rf build/mods/. "$GAME_DIR/patches/"
 # Player-facing scripts: launchers at the game root, helpers in tools/.
 mkdir -p "$GAME_DIR/tools"
-for s in setup_and_build.ps1 "Play GT2.cmd"; do
+for s in setup_and_build.ps1 "Setup GT2.cmd" "Play GT2.cmd"; do
     cp -f "$SRC/tools-win/local-build/$s" "$GAME_DIR/$s"
 done
 for s in play_gt2.ps1 compile_cache.ps1 run_logged.ps1 organize_game_folder.ps1 \

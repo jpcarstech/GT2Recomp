@@ -64,7 +64,23 @@ MD5 `70ecd6e788501eb69a220d2a96e624c4` (NTSC-U 1.1 Simulation base, boot EXE
 base (GT2 Plus, PAL) has a different boot EXE and would need its own function
 seeds.
 
-## Building and installing (Windows)
+## Quick start (players)
+
+1. Build your GT2 Combined Disc (previous section) and put it in a folder of
+   its own, e.g. `D:\Gran Turismo 2 Recompilation\` — `Gran Turismo 2 Combined.bin`
+   + `.cue`, and optionally your BIOS dump as `scph1001.bin`.
+2. Download **`GT2Recomp-setup.zip`** from the
+   [latest release](https://github.com/jpcarstech/GT2Recomp/releases/latest)
+   and unzip its five files into that same folder.
+3. Double-click **`Setup GT2.cmd`**. It installs the build tools (MSYS2 via
+   winget), fetches this repository, extracts the boot EXE from your image and
+   recompiles the game — 30–60 minutes the first time, ~6 GB RAM, ~15 GB disk.
+4. Play with **`Play GT2.cmd`**. Re-run `Setup GT2.cmd` any time to update.
+
+Nothing is downloaded that contains game code: the recompilation happens on
+your machine from your own disc.
+
+## Building and installing (Windows, from a checkout)
 
 Requirements: Windows 10/11 x64, ~6 GB free RAM during the build, ~15 GB of
 disk, Git for Windows (or any `git`), and about an hour the first time. The
@@ -79,9 +95,8 @@ script installs MSYS2 and the MinGW-w64 toolchain for you with `winget`.
    git clone https://github.com/jpcarstech/GT2Recomp.git GT2Recomp-src
    ```
    (No `--recursive` needed; the build fetches the pinned submodules itself.)
-3. Right-click `GT2Recomp-src\tools-win\local-build\setup_and_build.ps1` →
-   **Run with PowerShell** (or from a terminal:
-   `powershell -ExecutionPolicy Bypass -File .\GT2Recomp-src\tools-win\local-build\setup_and_build.ps1`).
+3. Double-click `GT2Recomp-src\tools-win\local-build\Setup GT2.cmd` (or run
+   `setup_and_build.ps1` there with PowerShell).
    It verifies the disc image, extracts the boot EXE into `extracted\`,
    installs the toolchain, applies the framework patches, recompiles the game
    (the long step) and installs everything into the game folder.
@@ -99,7 +114,7 @@ Your game folder ends up looking like this:
 Gran Turismo 2 Recompilation\
   Gran Turismo 2 Recompiled.exe     built by you
   Play GT2.cmd                      launcher (game + cache top-up)
-  setup_and_build.ps1               rebuild / update
+  Setup GT2.cmd, setup_and_build.ps1, local_build.sh   rebuild / update
   Gran Turismo 2 Combined.bin/.cue  your disc image
   game.toml                         runtime config (safe to edit)
   settings.toml, input.ini, keybinds.ini   launcher settings

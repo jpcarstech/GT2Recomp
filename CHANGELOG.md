@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.1 — quit-hang fix (2026-09-01)
+
+- **Fixed: the game hung on quit (Esc Esc).** The background finisher that
+  converts remaining game code after you exit was spawned inheriting every
+  inheritable handle — including the debug server's listening socket (Windows
+  sockets are inheritable by default) — so shutdown's `closesocket` never took
+  effect, its `accept()` never unblocked, and the quit joined forever. The
+  finisher now inherits nothing (cmd's own `>>` redirection writes its log)
+  and is spawned as the very last step of shutdown, after all sockets are
+  closed.
+- Docs: front-page README rewritten to a brief install/play/help sheet; the
+  GT2 Combined Disc steps are a link to that project instead of a restated
+  copy; this file is the detailed dev changelog.
+
 ## 0.1.0 — first public release (2026-09-01)
 
 Source release: build it yourself with `setup_and_build.ps1` from your own

@@ -15,12 +15,9 @@ What you need: a Windows 10/11 PC, ~15 GB free space, internet, and your own
 GT2 discs (both: Arcade and Simulation) saved as .bin + .cue files.
 
 STEP 1 - Combine your two discs into one game image (~15 minutes)
-  a. Install Python from python.org/downloads
-     (tick "Add python.exe to PATH" in its installer).
-  b. Download Silent's Combined Disc tool:
-     github.com/CookiePLMonster/GT2-Combined-Disc/releases/latest
-  c. Unzip it, double-click setup.py, pick your two disc images, wait.
-  d. You get a new ~1 GB game image (plus a small .cue). Keep those two.
+  Follow the instructions at github.com/CookiePLMonster/GT2-Combined-Disc
+  to merge your two disc images. You get a new ~1 GB game image (plus a
+  small .cue). Keep those two.
 
 STEP 2 - Make a game folder
   Create a folder anywhere (e.g. C:\Games\GT2) and put the combined image

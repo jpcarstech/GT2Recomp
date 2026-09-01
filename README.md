@@ -51,17 +51,11 @@ about an hour, almost all of it waiting.
 ### Step 1 — Combine your two discs into one game image (~15 min)
 
 GT2 shipped on two discs. This port uses the fan-made **Combined Disc**, which
-merges them into one game with both modes on the menu. You make it yourself:
-
-1. Install Python from [python.org/downloads](https://www.python.org/downloads/)
-   (run the installer, tick **"Add python.exe to PATH"**, click Install).
-2. Download Silent's Combined Disc tool from
-   [its download page](https://github.com/CookiePLMonster/GT2-Combined-Disc/releases/latest)
-   and unzip it anywhere.
-3. Double-click **`setup.py`** in the unzipped folder. It asks you to pick your
-   two disc images, then works for a few minutes.
-4. You end up with a new game image of about **1 GB** (plus a small `.cue`
-   file). That's the one this port uses — keep it, you can delete the rest.
+merges them into one game with both modes on the menu. You make it yourself
+from your two disc images by following the instructions at
+[CookiePLMonster/GT2-Combined-Disc](https://github.com/CookiePLMonster/GT2-Combined-Disc).
+You end up with a new game image of about **1 GB** (plus a small `.cue`
+file) — that's the one this port uses.
 
 ### Step 2 — Make a game folder
 

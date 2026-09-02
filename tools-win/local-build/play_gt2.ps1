@@ -25,6 +25,16 @@ if ((Test-Path "$mingw\gcc.exe") -and ($env:Path -notlike "*$mingw*")) { $env:Pa
 Write-Host "Starting Gran Turismo 2..."
 $p = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru
 $p.WaitForExit()
+# Multi-disc installs: the root exe is a tiny chooser that exits as soon as
+# it has started the actual disc build (titles\<name>\GT2 <Disc>.exe) — and a
+# disc switch starts ANOTHER one. Keep waiting while any disc is running.
+Start-Sleep -Seconds 3
+while ($true) {
+    $g = Get-Process -ErrorAction SilentlyContinue |
+         Where-Object { $_.ProcessName -like 'GT2 *' }
+    if (-not $g) { break }
+    Start-Sleep -Seconds 2
+}
 
 Write-Host ""
 Write-Host "Game closed - topping up the native-code cache (safe to minimize this window)."

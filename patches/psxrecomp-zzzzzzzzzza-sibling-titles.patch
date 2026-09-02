@@ -1,0 +1,580 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 68d5ed9b..e4159051 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -376,6 +376,17 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         rt.settings_path = fs::absolute(root / rel);
+         rt.has_settings_path = true;
+     }
++    if (runtime.contains("title_label")) {
++        /* Multi-title installs: this build's short name in the Disc row.
++         * Also the opt-in for sibling-title discovery (config_loader.h). */
++        const auto label = toml::find<std::string>(runtime, "title_label");
++        if (label.empty()) {
++            throw std::runtime_error(
++                "[runtime] title_label must not be empty");
++        }
++        rt.title_label = label;
++        rt.has_title_label = true;
++    }
+     if (runtime.contains("disc_speed")) {
+         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+         rt.has_disc_speed = true;
+@@ -2527,6 +2538,10 @@ UserSettings load_user_settings(const fs::path& path) {
+         if (l.contains("skip_launcher")) try_get([&]{
+             s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
+         });
++        if (l.contains("active_title")) try_get([&]{
++            const auto v = toml::find<std::string>(l, "active_title");
++            if (!v.empty()) { s.active_title = v; s.has_active_title = true; }
++        });
+     }
+     if (doc.contains("netplay")) {
+         const toml::value& n = toml::find(doc, "netplay");
+@@ -2785,8 +2800,13 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+             f << "save_state_menu_pad = "
+               << s.hotkey_pad_save_state_menu << "\n";
+     }
+-    if (s.has_skip_launcher)
+-        f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
++    if (s.has_skip_launcher || (s.has_active_title && !s.active_title.empty())) {
++        f << "\n[launcher]\n";
++        if (s.has_skip_launcher)
++            f << "skip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
++        if (s.has_active_title && !s.active_title.empty())
++            f << "active_title = \"" << s.active_title << "\"\n";
++    }
+     if ((s.has_netplay_player_name && !s.netplay_player_name.empty()) ||
+         (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())) {
+         f << "\n[netplay]\n";
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index a786a46f..58794874 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -189,6 +189,14 @@ struct RuntimeConfig {
+     bool                  has_settings_path = false;
+     std::filesystem::path settings_path;
+ 
++    // title_label: short display name for this build in a multi-title
++    // install's "Disc" row (e.g. "Arcade"). Setting it also opts the title
++    // into sibling discovery: the runtime scans the exe dir's PARENT for
++    // other title folders (each a dir with its own game.toml carrying a
++    // title_label) and offers them in the launcher/F1 Disc rows.
++    bool                  has_title_label = false;
++    std::string           title_label;
++
+     // mods_dir: name of the mod-package directory next to the exe (default
+     // "mods"). Plain directory name only - resolved against the exe dir at
+     // runtime, so a port can name the folder after what its launcher calls
+@@ -1274,6 +1282,11 @@ struct UserSettings {
+     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
+     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
+     bool has_skip_launcher  = false; bool skip_launcher  = false;
++    // [launcher] active_title — folder name of the sibling title the player
++    // last switched to in a multi-title install (titles/<name>/). Read by the
++    // root stub exe to decide which title to spawn; written by the runtime
++    // when the player switches discs. Absent for single-title installs.
++    bool has_active_title   = false; std::string active_title;
+     // [netplay] — display name for lobby browser / room. Prompted once on first
+     // Netplay Lobbies visit; Change Player Name updates it.
+     bool has_netplay_player_name = false; std::string netplay_player_name;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index d01a555f..ce5d1fd9 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2206,6 +2206,204 @@ static std::filesystem::path settings_file_path(const char* argv0) {
+     return exe_dir_from_argv(argv0) / "settings.toml";
+ }
+ 
++/* ---- multi-title installs (sibling disc titles) ---------------------------
++ * A game sold across several discs can be installed as SIBLING BUILDS, one
++ * folder per recompiled title under a shared parent:
++ *   <install>/titles/arcade/     game.toml  <exe>  generated caches...
++ *   <install>/titles/simulation/ game.toml  <exe>  ...
++ * Each title's game.toml opts in with [runtime] title_label = "Arcade".
++ * At boot the runtime scans the exe dir's PARENT for such siblings and
++ * offers them in the launcher's "Disc" row; picking one relaunches into
++ * that title's exe. The choice is persisted as [launcher] active_title
++ * (the folder name) in the shared settings file so the install's root stub
++ * can spawn the right title next time. */
++struct SiblingTitle {
++    std::string dir_name;  /* folder name under the shared parent */
++    std::string label;     /* [runtime] title_label */
++    std::string exe;       /* absolute exe path ("" = not runnable) */
++};
++static std::vector<SiblingTitle> g_sibling_titles;   /* sorted by dir_name */
++static int g_sibling_active = -1;                    /* index of THIS build */
++static std::string g_sibling_argv0;                  /* argv[0] at discovery */
++/* Borrowed C views for RecompLauncherCGameInfo (outlive run_window). */
++static std::vector<const char*> g_sibling_label_ptrs;
++static std::vector<const char*> g_sibling_exe_ptrs;
++
++/* Cheap [runtime] title_label scan. Deliberately NOT load_game_config(): a
++ * sibling's config is foreign input, and a parse error there must never
++ * break THIS title's boot — an unreadable sibling is simply not offered. */
++static std::string scan_sibling_title_label(const std::filesystem::path& cfg) {
++    std::ifstream f(cfg);
++    if (!f) return {};
++    std::string line;
++    bool in_runtime = false;
++    while (std::getline(f, line)) {
++        size_t b = line.find_first_not_of(" \t");
++        if (b == std::string::npos) continue;
++        if (line[b] == '#') continue;
++        if (line[b] == '[') {
++            in_runtime = (line.compare(b, 9, "[runtime]") == 0);
++            continue;
++        }
++        if (!in_runtime) continue;
++        if (line.compare(b, 11, "title_label") != 0) continue;
++        const size_t q1 = line.find('"', b + 11);
++        if (q1 == std::string::npos) continue;
++        const size_t q2 = line.find('"', q1 + 1);
++        if (q2 == std::string::npos) continue;
++        return line.substr(q1 + 1, q2 - q1 - 1);
++    }
++    return {};
++}
++
++/* The runnable exe inside a title folder: alphabetically first .exe on
++ * Windows / owner-executable regular file elsewhere, so an install with one
++ * exe per title (the shipped layout) is unambiguous. */
++static std::string find_sibling_title_exe(const std::filesystem::path& dir) {
++    namespace fs = std::filesystem;
++    std::error_code ec;
++    std::string best;
++    for (const auto& e : fs::directory_iterator(dir, ec)) {
++        if (ec) break;
++        std::error_code ec2;
++        if (!e.is_regular_file(ec2)) continue;
++        const fs::path& p = e.path();
++#ifdef _WIN32
++        std::string ext = p.extension().string();
++        for (char& c : ext) c = (char)std::tolower((unsigned char)c);
++        if (ext != ".exe") continue;
++#else
++        const auto perms = fs::status(p, ec2).permissions();
++        if (ec2) continue;
++        if ((perms & fs::perms::owner_exec) == fs::perms::none) continue;
++        if (p.extension() == ".so" || p.extension() == ".sh" ||
++            p.extension() == ".toml")
++            continue;
++#endif
++        const std::string s = p.string();
++        if (best.empty() || s < best) best = s;
++    }
++    return best;
++}
++
++static void discover_sibling_titles(const char* argv0) {
++    namespace fs = std::filesystem;
++    g_sibling_argv0 = (argv0 && argv0[0]) ? argv0 : "";
++    g_sibling_titles.clear();
++    g_sibling_active = -1;
++    g_sibling_label_ptrs.clear();
++    g_sibling_exe_ptrs.clear();
++    std::error_code ec;
++    const fs::path own = fs::weakly_canonical(exe_dir_from_argv(argv0), ec);
++    if (ec || own.empty()) return;
++    const fs::path parent = own.parent_path();
++    if (parent.empty() || parent == own) return;
++    for (const auto& e : fs::directory_iterator(parent, ec)) {
++        if (ec) break;
++        std::error_code ec2;
++        if (!e.is_directory(ec2)) continue;
++        const fs::path cfg = e.path() / "game.toml";
++        if (!fs::exists(cfg, ec2)) continue;
++        const std::string label = scan_sibling_title_label(cfg);
++        if (label.empty()) continue;   /* not opted into the multi-title UI */
++        SiblingTitle t;
++        t.dir_name = e.path().filename().string();
++        t.label    = label;
++        t.exe      = find_sibling_title_exe(e.path());
++        g_sibling_titles.push_back(std::move(t));
++    }
++    std::sort(g_sibling_titles.begin(), g_sibling_titles.end(),
++              [](const SiblingTitle& a, const SiblingTitle& b) {
++                  return a.dir_name < b.dir_name;
++              });
++    const std::string own_name = own.filename().string();
++    for (size_t i = 0; i < g_sibling_titles.size(); ++i)
++        if (g_sibling_titles[i].dir_name == own_name)
++            g_sibling_active = (int)i;
++    if (g_sibling_active < 0 || g_sibling_titles.size() < 2) {
++        /* Own folder didn't opt in, or nothing to switch to: feature off. */
++        g_sibling_titles.clear();
++        g_sibling_active = -1;
++        return;
++    }
++    for (const auto& t : g_sibling_titles) {
++        g_sibling_label_ptrs.push_back(t.label.c_str());
++        g_sibling_exe_ptrs.push_back(t.exe.empty() ? nullptr : t.exe.c_str());
++    }
++}
++
++#if defined(RECOMP_LAUNCHER)
++static void apply_sibling_titles_to_game_info(RecompLauncherCGameInfo* gi) {
++    if (!gi || g_sibling_active < 0 || g_sibling_titles.size() < 2) return;
++    gi->title_labels    = g_sibling_label_ptrs.data();
++    gi->title_exe_paths = g_sibling_exe_ptrs.data();
++    gi->num_titles      = (int)g_sibling_titles.size();
++    gi->active_title    = g_sibling_active;
++}
++
++/* The launcher returned RESULT_SWITCH_TITLE: persist the pick for the root
++ * stub, spawn the picked title's exe back into the launcher, and exit this
++ * process. Returns only on failure (caller then exits like QUIT). Handle
++ * inheritance stays OFF — an inherited listening socket is exactly the
++ * quit-hang bug the exit finisher had. */
++static void switch_sibling_title_or_return(const char* argv0) {
++    namespace fs = std::filesystem;
++    char exe[512] = {0};
++    if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
++        std::fprintf(stderr,
++                     "psxrecomp: title switch requested but no exe path\n");
++        return;
++    }
++    /* Persist [launcher] active_title = <folder name> in shared settings. */
++    for (const auto& t : g_sibling_titles) {
++        if (t.exe != exe) continue;
++        auto us = PSXRecompV4::load_user_settings(settings_file_path(argv0));
++        if (!us.parse_error) {
++            us.active_title = t.dir_name;
++            us.has_active_title = true;
++            (void)PSXRecompV4::save_user_settings(settings_file_path(argv0),
++                                                  us);
++        }
++        break;
++    }
++    const fs::path exe_dir = fs::path(exe).parent_path();
++    std::fprintf(stdout, "psxrecomp: switching title -> %s\n", exe);
++#ifdef _WIN32
++    {
++        STARTUPINFOA si;
++        PROCESS_INFORMATION pi;
++        char cmd[1024];
++        std::memset(&si, 0, sizeof(si));
++        std::memset(&pi, 0, sizeof(pi));
++        si.cb = sizeof(si);
++        std::snprintf(cmd, sizeof(cmd), "\"%s\" --launcher", exe);
++        const std::string wd = exe_dir.string();
++        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL,
++                            wd.empty() ? NULL : wd.c_str(), &si, &pi)) {
++            std::fprintf(stderr,
++                         "psxrecomp: title switch CreateProcess failed\n");
++            return;
++        }
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++        ExitProcess(0);
++    }
++#else
++    {
++        std::error_code ec;
++        fs::current_path(exe_dir, ec);
++        char exe_buf[512];
++        std::snprintf(exe_buf, sizeof(exe_buf), "%s", exe);
++        char* args[] = {exe_buf, (char*)"--launcher", nullptr};
++        execv(exe_buf, args);
++        std::fprintf(stderr, "psxrecomp: title switch execv failed: %s\n",
++                     std::strerror(errno));
++        return;
++    }
++#endif
++}
++#endif /* RECOMP_LAUNCHER */
++
+ static std::filesystem::path resolve_existing_runtime_path(const char* requested,
+                                                            const char* argv0) {
+     namespace fs = std::filesystem;
+@@ -6193,6 +6391,17 @@ extern "C" {
+ }
+ static const char kDisplayScaling[]  = "graphics.display_scaling";
+ static const char kFmvCrop[]         = "graphics.fmv_crop";
++/* F1 sibling-title switch rows (multi-title installs; see f1_titles_build). */
++static const char kRuntimeDiscTitle[]       = "system.disc_title";
++static const char kRuntimeDiscTitleSwitch[] = "system.disc_title_switch";
++static std::vector<const char*> g_f1_title_choices; /* installed labels */
++static std::vector<int>         g_f1_title_map;     /* -> g_sibling_titles */
++static int g_f1_title_pending = -1;                 /* choice index */
++/* Set by the F1 Switch action; applied AFTER the menu's pause loop unwinds.
++ * shutdown_runtime() must never run from inside that loop: the guest/render
++ * threads are frozen at the VBlank boundary waiting for the menu to close,
++ * and joining them from there deadlocks (observed as a futex hang). */
++static int g_f1_title_switch_target = -1;           /* g_sibling_titles idx */
+ static const char *const kDisplayScalingChoices[] = { "Nearest", "Bilinear", "Sharp bilinear" };
+ /* Crop FMVs is a toggle: on = letterbox-band removal + an 8-row CRT overscan
+  * trim (DuckStation Crop Mode = Overscan); the row count is not user-facing. */
+@@ -6273,6 +6482,10 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+         *value_out = host_volume_get();
+     else if (std::strcmp(item->key, kRuntimeControllerRoute) == 0)
+         *value_out = g_controller_ports_swapped ? 1 : 0;
++    else if (std::strcmp(item->key, kRuntimeDiscTitle) == 0) {
++        if (g_f1_title_pending < 0) return 0;
++        *value_out = g_f1_title_pending;
++    }
+     else if (std::strncmp(item->key, "pgxp.", 5) == 0)
+         return pgxp_ui_get(item->key, value_out);
+     else if (std::strcmp(item->key, kDisplayScaling) == 0)
+@@ -6320,6 +6533,9 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+         const int requested = value ? 1 : 0;
+         if (requested != (g_controller_ports_swapped ? 1 : 0))
+             controller_port_route_toggle();
++    } else if (std::strcmp(item->key, kRuntimeDiscTitle) == 0) {
++        if (value < 0 || value >= (int)g_f1_title_map.size()) return 0;
++        g_f1_title_pending = value;   /* applied by the Switch action */
+     } else if (std::strncmp(item->key, "pgxp.", 5) == 0) {
+         if (!pgxp_ui_set(item->key, value)) return 0;
+     } else if (std::strcmp(item->key, kDisplayScaling) == 0) {
+@@ -6412,6 +6628,101 @@ static int runtime_ui_change_disc(PsxRuntimeUiContext *context) {
+     return 1;
+ }
+ 
++/* ---- F1 sibling-title switch (multi-title installs) ----------------------
++ * The console-style disc change for installs where each disc is its own
++ * build (see discover_sibling_titles): a "Game disc" choice row cycles the
++ * INSTALLED titles, and a separate "Switch disc" action applies it — the
++ * two-step is the confirm, since the switch restarts into the other build.
++ * Quits through the normal shutdown path (memcards flushed, sockets closed,
++ * exit finisher spawned) and only then boots the picked exe, straight into
++ * the game (PSX_NO_LAUNCHER=1) — no launcher stop-over, like swapping a
++ * disc on the real console. */
++static void f1_titles_build(void) {
++    g_f1_title_choices.clear();
++    g_f1_title_map.clear();
++    g_f1_title_pending = -1;
++    if (g_sibling_active < 0 || g_sibling_titles.size() < 2) return;
++    for (size_t i = 0; i < g_sibling_titles.size(); ++i) {
++        /* Only installed titles are cyclable in-game (the launcher's row is
++         * where "not installed" is worth advertising). */
++        if (g_sibling_titles[i].exe.empty()) continue;
++        if ((int)i == g_sibling_active)
++            g_f1_title_pending = (int)g_f1_title_map.size();
++        g_f1_title_map.push_back((int)i);
++        g_f1_title_choices.push_back(g_sibling_titles[i].label.c_str());
++    }
++    if (g_f1_title_map.size() < 2 || g_f1_title_pending < 0) {
++        g_f1_title_choices.clear();
++        g_f1_title_map.clear();
++        g_f1_title_pending = -1;
++    }
++}
++
++static int f1_title_switch_ready(void) {
++    return g_f1_title_pending >= 0 &&
++           g_f1_title_pending < (int)g_f1_title_map.size() &&
++           g_f1_title_map[g_f1_title_pending] != g_sibling_active;
++}
++
++static void f1_title_switch_now(void) {
++    namespace fs = std::filesystem;
++    if (g_f1_title_switch_target < 0 ||
++        g_f1_title_switch_target >= (int)g_sibling_titles.size())
++        return;
++    const SiblingTitle& t =
++        g_sibling_titles[(size_t)g_f1_title_switch_target];
++    /* Remember the pick for the root stub + the next plain boot. */
++    {
++        const auto sp = settings_file_path(g_sibling_argv0.c_str());
++        auto us = PSXRecompV4::load_user_settings(sp);
++        if (!us.parse_error) {
++            us.active_title = t.dir_name;
++            us.has_active_title = true;
++            (void)PSXRecompV4::save_user_settings(sp, us);
++        }
++    }
++    /* Same clean path as double-Escape quit; only then start the sibling. */
++    psx_crash_trace_set_exit_origin("disc_title_switch");
++    shutdown_runtime();
++    const fs::path exe_dir = fs::path(t.exe).parent_path();
++    std::fprintf(stdout, "psxrecomp: disc switch -> %s\n", t.exe.c_str());
++#ifdef _WIN32
++    {
++        STARTUPINFOA si;
++        PROCESS_INFORMATION pi;
++        char cmd[1024];
++        std::memset(&si, 0, sizeof(si));
++        std::memset(&pi, 0, sizeof(pi));
++        si.cb = sizeof(si);
++        _putenv_s("PSX_NO_LAUNCHER", "1");   /* child inherits our env */
++        std::snprintf(cmd, sizeof(cmd), "\"%s\"", t.exe.c_str());
++        const std::string wd = exe_dir.string();
++        if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL,
++                           wd.empty() ? NULL : wd.c_str(), &si, &pi)) {
++            CloseHandle(pi.hThread);
++            CloseHandle(pi.hProcess);
++        } else {
++            std::fprintf(stderr,
++                         "psxrecomp: disc switch CreateProcess failed\n");
++        }
++        std::exit(0);
++    }
++#else
++    {
++        std::error_code ec;
++        fs::current_path(exe_dir, ec);
++        setenv("PSX_NO_LAUNCHER", "1", 1);
++        char exe_buf[512];
++        std::snprintf(exe_buf, sizeof(exe_buf), "%s", t.exe.c_str());
++        char* args[] = {exe_buf, nullptr};
++        execv(exe_buf, args);
++        std::fprintf(stderr, "psxrecomp: disc switch execv failed: %s\n",
++                     std::strerror(errno));
++        std::exit(1);
++    }
++#endif
++}
++
+ static int runtime_ui_run_action(void *opaque,
+                                  const RecompRuntimeUiItem *item) {
+     auto *context = static_cast<PsxRuntimeUiContext*>(opaque);
+@@ -6420,6 +6731,17 @@ static int runtime_ui_run_action(void *opaque,
+         if (context && context->ui) recomp_runtime_ui_close(context->ui);
+         return 1;
+     }
++    if (std::strcmp(item->key, kRuntimeDiscTitleSwitch) == 0) {
++        if (!f1_title_switch_ready() || psx_netplay_active()) return 0;
++        /* Defer: close the menu so its pause loop unwinds, then the main
++         * loop performs the actual shutdown + relaunch (see
++         * g_f1_title_switch_target). */
++        g_f1_title_switch_target = g_f1_title_map[g_f1_title_pending];
++        host_osd_push("Switching disc...", 1800);
++        if (context && context->ui)
++            recomp_runtime_ui_close(context->ui);
++        return 1;
++    }
+     if (std::strcmp(item->key, kRuntimeDiscChange) == 0)
+         return runtime_ui_change_disc(context);
+     if (std::strcmp(item->key, kRuntimeDiscReinsert) == 0) {
+@@ -6440,6 +6762,10 @@ static int runtime_ui_is_enabled(void*, const RecompRuntimeUiItem *item) {
+         return !psx_netplay_active();
+     if (std::strcmp(item->key, kRuntimeDiscReinsert) == 0)
+         return !psx_netplay_active() && cdrom_has_disc();
++    if (std::strcmp(item->key, kRuntimeDiscTitle) == 0)
++        return g_f1_title_map.size() > 1 && !psx_netplay_active();
++    if (std::strcmp(item->key, kRuntimeDiscTitleSwitch) == 0)
++        return f1_title_switch_ready() && !psx_netplay_active();
+     return 1;
+ }
+ 
+@@ -6505,6 +6831,38 @@ static void runtime_settings_ui_ensure_created(void) {
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+     };
+ 
++    /* Multi-title installs: append the disc-switch rows after the static
++     * extras. The vector (and the choices array it points at) must outlive
++     * the UI object, hence function-static. */
++    f1_titles_build();
++    static std::vector<RecompRuntimeUiItem> all_items;
++    all_items.assign(extras, extras + sizeof(extras) / sizeof(extras[0]));
++    if (g_f1_title_map.size() > 1) {
++        RecompRuntimeUiItem pick{};
++        pick.key = kRuntimeDiscTitle;
++        pick.section = "Disc";
++        pick.label = "Game disc";
++        pick.description =
++            "Pick another installed disc of this game, then apply it with "
++            "'Switch disc' below.";
++        pick.type = RECOMP_RUNTIME_UI_CHOICE;
++        pick.minimum = 0;
++        pick.maximum = (int)g_f1_title_choices.size() - 1;
++        pick.step = 1;
++        pick.choices = g_f1_title_choices.data();
++        pick.choice_count = g_f1_title_choices.size();
++        all_items.push_back(pick);
++        RecompRuntimeUiItem apply{};
++        apply.key = kRuntimeDiscTitleSwitch;
++        apply.section = "Disc";
++        apply.label = "Switch disc (restarts game)";
++        apply.description =
++            "Quit this disc cleanly and boot the selected one. Memory cards "
++            "are shared, so your saves are right there.";
++        apply.type = RECOMP_RUNTIME_UI_ACTION;
++        all_items.push_back(apply);
++    }
++
+     RecompRuntimeUiStandardConfig config{};
+     config.menu.title = "Runtime settings";
+     config.menu.subtitle = "Paused - live settings + PGXP tuning";
+@@ -6525,8 +6883,8 @@ static void runtime_settings_ui_ensure_created(void) {
+         RECOMP_RUNTIME_UI_STANDARD_VOLUME |
+         RECOMP_RUNTIME_UI_STANDARD_RESUME;
+     config.window_scale_max = 4;
+-    config.extra_items = extras;
+-    config.extra_item_count = sizeof(extras) / sizeof(extras[0]);
++    config.extra_items = all_items.data();
++    config.extra_item_count = all_items.size();
+     g_runtime_settings_ui = recomp_runtime_ui_create_standard(&config);
+     g_runtime_ui_context.ui = g_runtime_settings_ui;
+     psx_savestate_menu_set_runtime_ui(g_runtime_settings_ui);
+@@ -7423,6 +7781,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+             runtime_settings_menu_host_pause_loop();
+         if (psx_rewind_is_open())
+             rewind_host_pause_loop();
++#if defined(RECOMP_LAUNCHER)
++        /* F1 disc switch, deferred out of the menu's pause loop (the frozen
++         * guest threads are running again here, so shutdown can join them).
++         * Does not return on success. */
++        if (g_f1_title_switch_target >= 0)
++            f1_title_switch_now();
++#endif
+     }
+ 
+     /* Sample each player's device and feed the matching SIO pad slot.
+@@ -12079,6 +12444,8 @@ int main(int argc, char** argv) {
+             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
+             if (gc.runtime.has_settings_path)
+                 g_cfg_settings_file = gc.runtime.settings_path;
++            if (gc.runtime.has_title_label)
++                discover_sibling_titles(argv[0]);
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+             if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
+@@ -13457,6 +13824,7 @@ int main(int argc, char** argv) {
+                 gi.has_bios = 1;
+ #endif
+ #endif /* PSX_HAS_SETUP_WIZARD */
++            apply_sibling_titles_to_game_info(&gi);
+             launcher_boot_timing_mark("host:setup_checks_done");
+ #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+             g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;
+@@ -13782,6 +14150,16 @@ int main(int argc, char** argv) {
+                 return 1;
+             }
+ #endif
++            if (lr == RECOMP_LAUNCHER_RESULT_SWITCH_TITLE) {
++                /* Sibling-title switch from the Disc row: persist the pick,
++                 * spawn that title's exe into its launcher, exit. */
++                if (overlay_init_thread.joinable())
++                    overlay_init_thread.join();
++                switch_sibling_title_or_return(argv[0]);
++                /* Returns only on failure. */
++                SDL_Quit();
++                return 1;
++            }
+             if (lr == 0) {
+                 if (ls.netplay_launch.enabled) {
+                     net_cfg.enabled = 1;
+@@ -15462,6 +15840,7 @@ soft_return_lobby:
+ #if defined(PSX_HAS_SETUP_WIZARD) && defined(PSX_HAS_GAME_CODEGEN)
+         psx_game_codegen_setup_apply(&gi);
+ #endif
++        apply_sibling_titles_to_game_info(&gi);
+ 
+         char rui_out_disc[1024] = {0};
+         recomp_launcher_set_preserve_sdl(1);
+@@ -15493,6 +15872,14 @@ soft_return_lobby:
+             return 1;
+         }
+ #endif
++        if (rui_rc == RECOMP_LAUNCHER_RESULT_SWITCH_TITLE) {
++            /* Sibling-title switch from the Disc row (soft-return session):
++             * persist the pick, spawn that title's exe, exit. */
++            switch_sibling_title_or_return(argv[0]);
++            /* Returns only on failure. */
++            SDL_Quit();
++            return 1;
++        }
+ 
+         if (rui_rc == 0) {
+             host_volume_set(ls.volume);

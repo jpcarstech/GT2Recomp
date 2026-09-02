@@ -1,0 +1,121 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 75209fc5..af3cc187 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -411,6 +411,24 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+             rt.featured_feature_rows.push_back(std::move(r));
+         }
+     }
++    if (runtime.contains("feature_preset")) {
++        /* One-click enhancement presets (config_loader.h). */
++        const auto presets = toml::find(runtime, "feature_preset");
++        for (const toml::value& row : presets.as_array()) {
++            RuntimeConfig::FeaturePreset p;
++            p.label = toml::find<std::string>(row, "label");
++            if (p.label.empty())
++                throw std::runtime_error(
++                    "[[runtime.feature_preset]] label must not be empty");
++            if (row.contains("description"))
++                p.description = toml::find<std::string>(row, "description");
++            if (row.contains("enable"))
++                for (const auto& e :
++                     toml::find<std::vector<std::string>>(row, "enable"))
++                    p.enable.push_back(e);
++            rt.feature_presets.push_back(std::move(p));
++        }
++    }
+     if (runtime.contains("disc_speed")) {
+         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+         rt.has_disc_speed = true;
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index b1ce1a3e..25fdbdd9 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -219,6 +219,22 @@ struct RuntimeConfig {
+     };
+     std::vector<FeaturedFeatureRow> featured_feature_rows;
+ 
++    // feature_preset: a one-click enhancement preset offered on the launcher's
++    // mods page beside Enable all / Disable all. Applying one clears the page
++    // in view and switches on exactly what it names, so "play it like 1999"
++    // and "play it enhanced" are one button each instead of a page of
++    // checkboxes the player has to understand the dependencies of.
++    //   [[runtime.feature_preset]]
++    //   label = "Enhanced"
++    //   description = "Widescreen, 60 FPS, longer draw distance..."
++    //   enable = ["gt2.silent-enhancements/aspect", "..."]   # package/feature
++    struct FeaturePreset {
++        std::string label;
++        std::string description;
++        std::vector<std::string> enable;
++    };
++    std::vector<FeaturePreset> feature_presets;
++
+     // mods_dir: name of the mod-package directory next to the exe (default
+     // "mods"). Plain directory name only - resolved against the exe dir at
+     // runtime, so a port can name the folder after what its launcher calls
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index e5df31ee..4c597887 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2336,6 +2336,8 @@ static void discover_sibling_titles(const char* argv0) {
+  * storage for both the launcher rows and the F1 surface. */
+ static std::vector<PSXRecompV4::RuntimeConfig::FeaturedFeatureRow>
+     g_featured_rows_cfg;
++static std::vector<PSXRecompV4::RuntimeConfig::FeaturePreset>
++    g_feature_presets_cfg;
+ 
+ #if defined(RECOMP_LAUNCHER)
+ static std::vector<std::vector<const char*>> g_featured_row_fid_ptrs;
+@@ -2367,6 +2369,34 @@ static void apply_featured_rows_to_game_info(RecompLauncherCGameInfo* gi) {
+     gi->num_featured_mod_rows = (int)g_featured_rows_abi.size();
+ }
+ 
++static std::vector<std::vector<const char*>> g_preset_enable_ptrs;
++static std::vector<RecompLauncherCFeaturePreset> g_presets_abi;
++static void apply_feature_presets_to_game_info(RecompLauncherCGameInfo* gi) {
++    if (!gi || g_feature_presets_cfg.empty()) return;
++    if (g_presets_abi.empty()) {
++        g_preset_enable_ptrs.clear();
++        g_preset_enable_ptrs.reserve(g_feature_presets_cfg.size());
++        for (const auto& p : g_feature_presets_cfg) {
++            g_preset_enable_ptrs.emplace_back();
++            auto& ids = g_preset_enable_ptrs.back();
++            for (const auto& e : p.enable) ids.push_back(e.c_str());
++        }
++        for (size_t i = 0; i < g_feature_presets_cfg.size(); ++i) {
++            const auto& p = g_feature_presets_cfg[i];
++            RecompLauncherCFeaturePreset out{};
++            out.label = p.label.c_str();
++            out.description =
++                p.description.empty() ? nullptr : p.description.c_str();
++            out.enable = g_preset_enable_ptrs[i].empty()
++                ? nullptr : g_preset_enable_ptrs[i].data();
++            out.num_enable = (int)g_preset_enable_ptrs[i].size();
++            g_presets_abi.push_back(out);
++        }
++    }
++    gi->feature_presets = g_presets_abi.data();
++    gi->num_feature_presets = (int)g_presets_abi.size();
++}
++
+ static void apply_sibling_titles_to_game_info(RecompLauncherCGameInfo* gi) {
+     if (!gi || g_sibling_active < 0 || g_sibling_titles.size() < 2) return;
+     gi->title_labels    = g_sibling_label_ptrs.data();
+@@ -12612,6 +12642,7 @@ int main(int argc, char** argv) {
+             if (gc.runtime.has_title_label)
+                 discover_sibling_titles(argv[0]);
+             g_featured_rows_cfg = gc.runtime.featured_feature_rows;
++            g_feature_presets_cfg = gc.runtime.feature_presets;
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+             if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
+@@ -13992,6 +14023,8 @@ int main(int argc, char** argv) {
+ #endif /* PSX_HAS_SETUP_WIZARD */
+             apply_sibling_titles_to_game_info(&gi);
+             apply_featured_rows_to_game_info(&gi);
++        apply_feature_presets_to_game_info(&gi);
++            apply_feature_presets_to_game_info(&gi);
+             launcher_boot_timing_mark("host:setup_checks_done");
+ #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+             g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;

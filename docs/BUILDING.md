@@ -1,15 +1,15 @@
 # Building GT2Recomp
 
 The player version is in the [README](../README.md#install):
-unzip `GT2Recomp-setup.zip` next to your GT2 Combined Disc image and
-double-click `Setup GT2.cmd`. This page is the long version — what each step
-does, how to run it by hand, and how to build on Linux.
+unzip `GT2Recomp-setup.zip` next to your GT2 disc dump(s) and double-click
+`Setup GT2.cmd`. This page is the long version — what each step does, how to
+run it by hand, and how to build on Linux.
 
 ## Inputs you provide
 
 | File | Where | Notes |
 |---|---|---|
-| `Gran Turismo 2 Combined.bin` + `.cue` | game folder | Built from your own Arcade + Simulation dumps with [GT2-Combined-Disc](https://github.com/CookiePLMonster/GT2-Combined-Disc). Expected: 1,033,459,392 bytes, MD5 `70ecd6e788501eb69a220d2a96e624c4`. The `.cue` must reference the `.bin` by its real file name (`setup_and_build.ps1` rewrites it if not). |
+| Your disc dump(s), `.bin` (+ `.cue` if you have it) | game folder | The **Arcade disc** (SCUS-94455, 729,606,864 bytes, MD5 `79befcdb7e725daff04bce3c4aafb321`), the **Simulation disc** (SCUS-94488, 680,856,960 bytes, MD5 `36d8008a99299b236a32a6bf4702aac6`), or both — NTSC-U v1.1 are the tested dumps. Any file names: each image is identified by content (boot serial + track size). A missing/wrong `.cue` is written/fixed automatically. Optional third disc: a [GT2 Combined Disc](https://github.com/CookiePLMonster/GT2-Combined-Disc) image (1,033,459,392 bytes, MD5 `70ecd6e788501eb69a220d2a96e624c4`) builds as its own switchable title. |
 | `scph1001.bin` | game folder (optional) | A retail SCPH-1001 BIOS dump. Without it the bundled OpenBIOS is used; with it you can pick either in the launcher. Some titles behave differently on OpenBIOS; GT2 runs on both. |
 
 Everything else is derived: the boot EXE is extracted from the image, the
@@ -18,21 +18,14 @@ pinned commit.
 
 ## What `setup_and_build.ps1` does
 
-1. **Finds the game folder** — the folder containing `Gran Turismo 2 Combined.bin`,
-   looked up from the script's own location (three levels up from
-   `GT2Recomp-src\tools-win\local-build\`) or passed with `-GameDir`. If the
-   only large `.bin` there has another name it offers to rename it.
-2. **Checks the image** (size + MD5) and warns on a mismatch. A different base
-   image means a different boot EXE, and the function seeds in
-   `seeds/ghidra_funcs.txt` are for `SCUS_944.88` from this image.
-3. **Extracts the boot EXE**: `tools-win/extract_gt2_exe.ps1` parses the
-   ISO9660 filesystem inside the raw MODE2/2352 image, reads `SYSTEM.CNF`, and
-   writes `extracted\SCUS_944.88` (plus `disc_listing.txt` / `disc_md5.txt`).
-4. **Installs the toolchain** — MSYS2 via `winget`, then
+1. **Finds the game folder** — the folder containing at least one large
+   `.bin`, looked up from the script's own location (three levels up from
+   `GT2Recomp-src\tools-win\local-build\`) or passed with `-GameDir`.
+2. **Installs the toolchain** — MSYS2 via `winget`, then
    `mingw-w64-x86_64-{toolchain,cmake,ninja,ccache}`, `git`, `python`,
    `unzip`, `curl` via `pacman`. One-time; re-runs are no-ops.
-5. **Runs `local_build.sh`** in the MSYS2 MinGW64 shell, which does the actual
-   work (below).
+3. **Runs `local_build.sh`** in the MSYS2 MinGW64 shell, which does the actual
+   work (below), including working out which GT2 disc each image is.
 
 ## What `local_build.sh` does
 
@@ -52,25 +45,34 @@ Runs inside MSYS2 MinGW64; `bash local_build.sh "<game folder>" [<source dir>]`.
    describes each patch.
 3. **Recompiler tool** — `cmake -S psxrecomp/recompiler -B psxrecomp/recompiler/build`
    and builds `psxrecomp-game`.
-4. **Inputs + BIOS** — copies `extracted/SCUS_944.88` to `disc/`, your
-   `scph1001.bin` (if any) to `psxrecomp/bios/SCPH1001.BIN`, and regenerates
-   the recompiled BIOS backends (`tools/regen_bios.sh` for OpenBIOS and, if
-   present, the retail one).
-5. **Generate + build** — `psxrecomp-game --config game.toml` emits the game as
-   C (~9,800 functions, ~1.2 GB of C in ~230 shards; this needs ~6 GB RAM and
-   is the long step), then CMake configures the game runtime with
-   `-DPSX_RECOMP_UI=ON -DPSX_PGXP_VARIANT=ON -DPSX_DEBUG_TOOLS=ON -DPSX_EXPANDED_RAM=ON`
-   and builds the `psx-runtime-pgxp` target. `PSX_EXPANDED_RAM` is the 8 MB
-   dev-console memory map (DuckStation "8MB RAM") required by the 8 MB polygon
-   buffers / full-detail AI patches; the PGXP variant is the shipped exe and
-   its hooks early-out when the PGXP patch is off.
-6. **Install into the game folder** — the exe as `Gran Turismo 2 Recompiled.exe`,
-   `assets\`, the runtime `game.toml` (only if absent; otherwise a fresh copy is
-   left as `game.toml.new`), `seeds\`, `bios\` (OpenBIOS + license + your dump
-   + the BIOS profiles), the enhancement packages into `patches\` (their
-   enable state in `patches\state.toml` is preserved), `Play GT2.cmd`,
-   `setup_and_build.ps1`, and the player helpers into `tools\`.
-   `GT2_DEV_TOOLS=1` also installs the diagnostics from `tools-win/dev/`.
+4. **Discs** — every `.bin` over 400 MB in the game folder is probed
+   (`psxrecomp/tools/new_project_layout/probe_disc.py`): the boot serial and
+   data-track size say which GT2 disc it is (arcade / simulation / combined);
+   a missing or wrong `.cue` is written/fixed first. Non-GT2 images are
+   skipped with a note. Also regenerates the recompiled BIOS backends
+   (`tools/regen_bios.sh` for OpenBIOS and, with your `scph1001.bin`, the
+   retail one).
+5. **Generate + build, per disc** — for each disc found, in `titles/<name>/`
+   of the checkout: the player's image is hard-linked in under its canonical
+   name, the boot EXE extracted from it, then `psxrecomp-game --config
+   game.toml` emits that disc's game as C (~1.2 GB of C; needs ~6 GB RAM —
+   the long step) and CMake builds the `psx-runtime-pgxp` target with
+   `-DPSX_RECOMP_UI=ON -DPSX_PGXP_VARIANT=ON -DPSX_DEBUG_TOOLS=ON -DPSX_EXPANDED_RAM=ON`.
+   `PSX_EXPANDED_RAM` is the 8 MB dev-console memory map (DuckStation
+   "8MB RAM") required by the 8 MB polygon buffers / full-detail AI patches;
+   the PGXP variant is the shipped exe and its hooks early-out when the PGXP
+   patch is off.
+6. **Install into the game folder** — per disc, into `titles\<name>\`: the
+   exe (`GT2 Arcade.exe` / `GT2 Simulation.exe` / `GT2 Combined.exe`),
+   `assets\`, the runtime `game.toml` (only if absent; otherwise a fresh
+   copy is left as `game.toml.new` — the disc line points at your own cue),
+   `seeds\`, `bios\`, the enhancement packages into `patches\`. Shared, at
+   the game root: `saves\` (memory cards — all discs read the same garage),
+   `settings.toml`, and the compiled `gt2_stub.c` as
+   `Gran Turismo 2 Recompiled.exe` — the front door that starts the disc you
+   used last. A pre-0.2 root install's captures/cache/patch-state migrate
+   under `titles\combined\`. `GT2_DEV_TOOLS=1` also installs the
+   diagnostics from `tools-win/dev/`.
 7. **`overlay_toolchain\`** — the background native-code compiler used by the
    game: `psxrecomp-game.exe`, `compile_overlays.py`, the runtime headers
    (they define the cache namespace, so this is refreshed on every build),
@@ -96,12 +98,15 @@ and on exit hands the remaining backlog to a detached low-priority finisher
 fallback compiler when no gcc exists at all.
 
 First launch opens the launcher: renderer, internal scale, display scaling,
-Crop FMVs, texture filtering, controller setup, BIOS choice, and the
-Patches / Cheats tab (Silent's enhancements). Everything lands in
-`settings.toml` / `input.ini` / `keybinds.ini` / `patches\state.toml` next to
-the exe; `game.toml` is the port's runtime config and safe to hand-edit
-(comments explain each key). F1 opens the in-game menu with the live graphics
-and PGXP settings.
+Crop FMVs, texture filtering, controller setup, BIOS choice, the **Disc**
+row (switch between installed discs; relaunches into the picked one), and
+the Patches / Cheats tab (Silent's enhancements — shown only on discs they
+target). Settings land in the shared `settings.toml` at the game root;
+`input.ini` / `keybinds.ini` / `patches\state.toml` sit next to each disc's
+exe; each `titles\<name>\game.toml` is that disc's runtime config and safe
+to hand-edit (comments explain each key). F1 opens the in-game menu with the
+live graphics and PGXP settings plus **Disc → Switch disc** — a clean quit
+straight into the other disc, no launcher stop-over.
 
 ## Linux (build and run from the same tree)
 
@@ -149,11 +154,11 @@ resulting exe imports only Windows system DLLs.
 
 ## Troubleshooting
 
-- **"Could not find 'Gran Turismo 2 Combined.bin'"** — the script is not in
-  (or under) the game folder; pass `-GameDir`.
-- **Extraction produced no `SCUS_944.88`** — the image is not the Combined
-  Disc (its boot EXE is the Simulation disc's `SCUS_944.88`); check
-  `extracted\disc_listing.txt` and `SYSTEM.CNF`.
+- **"No disc image found"** — the script is not in (or under) the game
+  folder, or the folder has no `.bin` over 400 MB; pass `-GameDir`.
+- **"skipping <file> - serial ... is not GT2 NTSC-U"** — the image is a
+  different region/game; only SCUS-94455 / SCUS-94488 dumps build (the
+  seeds and patches are for the NTSC-U v1.1 EXEs).
 - **A patch "FAILED TO APPLY"** — the submodule is not at its pin (a manual
   `git submodule update` without `--force` over a dirty tree, or a checkout of
   a newer upstream). `git -C psxrecomp checkout -- . && git submodule update --force`
@@ -181,11 +186,9 @@ resulting exe imports only Windows system DLLs.
 
 | Path | What |
 |---|---|
-| `game.toml` | Game identity + recompiler config (build variant) |
-| `tools-win/local-build/game.runtime.toml` | The `game.toml` installed beside the exe (runtime variant) |
-| `seeds/ghidra_funcs.txt` | Function seeds for the boot EXE (entry + JAL scan) |
-| `CMakeLists.txt`, `codegen_setup.*` | Game runtime target (`psxrecomp_add_game_runtime`) |
-| `mods_gt2_silent.c`, `mods/` | The enhancement package: Silent's codes as runtime patch plugins |
+| `titles/<name>/` | Per-disc build config: `game.toml` (build variant + probe digests), `seeds/`, CMake project, `codegen_setup.*`, `mods_gt2_silent.c`, and `game.runtime.toml` (installed beside that disc's exe) |
+| `tools-win/local-build/gt2_stub.c` | The root `Gran Turismo 2 Recompiled.exe`: starts the disc you used last |
+| `game.toml`, `seeds/`, `CMakeLists.txt`, `codegen_setup.*`, `mods_gt2_silent.c` | The Combined title at the repo root (CI + pre-0.2 flow; `titles/combined/` is the installed variant) |
 | `psxrecomp/`, `recomp-ui/` | Framework and launcher submodules, pinned to upstream commits |
 | `patches/` | Everything this port changes in the framework, applied at build time ([`patches/README.md`](../patches/README.md)) |
 | `tools-win/` | The build scripts, player helpers, and `dev/` diagnostics |

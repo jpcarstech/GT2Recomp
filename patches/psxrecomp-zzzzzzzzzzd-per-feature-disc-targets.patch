@@ -1,0 +1,216 @@
+diff --git a/runtime/include/mod_packages.h b/runtime/include/mod_packages.h
+index b2ee6242..f3cfdd9e 100644
+--- a/runtime/include/mod_packages.h
++++ b/runtime/include/mod_packages.h
+@@ -39,6 +39,12 @@ struct ModOption {
+     std::string disabled_by;
+ };
+ 
++struct ModTarget {
++    std::string game_id;
++    std::string exe_sha256;
++    std::string disc_sha256;
++};
++
+ struct ModFeature {
+     std::string id;
+     std::string name;
+@@ -51,6 +57,15 @@ struct ModFeature {
+      * and infrastructure a user should not have to reason about. */
+     bool hidden = false;
+     bool legacy = false;
++    /* Per-feature disc targeting. EMPTY (the default) means "inherit the
++     * package's [[target]] list" — every existing manifest keeps working.
++     * When present, this feature is offered and applied ONLY on a title the
++     * list matches, so one enhancement package can carry codes for several
++     * discs of the same game (a 60 FPS patch whose sites exist only in one
++     * disc's overlay, an unlock that only one disc has) and each disc sees
++     * exactly the features that are real for it. Parsed from
++     * [[feature.target]] entries, same fields as [[target]]. */
++    std::vector<ModTarget> targets;
+ };
+ 
+ enum class ModConstraintKind {
+@@ -79,12 +94,6 @@ struct ModRequirement {
+     std::string version;
+ };
+ 
+-struct ModTarget {
+-    std::string game_id;
+-    std::string exe_sha256;
+-    std::string disc_sha256;
+-};
+-
+ enum class ModPatchTarget {
+     MainExe,
+     DiscRaw,
+@@ -313,6 +322,18 @@ using ModBuiltinResolver = std::function<bool(
+  * title: game_id (or "*"), plus optional exe_sha256 / disc_sha256 pins.
+  * Shared by activation (ModPackageManager::resolve) and the launcher's
+  * package listing, so a package can never be shown where it cannot run. */
++/* The identity of the title this process is running, consulted by the
++ * per-feature target gate (ModFeature::targets). Set once at mod runtime
++ * init; empty values mean "unknown", which leaves every feature visible. */
++void mod_set_current_title(const std::string& game, const std::string& exe,
++                           const std::string& disc);
++
++/* True when `feature` applies to the given title. A feature with no targets
++ * of its own inherits the package's. */
++bool feature_target_matches(const ModPackage& package, const ModFeature& feature,
++                            const std::string& game, const std::string& exe,
++                            const std::string& disc);
++
+ bool target_matches(const ModPackage& package, const std::string& game,
+                     const std::string& exe, const std::string& disc);
+ 
+diff --git a/runtime/src/mod_packages.cpp b/runtime/src/mod_packages.cpp
+index 79d4fc7f..995d0519 100644
+--- a/runtime/src/mod_packages.cpp
++++ b/runtime/src/mod_packages.cpp
+@@ -19,6 +19,13 @@
+ namespace fs = std::filesystem;
+ 
+ namespace PSXRecompV4 {
++
++namespace {
++/* Identity of the title this process runs, for the per-feature target gate.
++ * Empty game id = unknown (bare runtime / tests): nothing is filtered. */
++std::string g_cur_game, g_cur_exe, g_cur_disc;
++}  // namespace
++
+ namespace {
+ 
+ constexpr uint32_t kMinFormatVersion = 1;
+@@ -790,6 +797,15 @@ const ModFeatureSelection* find_feature_selection(const ModPackage& package,
+ 
+ bool is_feature_enabled(const ModPackage& package, const ModSelection& selection,
+                         const ModFeature& feature) {
++    /* Per-feature disc gate. A feature whose [[feature.target]] list does not
++     * cover the running title is never enabled — not listed as on, not
++     * counted by has_enabled_feature, and never applied by resolve(). This
++     * one check is what lets a single enhancement package carry per-disc
++     * codes. Unknown identity (bare runtime / unit tests) filters nothing. */
++    if (!feature.targets.empty() && !g_cur_game.empty() &&
++        !feature_target_matches(package, feature, g_cur_game, g_cur_exe,
++                                g_cur_disc))
++        return false;
+     if (feature.hidden) return true;          /* ships always-on */
+     if (feature.legacy) return selection.enabled;
+     const ModFeatureSelection* selected =
+@@ -1427,6 +1443,27 @@ bool target_matches(const ModPackage& package, const std::string& game,
+     return false;
+ }
+ 
++void mod_set_current_title(const std::string& game, const std::string& exe,
++                           const std::string& disc) {
++    g_cur_game = game;
++    g_cur_exe = exe;
++    g_cur_disc = disc;
++}
++
++bool feature_target_matches(const ModPackage& package, const ModFeature& feature,
++                            const std::string& game, const std::string& exe,
++                            const std::string& disc) {
++    if (feature.targets.empty())
++        return target_matches(package, game, exe, disc);
++    for (const ModTarget& target : feature.targets) {
++        if (target.game_id != "*" && target.game_id != game) continue;
++        if (!target.exe_sha256.empty() && target.exe_sha256 != exe) continue;
++        if (!target.disc_sha256.empty() && target.disc_sha256 != disc) continue;
++        return true;
++    }
++    return false;
++}
++
+ bool mod_register_builtin_resolver(const std::string& id, ModBuiltinResolver resolver) {
+     if (!valid_id(id) || !resolver) return false;
+     return builtin_resolvers().emplace(id, std::move(resolver)).second;
+@@ -1573,6 +1610,21 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
+                     ? toml::find<std::string>(v, "description") : "";
+                 feature.group = v.contains("group")
+                     ? toml::find<std::string>(v, "group") : "General";
++                /* Optional per-feature disc targeting ([[feature.target]]);
++                 * absent => the feature inherits the package's targets. */
++                if (v.contains("target")) {
++                    for (const toml::value& t : toml::find(v, "target").as_array()) {
++                        ModTarget target;
++                        target.game_id = toml::find<std::string>(t, "game_id");
++                        target.exe_sha256 = t.contains("exe_sha256")
++                            ? toml::find<std::string>(t, "exe_sha256") : "";
++                        target.disc_sha256 = t.contains("disc_sha256")
++                            ? toml::find<std::string>(t, "disc_sha256") : "";
++                        if (target.game_id.empty())
++                            throw std::runtime_error("feature target game_id is empty");
++                        feature.targets.push_back(std::move(target));
++                    }
++                }
+                 feature.default_enabled =
+                     toml::find_or<bool>(v, "default_enabled", false);
+                 feature.hidden = toml::find_or<bool>(v, "hidden", false);
+diff --git a/runtime/src/mod_runtime.cpp b/runtime/src/mod_runtime.cpp
+index f9587bf9..765c0c83 100644
+--- a/runtime/src/mod_runtime.cpp
++++ b/runtime/src/mod_runtime.cpp
+@@ -610,6 +610,18 @@ static bool package_visible_here(const ModPackage& package) {
+     return target_matches(package, s.game_id, s.exe_sha256, s.disc_sha256);
+ }
+ 
++/* Same gate one level down: a feature carrying its own [[feature.target]]
++ * list is only offered on a title it targets, so one package can ship
++ * per-disc codes (a 60 FPS patch whose sites exist in one disc's overlay
++ * only) and each disc's menu shows exactly what is real for it. */
++static bool feature_visible_here(const ModPackage& package,
++                                 const ModFeature& feature) {
++    const RuntimeMods& s = state();
++    if (s.game_id.empty()) return true;
++    return feature_target_matches(package, feature, s.game_id, s.exe_sha256,
++                                  s.disc_sha256);
++}
++
+ int provider_package_count(void*) {
+     int count = 0;
+     for (const auto& [package_id, versions] : state().manager.packages()) {
+@@ -707,6 +719,7 @@ bool provider_feature_at(int index, const ModPackage*& package,
+         if (!package_visible_here(*selected)) continue;
+         for (const ModFeature& candidate : selected->features) {
+             if (candidate.hidden) continue;
++            if (!feature_visible_here(*selected, candidate)) continue;
+             if (index-- == 0) {
+                 package = selected;
+                 feature = &candidate;
+@@ -742,7 +755,8 @@ int provider_feature_count(void*) {
+         if (!package) continue;
+         if (!package_visible_here(*package)) continue;
+         for (const ModFeature& feature : package->features)
+-            if (!feature.hidden) count++;     /* hidden: ships always-on, no UI */
++            if (!feature.hidden && feature_visible_here(*package, feature))
++                count++;                      /* hidden: ships always-on, no UI */
+     }
+     return count;
+ }
+@@ -1133,6 +1147,9 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
+     s.disc_guard_failed = false;
+     s.manager.set_root(root);
+     s.game_id = game_id;
++    /* Publish the title identity for the per-feature target gate
++     * (is_feature_enabled). Refreshed below once the digests are computed. */
++    mod_set_current_title(s.game_id, s.exe_sha256, s.disc_sha256);
+     s.entry_phys = game_entry_pc & 0x1FFFFFFFu;
+     if (!s.manager.scan(&s.error) || !s.manager.load_state(&s.error)) {
+         if (error) *error = s.error;
+@@ -1144,6 +1161,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
+         s.exe_sha256.clear();
+         s.error.clear();
+     }
++    mod_set_current_title(s.game_id, s.exe_sha256, s.disc_sha256);
+     s.initialized = true;
+     return true;
+ }
+@@ -1179,6 +1197,7 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
+         if (!sha256_file(disc_path, digest, &hash_error)) digest.clear();
+         s.disc_path = disc_path;
+         s.disc_sha256 = std::move(digest);
++        mod_set_current_title(s.game_id, s.exe_sha256, s.disc_sha256);
+     }
+     ModResolution plan =
+         s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256);

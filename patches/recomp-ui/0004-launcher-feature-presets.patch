@@ -1,0 +1,137 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 33f1ccf..20c56c2 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -7160,6 +7160,13 @@ static void draw_mod_feature_diagnostics(
+     }
+ }
+ 
++/* Apply a one-click preset (GameInfo.feature_presets): clear the page the
++ * player is looking at, then switch on exactly what the preset names. Uses
++ * the same scope rule as Enable all / Disable all so a preset on the Patches
++ * page never silently reaches into someone's cheats. */
++static bool apply_feature_preset(LauncherModel* m,
++                                 const RecompLauncherCFeaturePreset* preset);
++
+ static bool set_all_mod_features(LauncherModel* m, bool enabled) {
+     const auto* mods = m ? m->mods : nullptr;
+     if (!mods || !mods->feature_count || !mods->feature_get ||
+@@ -7220,6 +7227,32 @@ static bool set_all_mod_features(LauncherModel* m, bool enabled) {
+     return true;
+ }
+ 
++static bool apply_feature_preset(LauncherModel* m,
++                                 const RecompLauncherCFeaturePreset* preset) {
++    const auto* mods = m ? m->mods : nullptr;
++    if (!mods || !mods->feature_enable || !preset) return false;
++    /* Start from a known state so a preset always means the same thing,
++     * whatever the player had ticked before. */
++    if (!set_all_mod_features(m, false)) return false;
++    for (int i = 0; i < preset->num_enable; ++i) {
++        const char* entry = preset->enable ? preset->enable[i] : nullptr;
++        if (!entry || !entry[0]) continue;
++        const char* slash = std::strchr(entry, '/');
++        if (!slash || !slash[1]) continue;          /* want package/feature */
++        std::string package(entry, (size_t)(slash - entry));
++        const char* feature = slash + 1;
++        if (!mods->feature_enable(mods->ctx, package.c_str(), feature, 1)) {
++            /* A preset naming something this disc does not have is not an
++             * error the player caused - skip it and keep going. */
++            continue;
++        }
++    }
++    std::snprintf(m->mod_status, sizeof(m->mod_status), "%s %s",
++                  preset->label ? preset->label : "Preset",
++                  ui_text("applied. Changes apply when you press PLAY."));
++    return true;
++}
++
+ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+     const auto* mods = m ? m->mods : nullptr;
+     if (!mods || !mods->feature_count || !mods->feature_get ||
+@@ -7272,6 +7305,18 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+         set_all_mod_features(m, false);
+     if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("%s", ui_text("Disable every installed mod feature"));
++    for (int pi = 0; pi < m->num_feature_presets; ++pi) {
++        const RecompLauncherCFeaturePreset* preset = &m->feature_presets[pi];
++        if (!preset->label || !preset->label[0]) continue;
++        ImGui::SameLine();
++        ImGui::PushID(pi + 0x50524553);   /* 'PRES' + index */
++        if (ImGui::Button(ui_text(preset->label)))
++            apply_feature_preset(m, preset);
++        if (preset->description && preset->description[0] &&
++            ImGui::IsItemHovered())
++            ImGui::SetTooltip("%s", ui_text(preset->description));
++        ImGui::PopID();
++    }
+     ImGui::SameLine();
+     ImGui::SetNextItemWidth(px(300));
+     ImGui::InputTextWithHint("##mod_search", ui_text("Search features, groups, packages..."),
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 82e1bdd..0b4d3b1 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -397,6 +397,8 @@ void launcher_model_init(LauncherModel* m,
+                    game->num_titles > 0 ? game->num_titles - 1 : 0);
+         m->featured_mod_rows     = game->featured_mod_rows;
+         m->num_featured_mod_rows = game->num_featured_mod_rows;
++        m->feature_presets       = game->feature_presets;
++        m->num_feature_presets   = game->num_feature_presets;
+         m->hide_rebind          = game->hide_rebind != 0;
+         m->has_mouse_controls   = game->has_mouse_controls != 0;
+         m->has_gyro_controls    = game->has_gyro_controls != 0;
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 86ce902..70a4de2 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -297,6 +297,10 @@ typedef struct {
+     const RecompLauncherCFeaturedModRow* featured_mod_rows;
+     int  num_featured_mod_rows;
+ 
++    // ---- one-click enhancement presets (GameInfo.feature_presets) ---------
++    const RecompLauncherCFeaturePreset* feature_presets;
++    int  num_feature_presets;
++
+     // ---- rebind-page opt-out (GameInfo.hide_rebind) ------------------------
+     bool hide_rebind;
+     // ---- mouse controls (GameInfo.has_mouse_controls; Snap) ----------------
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 8a85e1a..08319b1 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -886,6 +886,20 @@ typedef struct RecompLauncherCDisc {
+     const char* path;
+ } RecompLauncherCDisc;
+ 
++/* One-click enhancement preset (GameInfo.feature_presets). A preset is the
++ * answer to a page of checkboxes: "play it like 1999" and "play it enhanced"
++ * are the two things most players actually want, and expecting them to know
++ * which features depend on which is a losing bet. Applying one turns off
++ * every feature on the page in view (exactly what Disable all does, so the
++ * scope is one the player already understands), then enables the named ones.
++ * Each entry in `enable` is "package_id/feature_id". */
++typedef struct RecompLauncherCFeaturePreset {
++    const char* label;        /* button text, e.g. "Authentic 1999" */
++    const char* description;  /* tooltip: what this preset turns on */
++    const char* const* enable;
++    int num_enable;
++} RecompLauncherCFeaturePreset;
++
+ /* Promoted mod-feature row (GameInfo.featured_mod_rows): a first-class
+  * settings toggle backed by the same provider as the Mods page. Toggling
+  * flips every feature in feature_ids together (a headline feature plus its
+@@ -1433,6 +1447,13 @@ typedef struct RecompLauncherCGameInfo {
+      * run_window. */
+     const RecompLauncherCFeaturedModRow* featured_mod_rows;
+     int  num_featured_mod_rows;
++
++    /* ---- one-click enhancement presets (appended additively) -------------
++     * See RecompLauncherCFeaturePreset above. Drawn as buttons beside
++     * Enable all / Disable all on the mods page. NULL/0 => no buttons.
++     * Borrowed; must outlive run_window. */
++    const RecompLauncherCFeaturePreset* feature_presets;
++    int  num_feature_presets;
+ } RecompLauncherCGameInfo;
+ 
+ /* recomp_launcher_run_window return codes */

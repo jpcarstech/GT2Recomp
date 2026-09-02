@@ -1,0 +1,40 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 2920274..f961804 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -6619,7 +6619,7 @@ static bool mod_feature_text_matches(const char* search,
+ }
+ 
+ /* "Cheats" is a reserved feature-group name: when any installed feature uses
+- * it, the dashboard splits the single Mods entry into "Patches" (every other
++ * it, the dashboard splits the single Mods entry into "Mods" (every other
+  * group — enhancements, fixes, performance) and "Cheats" (this group), so
+  * gameplay-altering unlocks are never mixed in between enhancement patches.
+  * Group matching is case-insensitive. */
+@@ -7220,7 +7220,7 @@ static bool set_all_mod_features(LauncherModel* m, bool enabled) {
+         changed.push_back(index);
+     }
+     const char* what = m->mod_group_filter == 2 ? "cheats"
+-                     : m->mod_group_filter == 1 ? "patches" : "mod features";
++                     : m->mod_group_filter == 1 ? "mods" : "mod features";
+     std::snprintf(m->mod_status, sizeof(m->mod_status),
+                   "All %s %s. Changes apply on PLAY.", what,
+                   enabled ? "enabled" : "disabled");
+@@ -9051,7 +9051,7 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
+         const float y = hdr_top + px(6.0f);
+         if (m->view == LNG_VIEW_DASHBOARD) {
+             /* With a "Cheats" feature group installed the Mods entry splits:
+-             * "Patches" (enhancements/fixes) and "Cheats" (gameplay unlocks)
++             * "Mods" (enhancements/fixes) and "Cheats" (gameplay unlocks)
+              * — the names say what is inside. Without one, the single legacy
+              * "Mods" entry stays, unchanged for every other game. */
+             const bool mods_split = m->mods &&
+@@ -9067,7 +9067,7 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
+                 launcher_model_set_view(m, LNG_VIEW_SETTINGS);
+             if (m->mods) {
+                 ImGui::SameLine(0, gap);
+-                if (ImGui::Button(mods_split ? ui_text("Patches") : ui_text("Mods"),
++                if (ImGui::Button(ui_text("Mods"),
+                                   ImVec2(w, px(34)))) {
+                     m->mod_group_filter = mods_split ? 1 : 0;
+                     launcher_model_set_view(m, LNG_VIEW_MODS);

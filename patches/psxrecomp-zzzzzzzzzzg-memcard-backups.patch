@@ -1,0 +1,147 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index af3cc187..edafa9a4 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -376,6 +376,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         rt.settings_path = fs::absolute(root / rel);
+         rt.has_settings_path = true;
+     }
++    if (runtime.contains("memcard_backups")) {
++        const auto n = toml::find<int64_t>(runtime, "memcard_backups");
++        if (n < 0 || n > 50) {
++            throw std::runtime_error(
++                "[runtime] memcard_backups out of range (0..50)");
++        }
++        rt.memcard_backups = (int)n;
++        rt.has_memcard_backups = true;
++    }
+     if (runtime.contains("title_label")) {
+         /* Multi-title installs: this build's short name in the Disc row.
+          * Also the opt-in for sibling-title discovery (config_loader.h). */
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 25fdbdd9..174a315d 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -189,6 +189,11 @@ struct RuntimeConfig {
+     bool                  has_settings_path = false;
+     std::filesystem::path settings_path;
+ 
++    // memcard_backups: how many rolling copies of each memory card to keep
++    // under <memcard_dir>/backups. 0 disables. Default 10.
++    bool                  has_memcard_backups = false;
++    int                   memcard_backups = 10;
++
+     // title_label: short display name for this build in a multi-title
+     // install's "Disc" row (e.g. "Arcade"). Setting it also opts the title
+     // into sibling discovery: the runtime scans the exe dir's PARENT for
+diff --git a/runtime/include/memcard.h b/runtime/include/memcard.h
+index 1275ebcf..e2e575b8 100644
+--- a/runtime/include/memcard.h
++++ b/runtime/include/memcard.h
+@@ -27,6 +27,13 @@ typedef struct {
+  * only used to derive default paths for slots whose path is NULL. */
+ void memcard_init_slots(const char* dir, const MemcardSlotConfig slots[2]);
+ 
++/* How many rolling backups of each card to keep under <memcard_dir>/backups
++ * (0 disables; default 10). A career save is tens of hours of someone's life
++ * and the file is rewritten in place every time the game saves, so one bad
++ * write is otherwise unrecoverable. Taken at load, before the game can touch
++ * the card, and skipped when nothing changed since the last one. */
++void memcard_set_backup_count(int count);
++
+ /* Stateless on-disk introspection (used by the launcher before boot). Parses a
+  * .mcd file's directory frames without touching the live card array. */
+ typedef struct {
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 4c597887..f4761ccc 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -12639,6 +12639,8 @@ int main(int argc, char** argv) {
+             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
+             if (gc.runtime.has_settings_path)
+                 g_cfg_settings_file = gc.runtime.settings_path;
++            if (gc.runtime.has_memcard_backups)
++                memcard_set_backup_count(gc.runtime.memcard_backups);
+             if (gc.runtime.has_title_label)
+                 discover_sibling_titles(argv[0]);
+             g_featured_rows_cfg = gc.runtime.featured_feature_rows;
+diff --git a/runtime/src/memcard.c b/runtime/src/memcard.c
+index a0dfbacd..9088a3b0 100644
+--- a/runtime/src/memcard.c
++++ b/runtime/src/memcard.c
+@@ -153,6 +153,66 @@ static void memcard_ensure_dir(const char* dir) {
+ #endif
+ }
+ 
++/* Rolling card backups. Numbered rather than timestamped so no directory
++ * listing is needed (the two platforms disagree about that) and the set stays
++ * bounded by construction: .1 is the most recent, .N the oldest. */
++static int s_backup_count = 10;
++static unsigned char s_backup_prev[MEMCARD_SIZE];
++
++void memcard_set_backup_count(int count) {
++    if (count < 0) count = 0;
++    if (count > 50) count = 50;
++    s_backup_count = count;
++}
++
++static void memcard_backup(const char* dir, const char* filepath,
++                           const unsigned char* data) {
++    char bdir[512], stem[160], newest[700], from[700], to[700];
++    const char* base;
++    const char* alt;
++    char* dot;
++    FILE* f;
++    int i;
++
++    if (s_backup_count <= 0 || !dir || !dir[0] || !filepath || !filepath[0])
++        return;
++    snprintf(bdir, sizeof(bdir), "%s/backups", dir);
++    memcard_ensure_dir(bdir);
++
++    base = strrchr(filepath, '/');
++    alt = strrchr(filepath, '\\');
++    if (alt > base) base = alt;
++    base = base ? base + 1 : filepath;
++    snprintf(stem, sizeof(stem), "%s", base);
++    dot = strrchr(stem, '.');
++    if (dot) *dot = '\0';
++
++    snprintf(newest, sizeof(newest), "%s/%s.1.mcd", bdir, stem);
++    f = fopen(newest, "rb");
++    if (f) {
++        size_t n = fread(s_backup_prev, 1, MEMCARD_SIZE, f);
++        fclose(f);
++        /* Nothing has changed since the last session - don't push a
++         * duplicate in and age a genuinely different card off the end. */
++        if (n == MEMCARD_SIZE &&
++            memcmp(s_backup_prev, data, MEMCARD_SIZE) == 0)
++            return;
++    }
++
++    snprintf(to, sizeof(to), "%s/%s.%d.mcd", bdir, stem, s_backup_count);
++    remove(to);
++    for (i = s_backup_count - 1; i >= 1; --i) {
++        snprintf(from, sizeof(from), "%s/%s.%d.mcd", bdir, stem, i);
++        snprintf(to, sizeof(to), "%s/%s.%d.mcd", bdir, stem, i + 1);
++        rename(from, to);        /* absent slots fail harmlessly */
++    }
++    f = fopen(newest, "wb");
++    if (f) {
++        fwrite(data, 1, MEMCARD_SIZE, f);
++        fclose(f);
++    }
++}
++
+ void memcard_init_slots(const char* dir, const MemcardSlotConfig slots[2]) {
+     memset(cards, 0, sizeof(cards));
+     memcard_ensure_dir(dir);
+@@ -187,6 +247,8 @@ void memcard_init_slots(const char* dir, const MemcardSlotConfig slots[2]) {
+             if (n == MEMCARD_SIZE) {
+                 cards[i].present = 1;
+                 outcome = "loaded_existing";
++                /* Before the game gets a chance to write to it. */
++                memcard_backup(dir, cards[i].filepath, cards[i].data);
+             } else {
+                 outcome = "rejected_invalid_size";
+             }

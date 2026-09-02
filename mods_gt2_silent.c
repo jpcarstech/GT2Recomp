@@ -441,6 +441,20 @@ static void gt2_arcade_cars_vblank(void) {
     }
 }
 
+/* ---- plain Arcade disc (SCUS-94455): no unlock cheats -------------------
+ * There used to be two VBlank writers here applying the published GameShark
+ * unlock codes (0x800F364E.. track masks, 0x801C93F8.. completion record).
+ * Those codes are for the v1.0 pressing - DuckStation's cheat DB says so in
+ * the file header - and this port targets v1.1, where the same addresses
+ * hold something else. Asserted every VBlank they corrupted the input path:
+ * keyboard and pad both dead, restored the moment they were switched off
+ * (2026-09-02). Removed rather than "fixed" because there is no v1.1 source
+ * to fix them from; the honest path is to reverse-engineer the unlock check
+ * from the v1.1 arcade overlay, as gt2_arcade_tracks/cars_vblank above do
+ * for the Combined Disc. Until then the Arcade disc simply has no unlock
+ * cheats - which is the 1999 experience, not a regression.
+ */
+
 PSX_MOD_CONSTRUCTOR(gt2_register_silent_enhancements) {
     (void)psx_mod_register_vblank_plugin("gt2.display-aspect",
                                          gt2_aspect_vblank);

@@ -1,0 +1,158 @@
+# Gran Turismo 2 Recompiled — runtime config for the Simulation title.
+# Lives in titles/simulation/ next to this title's exe. Shared things (disc images,
+# saves, settings.toml, overlay_toolchain) live two levels up, at the install root.
+#
+# NOTE: this is the RUNTIME variant (game-folder paths, overlay_cache on).
+# The repo-root game.toml is the BUILD variant (disc/ paths, [prepare_disc]).
+# Do not overwrite one with the other.
+
+[game]
+name = "Gran Turismo 2 (Simulation Mode)"
+id = "SCUS-94488"
+players = 2
+exe = "extracted/SCUS_944.88"
+disc = "../../__DISC_CUE__"
+load_address = "0x80010000"
+entry_pc = "0x8005D5C0"
+text_size = "0x00099000"
+stack_base = "0x801FFF00"
+
+# Required by the config loader even at runtime (identifies the recompiler
+# inputs this build was generated from).
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+# Emit a trusted mod hook at the PS-EXE entry: GT2 defeats both of the
+# framework's game-start detectors (HLE handoff skips the entry dispatch;
+# overlays overwrite game text so the clean-text match never fires), so the
+# widescreen engage latch — and the rest of the boot handoff — never
+# triggered. The hook calls fntrace_mark_game_started at entry.
+mod_function_entry_funcs = ["0x8005D5C0"]
+out_dir = "generated"
+strict = true
+
+[runtime]
+window_title = "Gran Turismo 2 (Simulation) Recompiled"
+memcard_dir = "../../saves"
+# Multi-title install: this build's short name in the launcher/F1 "Disc"
+# rows (also opts the title into sibling discovery), and the settings file
+# every title shares so choices follow the player across discs.
+title_label = "Simulation"
+settings_path = "../../settings.toml"
+# Keep the launcher's Cheats page in place even when nothing applies to
+# this disc, and say why - otherwise the page itself disappears and the
+# cheats look like they vanished.
+cheats_page_note = "No cheats for the Simulation disc yet. The published GameShark codes for it are for the v1.2 pressing; this port runs v1.1, and codes for another pressing corrupt the game rather than cheat it. Cheats will appear here as they are verified on this disc."
+# Enhancements live with the player, not with the disc: one shared
+# tree for the whole install, beside the shared settings.toml (this is
+# a plain folder name - the runtime resolves it next to that file, not
+# next to each exe), so ticking 60 FPS or widescreen on one disc has
+# it already on when you switch. Safe because each feature carries its
+# own [[feature.target]]: anything the running disc does not have (the
+# Arcade unlocks) is inert there rather than applied. Verified against
+# DuckStation's cheat DB - the 60 FPS, widescreen, draw-distance,
+# full-LOD-AI and 8 MB-buffer codes are byte-identical for SCUS-94455
+# and SCUS-94488; only the arcade unlocks genuinely differ per disc.
+mods_dir = "mods"
+# Runtime-written diagnostic files go into subfolders instead of the root:
+# crash report + freeze heartbeat -> diagnostics\, freeze dumps -> dumps\.
+diagnostics_dir = "diagnostics"
+dumps_dir = "dumps"
+overlay_cache = true
+# Background overlay compiler: use the full GCC toolchain (C:\msys64\mingw64\bin
+# on the user PATH) instead of the bundled TinyCC — gcc-built shards run
+# significantly faster. Relative paths resolve from the game folder. If gcc is
+# not found on PATH at launch, the runtime falls back to the bundled TinyCC
+# tier automatically; shards from both tiers load side by side.
+overlay_autocompile_cmd = '..\..\overlay_toolchain\python\python.exe ..\..\overlay_toolchain\compile_overlays.py --captures overlay_captures.json --game-toml game.toml --recompiler ..\..\overlay_toolchain\psxrecomp-game.exe --runtime-include ..\..\overlay_toolchain\include --out-dir cache --compiler gcc --jobs 8'
+
+# Frame rate as a first-class launcher/F1 row ("Frame rate: Original (30
+# fps) / 60 FPS"): flips the Silent pack's 60fps feature together with the
+# CPU overclock it needs to actually reach 60. Hidden automatically on a
+# disc the pack doesn't target.
+[[runtime.featured_feature_row]]
+label = "Frame rate"
+package = "gt2.silent-enhancements"
+# Only 60fps itself. Choosing 60 FPS switches the CPU overclock on through
+# the package's requires_feature constraint; choosing Original (30 fps)
+# leaves the overclock as it is, because it is doing real work at 30 fps
+# too - full-detail AI cars and the longer draw distance load the emulated
+# CPU/GTE, and without it the game dips below its own frame rate exactly
+# where the console did. Overclock has its own row on the Mods page.
+features = ["60fps"]
+off_label = "Original (30 fps)"
+on_label = "60 FPS"
+help = "60 FPS doubles the game's simulation rate; choosing it switches on the CPU overclock it needs. Original (30 fps) is how GT2 shipped, and keeps the overclock if you have it on - with full-detail AI cars and the longer draw distance the game needs it to hold 30 (untick it on the Mods page for the true 1999 feel). Old replays and Rally ghosts don't work at 60."
+
+# One-click presets on the launcher's Mods page, beside Enable all /
+# Disable all. GT2 ships with everything OFF - the 1999 game out of the box -
+# and these are the two answers most players actually want, without having to
+# know that 60 FPS needs the overclock or that full-detail AI needs the 8 MB
+# buffers. Applying one clears the page and switches on exactly what it names.
+[[runtime.feature_preset]]
+label = "Authentic 1999"
+description = "Turn everything off and play it exactly as it shipped: 30 fps, 4:3, original draw distance."
+
+[[runtime.feature_preset]]
+label = "Enhanced"
+description = "The best-running setup: widescreen 16:9, geometry correction, longer draw distance and full-detail AI cars, with the CPU overclock (200%) that keeps the game at a solid 30 fps with those on. 60 FPS is one row away (the Frame rate setting) if your PC has the headroom; Fast Loading is on the list below if you want it."
+# Tuned on real hardware for the best frame rate, not the longest feature
+# list: 60 FPS stays OFF here because at 60 the emulated CPU has to do a
+# frame's work in half the time AND run at 325%, which on most PCs costs
+# more than it gives; the Frame rate row is one click for those who have
+# the headroom. Fast Loading is deliberately not part of Enhanced either -
+# it changes the feel between races rather than the game itself, so it is
+# a choice a player makes on their own.
+enable = [
+  "psx.enhancement.pgxp/pgxp",
+  "gt2.silent-enhancements/aspect",
+  "gt2.silent-enhancements/overclock",
+  "gt2.silent-enhancements/draw_distance",
+  "gt2.silent-enhancements/full_lod_ai",
+]
+
+[widescreen]
+# Native-wide (default) only presents wide when the game renders extra width —
+# untuned GT2 culls to 4:3, so it pillarboxes. Squash mode is the generic
+# DuckStation-style hack: GTE X-squash + wide stretch, with the framework's
+# per-prim proportion correction for HUD/sprites. Revisit when GT2 gets
+# cull-site tuning for true native-wide.
+native_wide = false
+# The game renders widescreen NATIVELY in races (Silent's 16:9 patch, applied
+# by the Aspect Ratio mod): keep the framework's GTE X-squash at identity so
+# the widening is not applied twice. Present/classification stay squash-mode.
+gte_squash = false
+# Gameplay classifier: a RAM-word gate decides the wide present (it takes
+# priority over the per-frame GTE detector, which flapped through the
+# pre-race flow's 2D-heavy frames).
+gameplay_state_addr = "0x80060000"
+# ALWAYS-WIDE (DuckStation behavior): the gate word is EXE code at
+# 0x80060000, ABOVE every overlay's load extent (max 0x8005D5B4), so it is
+# loaded at boot and never overwritten — the gate matches from the moment
+# the game EXE is in RAM, for every screen. (The earlier overlay-identity
+# list at 0x80016A6C missed at least one screen — course select still
+# flipped 4:3.) FMV still presents 4:3 (checked after this gate); the BIOS
+# logos present 4:3 too (RAM is zero there before the EXE loads).
+gameplay_state_values = ["0x0200A821"]
+# Fallback per-frame GTE detector (unused while the state gate matches -1
+# never happens with the gate configured, but harmless to keep).
+gte_game_mode = true
+# Course select / menu backdrops are 24-bit STILL images on the FMV display
+# path and were pinned 4:3; only real MDEC playback (the intro and movies)
+# should stay 4:3. Requires the stretch-stills carried patch (rebuild).
+stretch_24bpp_stills = true
+
+[video]
+renderer = "opengl"
+aspect_ratio = "4:3"   # launcher Settings overrides; "16:10" also valid here
+# PGXP geometry tolerance, in pixels. -1 (DuckStation's setting) disables the
+# acceptance gate — but our engine's fallback corrector lacks DuckStation's
+# full per-vertex provenance, so at -1 adjacent polygons sharing a vertex can
+# receive different corrections and thin GAPS open along ground seams
+# (observed in-race 2026-08-28). 0.1 is the user-validated sweet spot: stable
+# image, wobble fixed, no seams. Revisit -1 after the PGXP coverage work.
+pgxp_tolerance = 0.1
+
+[controller]
+default_mode = "analog"
+p1_device = "auto"
+multitap_analog = true

@@ -1,0 +1,109 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 914d84ed..68d5ed9b 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -364,6 +364,18 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         rt.memcard_dir = fs::absolute(root / rel);
+         rt.has_memcard_dir = true;
+     }
++    if (runtime.contains("settings_path")) {
++        /* Shared settings file for multi-title installs (see config_loader.h).
++         * Resolved against the project root like memcard_dir, so a per-title
++         * game.toml can point outward ("../../settings.toml"). */
++        const auto rel = toml::find<std::string>(runtime, "settings_path");
++        if (rel.empty()) {
++            throw std::runtime_error(
++                "[runtime] settings_path must not be empty");
++        }
++        rt.settings_path = fs::absolute(root / rel);
++        rt.has_settings_path = true;
++    }
+     if (runtime.contains("disc_speed")) {
+         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+         rt.has_disc_speed = true;
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 4970af40..a786a46f 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -182,6 +182,13 @@ struct RuntimeConfig {
+     bool                  has_memcard_dir = false;
+     std::filesystem::path memcard_dir;     // absolute path (resolved against project root)
+ 
++    // settings_path: where settings.toml lives (absolute, resolved against
++    // project root). Default: "settings.toml" next to the exe. A multi-title
++    // install points every title at one shared file (e.g. "../../settings.toml")
++    // so video/controller/patch choices follow the player across discs.
++    bool                  has_settings_path = false;
++    std::filesystem::path settings_path;
++
+     // mods_dir: name of the mod-package directory next to the exe (default
+     // "mods"). Plain directory name only - resolved against the exe dir at
+     // runtime, so a port can name the folder after what its launcher calls
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index f47fa381..d01a555f 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2194,6 +2194,18 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+     return exe_dir;
+ }
+ 
++/* [runtime] settings_path from game.toml (absolute, resolved by the config
++ * loader against the config's own directory). Multi-title installs point
++ * every title at one shared settings.toml so the player's video/controller/
++ * patch choices follow them across discs. Empty -> the historical default,
++ * settings.toml next to the exe. Set once at config load, before any
++ * settings read. */
++static std::filesystem::path g_cfg_settings_file;
++static std::filesystem::path settings_file_path(const char* argv0) {
++    if (!g_cfg_settings_file.empty()) return g_cfg_settings_file;
++    return exe_dir_from_argv(argv0) / "settings.toml";
++}
++
+ static std::filesystem::path resolve_existing_runtime_path(const char* requested,
+                                                            const char* argv0) {
+     namespace fs = std::filesystem;
+@@ -12065,6 +12077,8 @@ int main(int argc, char** argv) {
+             }
+             if (!gc.discs.empty()) resolved_disc = gc.discs.front();
+             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
++            if (gc.runtime.has_settings_path)
++                g_cfg_settings_file = gc.runtime.settings_path;
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+             if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
+@@ -12505,7 +12519,7 @@ int main(int argc, char** argv) {
+     bool user_settings_has_renderer = false;
+     {
+         std::filesystem::path settings_path =
+-            exe_dir_from_argv(argv[0]) / "settings.toml";
++            settings_file_path(argv[0]);
+         g_runtime_settings_path = settings_path;
+ #if defined(RECOMP_LAUNCHER)
+         g_lnch_settings_path = settings_path;
+@@ -13709,7 +13723,7 @@ int main(int argc, char** argv) {
+                  * identity survive untouched. */
+                 {
+                     std::filesystem::path sp =
+-                        exe_dir_from_argv(argv[0]) / "settings.toml";
++                        settings_file_path(argv[0]);
+                     PSXRecompV4::UserSettings qs =
+                         PSXRecompV4::load_user_settings(sp);
+                     if (!qs.parse_error) {
+@@ -13889,7 +13903,7 @@ int main(int argc, char** argv) {
+                 g_video_win_w = seed.window_width;
+                 /* Persist the user's choices next to the exe. */
+                 if (!PSXRecompV4::save_user_settings(
+-                        exe_dir_from_argv(argv[0]) / "settings.toml", seed))
++                        settings_file_path(argv[0]), seed))
+                     std::fprintf(stderr,
+                         "psxrecomp: WARNING: settings.toml save failed on "
+                         "launch - settings will not persist\n");
+@@ -15553,7 +15567,7 @@ soft_return_lobby:
+              * the rest of settings.toml — merge into the on-disk file. */
+             {
+                 const auto settings_path =
+-                    exe_dir_from_argv(argv[0]) / "settings.toml";
++                    settings_file_path(argv[0]);
+                 PSXRecompV4::UserSettings us =
+                     PSXRecompV4::load_user_settings(settings_path);
+                 const int un = std::min(PSX_MAX_PLAYERS,

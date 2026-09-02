@@ -1,0 +1,293 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index e4159051..75209fc5 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -387,6 +387,30 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         rt.title_label = label;
+         rt.has_title_label = true;
+     }
++    if (runtime.contains("featured_feature_row")) {
++        /* Promoted launcher rows over mod features (config_loader.h). */
++        const auto rows = toml::find(runtime, "featured_feature_row");
++        for (const toml::value& row : rows.as_array()) {
++            RuntimeConfig::FeaturedFeatureRow r;
++            r.label   = toml::find<std::string>(row, "label");
++            r.package = toml::find<std::string>(row, "package");
++            for (const auto& f :
++                 toml::find<std::vector<std::string>>(row, "features"))
++                r.features.push_back(f);
++            if (r.label.empty() || r.package.empty() || r.features.empty()) {
++                throw std::runtime_error(
++                    "[[runtime.featured_feature_row]] needs label, package "
++                    "and a non-empty features list");
++            }
++            if (row.contains("off_label"))
++                r.off_label = toml::find<std::string>(row, "off_label");
++            if (row.contains("on_label"))
++                r.on_label = toml::find<std::string>(row, "on_label");
++            if (row.contains("help"))
++                r.help = toml::find<std::string>(row, "help");
++            rt.featured_feature_rows.push_back(std::move(r));
++        }
++    }
+     if (runtime.contains("disc_speed")) {
+         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+         rt.has_disc_speed = true;
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 58794874..b1ce1a3e 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -197,6 +197,28 @@ struct RuntimeConfig {
+     bool                  has_title_label = false;
+     std::string           title_label;
+ 
++    // featured_feature_row: promote a mod feature (plus its prerequisite
++    // features, flipped together) to a first-class launcher settings row —
++    // e.g. GT2's "Frame rate: Original (30 fps) / 60 FPS" over the Silent
++    // pack's 60fps + overclock features. The launcher hides a row whose
++    // package can't target the running title.
++    //   [[runtime.featured_feature_row]]
++    //   label = "Frame rate"
++    //   package = "gt2.silent-enhancements"
++    //   features = ["60fps", "overclock"]   # [0] carries the on/off state
++    //   off_label = "Original (30 fps)"
++    //   on_label = "60 FPS"
++    //   help = "..."                        # optional tooltip
++    struct FeaturedFeatureRow {
++        std::string label;
++        std::string off_label;
++        std::string on_label;
++        std::string help;
++        std::string package;
++        std::vector<std::string> features;
++    };
++    std::vector<FeaturedFeatureRow> featured_feature_rows;
++
+     // mods_dir: name of the mod-package directory next to the exe (default
+     // "mods"). Plain directory name only - resolved against the exe dir at
+     // runtime, so a port can name the folder after what its launcher calls
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index ce5d1fd9..7d5a6d67 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2332,7 +2332,41 @@ static void discover_sibling_titles(const char* argv0) {
+     }
+ }
+ 
++/* [runtime] featured_feature_row config, captured at config load. String
++ * storage for both the launcher rows and the F1 surface. */
++static std::vector<PSXRecompV4::RuntimeConfig::FeaturedFeatureRow>
++    g_featured_rows_cfg;
++
+ #if defined(RECOMP_LAUNCHER)
++static std::vector<std::vector<const char*>> g_featured_row_fid_ptrs;
++static std::vector<RecompLauncherCFeaturedModRow> g_featured_rows_abi;
++static void apply_featured_rows_to_game_info(RecompLauncherCGameInfo* gi) {
++    if (!gi || g_featured_rows_cfg.empty()) return;
++    if (g_featured_rows_abi.empty()) {
++        g_featured_row_fid_ptrs.clear();
++        g_featured_row_fid_ptrs.reserve(g_featured_rows_cfg.size());
++        for (const auto& r : g_featured_rows_cfg) {
++            g_featured_row_fid_ptrs.emplace_back();
++            auto& ids = g_featured_row_fid_ptrs.back();
++            for (const auto& f : r.features) ids.push_back(f.c_str());
++        }
++        for (size_t i = 0; i < g_featured_rows_cfg.size(); ++i) {
++            const auto& r = g_featured_rows_cfg[i];
++            RecompLauncherCFeaturedModRow row{};
++            row.label      = r.label.c_str();
++            row.off_label  = r.off_label.empty() ? nullptr : r.off_label.c_str();
++            row.on_label   = r.on_label.empty() ? nullptr : r.on_label.c_str();
++            row.help       = r.help.empty() ? nullptr : r.help.c_str();
++            row.package_id = r.package.c_str();
++            row.feature_ids = g_featured_row_fid_ptrs[i].data();
++            row.num_feature_ids = (int)g_featured_row_fid_ptrs[i].size();
++            g_featured_rows_abi.push_back(row);
++        }
++    }
++    gi->featured_mod_rows = g_featured_rows_abi.data();
++    gi->num_featured_mod_rows = (int)g_featured_rows_abi.size();
++}
++
+ static void apply_sibling_titles_to_game_info(RecompLauncherCGameInfo* gi) {
+     if (!gi || g_sibling_active < 0 || g_sibling_titles.size() < 2) return;
+     gi->title_labels    = g_sibling_label_ptrs.data();
+@@ -6397,6 +6431,43 @@ static const char kRuntimeDiscTitleSwitch[] = "system.disc_title_switch";
+ static std::vector<const char*> g_f1_title_choices; /* installed labels */
+ static std::vector<int>         g_f1_title_map;     /* -> g_sibling_titles */
+ static int g_f1_title_pending = -1;                 /* choice index */
++
++/* F1 "Frame rate" rows: the FIRST [runtime] featured_feature_row surfaced
++ * in-game as a choice + an apply action. Applying flips the row's features
++ * through the mod provider (persisted like any Patches-tab toggle) and, in
++ * a multi-title install, restarts the running title through the same
++ * deferred relaunch the disc switch uses — mod plans only commit at launch. */
++static const char kRuntimeFrameRate[]      = "system.frame_rate";
++static const char kRuntimeFrameRateApply[] = "system.frame_rate_apply";
++static int g_f1_framerate_pending = -1;    /* -1 = follow current; 0/1 */
++static const char* g_f1_framerate_choices[2] = {nullptr, nullptr};
++
++/* Current state of the first featured row per the provider. Returns 0/1;
++ * -1 when the row's features aren't all listed for this title (wrong disc /
++ * package missing) — the rows are disabled then. */
++static int f1_featured_row_state(void) {
++    if (g_featured_rows_cfg.empty()) return -1;
++    const RecompLauncherCModProvider* p =
++        PSXRecompV4::mod_runtime_launcher_provider();
++    if (!p || !p->feature_count || !p->feature_get) return -1;
++    const auto& row = g_featured_rows_cfg[0];
++    int found = 0;
++    int first_enabled = 0;
++    const int n = p->feature_count(p->ctx);
++    for (int i = 0; i < n; ++i) {
++        RecompLauncherCModFeature f;
++        if (!p->feature_get(p->ctx, i, &f)) continue;
++        if (row.package != f.package_id) continue;
++        for (size_t k = 0; k < row.features.size(); ++k) {
++            if (row.features[k] != f.id) continue;
++            ++found;
++            if (k == 0) first_enabled = f.enabled ? 1 : 0;
++        }
++    }
++    if (found < (int)row.features.size()) return -1;
++    return first_enabled;
++}
++
+ /* Set by the F1 Switch action; applied AFTER the menu's pause loop unwinds.
+  * shutdown_runtime() must never run from inside that loop: the guest/render
+  * threads are frozen at the VBlank boundary waiting for the menu to close,
+@@ -6486,6 +6557,12 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+         if (g_f1_title_pending < 0) return 0;
+         *value_out = g_f1_title_pending;
+     }
++    else if (std::strcmp(item->key, kRuntimeFrameRate) == 0) {
++        const int cur = f1_featured_row_state();
++        if (cur < 0 && g_f1_framerate_pending < 0) return 0;
++        *value_out = g_f1_framerate_pending >= 0 ? g_f1_framerate_pending
++                                                 : cur;
++    }
+     else if (std::strncmp(item->key, "pgxp.", 5) == 0)
+         return pgxp_ui_get(item->key, value_out);
+     else if (std::strcmp(item->key, kDisplayScaling) == 0)
+@@ -6536,6 +6613,9 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+     } else if (std::strcmp(item->key, kRuntimeDiscTitle) == 0) {
+         if (value < 0 || value >= (int)g_f1_title_map.size()) return 0;
+         g_f1_title_pending = value;   /* applied by the Switch action */
++    } else if (std::strcmp(item->key, kRuntimeFrameRate) == 0) {
++        if (value < 0 || value > 1) return 0;
++        g_f1_framerate_pending = value;   /* applied by the Apply action */
+     } else if (std::strncmp(item->key, "pgxp.", 5) == 0) {
+         if (!pgxp_ui_set(item->key, value)) return 0;
+     } else if (std::strcmp(item->key, kDisplayScaling) == 0) {
+@@ -6742,6 +6822,32 @@ static int runtime_ui_run_action(void *opaque,
+             recomp_runtime_ui_close(context->ui);
+         return 1;
+     }
++    if (std::strcmp(item->key, kRuntimeFrameRateApply) == 0) {
++        const int cur = f1_featured_row_state();
++        if (cur < 0 || g_f1_framerate_pending < 0 ||
++            g_f1_framerate_pending == cur || psx_netplay_active())
++            return 0;
++        const RecompLauncherCModProvider* p =
++            PSXRecompV4::mod_runtime_launcher_provider();
++        if (!p || !p->feature_enable) return 0;
++        const auto& row = g_featured_rows_cfg[0];
++        for (const auto& fid : row.features)
++            (void)p->feature_enable(p->ctx, row.package.c_str(), fid.c_str(),
++                                    g_f1_framerate_pending);
++        /* Mod plans commit at launch: restart the running title through the
++         * deferred relaunch (multi-title installs). Single-build installs
++         * just get the note — the change lands on the next launch. */
++        if (g_sibling_active >= 0 && !g_sibling_titles.empty()) {
++            g_f1_title_switch_target = g_sibling_active;
++            host_osd_push("Applying frame rate...", 1800);
++        } else {
++            host_osd_push("Frame rate change applies from the next launch",
++                          2600);
++        }
++        if (context && context->ui)
++            recomp_runtime_ui_close(context->ui);
++        return 1;
++    }
+     if (std::strcmp(item->key, kRuntimeDiscChange) == 0)
+         return runtime_ui_change_disc(context);
+     if (std::strcmp(item->key, kRuntimeDiscReinsert) == 0) {
+@@ -6766,6 +6872,13 @@ static int runtime_ui_is_enabled(void*, const RecompRuntimeUiItem *item) {
+         return g_f1_title_map.size() > 1 && !psx_netplay_active();
+     if (std::strcmp(item->key, kRuntimeDiscTitleSwitch) == 0)
+         return f1_title_switch_ready() && !psx_netplay_active();
++    if (std::strcmp(item->key, kRuntimeFrameRate) == 0)
++        return f1_featured_row_state() >= 0 && !psx_netplay_active();
++    if (std::strcmp(item->key, kRuntimeFrameRateApply) == 0) {
++        const int cur = f1_featured_row_state();
++        return cur >= 0 && g_f1_framerate_pending >= 0 &&
++               g_f1_framerate_pending != cur && !psx_netplay_active();
++    }
+     return 1;
+ }
+ 
+@@ -6862,6 +6975,40 @@ static void runtime_settings_ui_ensure_created(void) {
+         apply.type = RECOMP_RUNTIME_UI_ACTION;
+         all_items.push_back(apply);
+     }
++    if (!g_featured_rows_cfg.empty() && f1_featured_row_state() >= 0) {
++        const auto& r = g_featured_rows_cfg[0];
++        g_f1_framerate_choices[0] =
++            r.off_label.empty() ? "Off" : r.off_label.c_str();
++        g_f1_framerate_choices[1] =
++            r.on_label.empty() ? "On" : r.on_label.c_str();
++        static std::string fr_label, fr_help, fr_apply_label;
++        fr_label = r.label;
++        fr_help  = r.help.empty()
++            ? std::string("Pick a value, then apply it with the row below.")
++            : r.help;
++        fr_apply_label = "Apply " + r.label + " (restarts game)";
++        RecompRuntimeUiItem pick{};
++        pick.key = kRuntimeFrameRate;
++        pick.section = "Display";
++        pick.label = fr_label.c_str();
++        pick.description = fr_help.c_str();
++        pick.type = RECOMP_RUNTIME_UI_CHOICE;
++        pick.minimum = 0;
++        pick.maximum = 1;
++        pick.step = 1;
++        pick.choices = g_f1_framerate_choices;
++        pick.choice_count = 2;
++        all_items.push_back(pick);
++        RecompRuntimeUiItem apply{};
++        apply.key = kRuntimeFrameRateApply;
++        apply.section = "Display";
++        apply.label = fr_apply_label.c_str();
++        apply.description =
++            "The change takes effect at launch, so this quits cleanly and "
++            "boots the same disc again with the new setting.";
++        apply.type = RECOMP_RUNTIME_UI_ACTION;
++        all_items.push_back(apply);
++    }
+ 
+     RecompRuntimeUiStandardConfig config{};
+     config.menu.title = "Runtime settings";
+@@ -12446,6 +12593,7 @@ int main(int argc, char** argv) {
+                 g_cfg_settings_file = gc.runtime.settings_path;
+             if (gc.runtime.has_title_label)
+                 discover_sibling_titles(argv[0]);
++            g_featured_rows_cfg = gc.runtime.featured_feature_rows;
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+             if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
+@@ -13825,6 +13973,7 @@ int main(int argc, char** argv) {
+ #endif
+ #endif /* PSX_HAS_SETUP_WIZARD */
+             apply_sibling_titles_to_game_info(&gi);
++            apply_featured_rows_to_game_info(&gi);
+             launcher_boot_timing_mark("host:setup_checks_done");
+ #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+             g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;
+@@ -15841,6 +15990,7 @@ soft_return_lobby:
+         psx_game_codegen_setup_apply(&gi);
+ #endif
+         apply_sibling_titles_to_game_info(&gi);
++        apply_featured_rows_to_game_info(&gi);
+ 
+         char rui_out_disc[1024] = {0};
+         recomp_launcher_set_preserve_sdl(1);

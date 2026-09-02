@@ -1,0 +1,445 @@
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index edafa9a4..f132a64a 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -420,6 +420,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+             rt.featured_feature_rows.push_back(std::move(r));
+         }
+     }
++    if (runtime.contains("cheats_page_note")) {
++        rt.cheats_page_note = toml::find<std::string>(runtime, "cheats_page_note");
++        rt.has_cheats_page_note = !rt.cheats_page_note.empty();
++    }
+     if (runtime.contains("feature_preset")) {
+         /* One-click enhancement presets (config_loader.h). */
+         const auto presets = toml::find(runtime, "feature_preset");
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 174a315d..a754f18d 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -240,6 +240,14 @@ struct RuntimeConfig {
+     };
+     std::vector<FeaturePreset> feature_presets;
+ 
++    // cheats_page_note: keep the launcher's Cheats page offered even when no
++    // cheat applies to the running disc, and show this text there meanwhile.
++    // A multi-disc port's cheats exist for one disc and not another; without
++    // this the launcher changes shape between discs and the cheats "vanish".
++    //   [runtime] cheats_page_note = "No cheats for this disc yet - ..."
++    std::string cheats_page_note;
++    bool has_cheats_page_note = false;
++
+     // mods_dir: name of the mod-package directory next to the exe (default
+     // "mods"). Plain directory name only - resolved against the exe dir at
+     // runtime, so a port can name the folder after what its launcher calls
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index f4761ccc..73a4b539 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2206,6 +2206,27 @@ static std::filesystem::path settings_file_path(const char* argv0) {
+     return exe_dir_from_argv(argv0) / "settings.toml";
+ }
+ 
++/* Where the player's OWN configuration lives, as opposed to this build's.
++ * settings.toml is only part of it: input.ini (pad mapping) and keybinds.ini
++ * (keyboard/hotkeys) are the same kind of thing -- one player's preferences,
++ * not a property of the disc -- and a multi-title install must keep them
++ * together or remapping a button on one disc silently leaves the others on
++ * defaults. Anchored to the shared settings.toml's own directory, so opting
++ * a title into [runtime] settings_path moves the whole set with it and there
++ * is no second key to keep consistent. Empty settings_path -> the exe dir,
++ * the single-title layout, unchanged.
++ *
++ * Deliberately NOT moved: patches/ (the enabled mods and cheats -- those ARE
++ * a property of the disc and differ between them) and disc.cfg (each title's
++ * own image). */
++static std::filesystem::path shared_config_dir(const char* argv0) {
++    if (!g_cfg_settings_file.empty()) {
++        std::filesystem::path d = g_cfg_settings_file.parent_path();
++        if (!d.empty()) return d;
++    }
++    return exe_dir_from_argv(argv0);
++}
++
+ /* ---- multi-title installs (sibling disc titles) ---------------------------
+  * A game sold across several discs can be installed as SIBLING BUILDS, one
+  * folder per recompiled title under a shared parent:
+@@ -2224,6 +2245,17 @@ struct SiblingTitle {
+ };
+ static std::vector<SiblingTitle> g_sibling_titles;   /* sorted by dir_name */
+ static int g_sibling_active = -1;                    /* index of THIS build */
++
++/* Stamp the RUNNING title into a settings object about to be saved.
++ * The launcher persists an object it BUILT from its own fields, not one it
++ * loaded, so every key it does not know about is dropped the next time the
++ * player presses Play - and [launcher] active_title is one of those. Losing
++ * it makes the root stub fall back to the first installed disc: the player
++ * chooses Arcade, quits, and comes back to Simulation with nothing on screen
++ * explaining why. The title that is running is the authority on which title
++ * is active, so there is nothing to preserve - just restate it. No-op for a
++ * single-title install. */
++static void stamp_active_title(PSXRecompV4::UserSettings& s);
+ static std::string g_sibling_argv0;                  /* argv[0] at discovery */
+ /* Borrowed C views for RecompLauncherCGameInfo (outlive run_window). */
+ static std::vector<const char*> g_sibling_label_ptrs;
+@@ -2338,6 +2370,7 @@ static std::vector<PSXRecompV4::RuntimeConfig::FeaturedFeatureRow>
+     g_featured_rows_cfg;
+ static std::vector<PSXRecompV4::RuntimeConfig::FeaturePreset>
+     g_feature_presets_cfg;
++static std::string g_cheats_page_note_cfg;   /* [runtime] cheats_page_note */
+ 
+ #if defined(RECOMP_LAUNCHER)
+ static std::vector<std::vector<const char*>> g_featured_row_fid_ptrs;
+@@ -4491,22 +4524,30 @@ static std::string default_input_ini_text(void) {
+         "rs_right = rightx+\n";
+ }
+ 
++/* Full path, never the bare directory: psx_keybinds' resolver guesses
++ * file-vs-directory from "does the last component contain a dot", and a
++ * perfectly ordinary install folder ("GT2 v0.2", "Games 1.2") would be
++ * mistaken for a file and drop the binds a level up. */
++static std::string shared_keybinds_path(const char* argv0) {
++    return (shared_config_dir(argv0) / "keybinds.ini").string();
++}
++
+ static void load_input_config(const char* argv0) {
+     set_default_controller_mapping();
+ 
+     namespace fs = std::filesystem;
+-    fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
++    fs::path config_path = shared_config_dir(argv0) / "input.ini";
+     std::error_code ec;
+     if (!fs::exists(config_path, ec)) {
+         std::ofstream out(config_path, std::ios::binary);
+         if (out) out << default_input_ini_text();
+-        psx_keybinds_init(argv0);
++        psx_keybinds_init(shared_keybinds_path(argv0).c_str());
+         return;
+     }
+ 
+     std::ifstream in(config_path);
+     if (!in) {
+-        psx_keybinds_init(argv0);
++        psx_keybinds_init(shared_keybinds_path(argv0).c_str());
+         return;
+     }
+ 
+@@ -4574,7 +4615,7 @@ static void load_input_config(const char* argv0) {
+      * from input.ini's gamepad map. Loads the user's map (or writes defaults on
+      * first run). The launcher may have just edited+saved this file; we re-read
+      * it here so the runtime always reflects the current bindings. */
+-    psx_keybinds_init(argv0);
++    psx_keybinds_init(shared_keybinds_path(argv0).c_str());
+ }
+ 
+ static void close_player(PlayerInput& p) {
+@@ -6774,6 +6815,14 @@ static int f1_title_switch_ready(void) {
+            g_f1_title_map[g_f1_title_pending] != g_sibling_active;
+ }
+ 
++static void stamp_active_title(PSXRecompV4::UserSettings& s) {
++    if (g_sibling_active < 0 ||
++        g_sibling_active >= (int)g_sibling_titles.size())
++        return;
++    s.active_title = g_sibling_titles[(size_t)g_sibling_active].dir_name;
++    s.has_active_title = true;
++}
++
+ static void f1_title_switch_now(void) {
+     namespace fs = std::filesystem;
+     if (g_f1_title_switch_target < 0 ||
+@@ -6794,6 +6843,22 @@ static void f1_title_switch_now(void) {
+     /* Same clean path as double-Escape quit; only then start the sibling. */
+     psx_crash_trace_set_exit_origin("disc_title_switch");
+     shutdown_runtime();
++    /* Hand the host input devices back to the OS BEFORE the sibling starts.
++     * shutdown_runtime -> close_controller drops OUR gamepad handles, but the
++     * SDL joystick subsystem keeps the underlying HID/DirectInput ones open
++     * until it is quit, and on Windows those are not shareable: the child
++     * opens the same pad a few milliseconds later, the open fails, and the
++     * controller is dead for the whole switched-to session while keyboard
++     * still works. Destroying the window here also makes the switch read as
++     * one window replacing another instead of two briefly overlapping. */
++    if (g_vk_active) { vk_renderer_shutdown(); g_vk_active = false; }
++    if (g_gl_active) { gl_renderer_shutdown(); g_gl_active = false; }
++    if (sdl_texture)   { SDL_DestroyTexture(sdl_texture);   sdl_texture = nullptr; }
++    if (sdl_renderer)  { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
++    if (sdl_window)    { SDL_DestroyWindow(sdl_window);     sdl_window = nullptr; }
++    SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK |
++                      SDL_INIT_HAPTIC);
++    SDL_Quit();
+     const fs::path exe_dir = fs::path(t.exe).parent_path();
+     std::fprintf(stdout, "psxrecomp: disc switch -> %s\n", t.exe.c_str());
+ #ifdef _WIN32
+@@ -6999,12 +7064,27 @@ static void runtime_settings_ui_ensure_created(void) {
+     static std::vector<RecompRuntimeUiItem> all_items;
+     all_items.assign(extras, extras + sizeof(extras) / sizeof(extras[0]));
+     if (g_f1_title_map.size() > 1) {
++        /* A multi-disc install keeps the Disc section to exactly two rows:
++         * cycle through the INSTALLED discs, and switch to the chosen one.
++         * The framework's "Change disc..." (mount any image file) and
++         * "Reinsert current disc" (tray cycle) go: each title is a build of
++         * one specific image, so mounting another file into it is the one
++         * thing a player must not be offered - and the tray cycle only
++         * exists for games that ask for a swap mid-session, which a
++         * sibling-title install never does. Single-title games keep both. */
++        all_items.erase(
++            std::remove_if(all_items.begin(), all_items.end(),
++                [](const RecompRuntimeUiItem& it) {
++                    return it.key == kRuntimeDiscChange ||
++                           it.key == kRuntimeDiscReinsert;
++                }),
++            all_items.end());
+         RecompRuntimeUiItem pick{};
+         pick.key = kRuntimeDiscTitle;
+         pick.section = "Disc";
+-        pick.label = "Game disc";
++        pick.label = "Disc";
+         pick.description =
+-            "Pick another installed disc of this game, then apply it with "
++            "Left/right to choose one of your installed discs, then "
+             "'Switch disc' below.";
+         pick.type = RECOMP_RUNTIME_UI_CHOICE;
+         pick.minimum = 0;
+@@ -7018,8 +7098,8 @@ static void runtime_settings_ui_ensure_created(void) {
+         apply.section = "Disc";
+         apply.label = "Switch disc (restarts game)";
+         apply.description =
+-            "Quit this disc cleanly and boot the selected one. Memory cards "
+-            "are shared, so your saves are right there.";
++            "Boot the chosen disc. Your settings, enhancements and memory "
++            "cards are shared, so everything is right where you left it.";
+         apply.type = RECOMP_RUNTIME_UI_ACTION;
+         all_items.push_back(apply);
+     }
+@@ -7071,6 +7151,9 @@ static void runtime_settings_ui_ensure_created(void) {
+     config.menu.callbacks.is_enabled = runtime_ui_is_enabled;
+     config.menu.callbacks.save = runtime_ui_save;
+     config.menu.callbacks.visibility_changed = runtime_ui_visibility_changed;
++    /* A multi-disc install opens F1 to change discs far more often than to
++     * tune anything, so that section leads. Single-title: standard order. */
++    config.menu.first_section = (g_f1_title_map.size() > 1) ? "Disc" : nullptr;
+     config.features =
+         RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
+         RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE |
+@@ -12194,7 +12277,7 @@ namespace {
+     };
+ 
+     void ae_rui_set_sidecar_paths(const char* argv0) {
+-        const auto exe = exe_dir_from_argv(argv0 ? argv0 : "");
++        const auto exe = shared_config_dir(argv0 ? argv0 : "");
+         g_rui_keybinds_path = (exe / "keybinds.ini").string();
+         g_rui_config_ini_path = (exe / "config.ini").string();
+     }
+@@ -12540,6 +12623,11 @@ int main(int argc, char** argv) {
+     std::string resolved_language = "en";
+     std::vector<PSXRecompV4::RuntimeConfig::LanguageOption> lang_menu_options;
+     std::filesystem::path resolved_disc;
++    /* The disc image game.toml declares for THIS build, kept apart from
++     * resolved_disc because everything downstream may overwrite that one.
++     * A sibling-title install re-pins to this before mounting: see the
++     * comment at resolve_disc_for_runtime below. */
++    std::filesystem::path config_declared_disc;
+     /* game.toml [game] discs, in disc order -- the images this build was made
+      * from. Single-disc titles leave one entry (or none). This is the roster
+      * the launcher's Disc Selection dropdown offers and the list [disc]
+@@ -12635,7 +12723,27 @@ int main(int argc, char** argv) {
+                 g_disc_netplay_fps[uppercase_ascii(gc.discs[i].stem().string())] =
+                     gc.netplay_required_disc_fps[i];
+             }
+-            if (!gc.discs.empty()) resolved_disc = gc.discs.front();
++            if (!gc.discs.empty()) {
++                /* Make it ABSOLUTE here, resolved from the EXE dir - never
++                 * left relative for someone downstream to resolve against the
++                 * current directory. game.toml spells this disc "../../x.cue",
++                 * which is correct relative to the title folder and wrong
++                 * relative to anything else, and the launcher tests it with
++                 * std::filesystem::exists(): started from a shortcut or a
++                 * helper script, that test fails, the launcher drops the disc
++                 * it was given and substitutes whichever one the shared
++                 * settings file remembers - which is how the Arcade build came
++                 * to mount the Simulation image. */
++                config_declared_disc = gc.discs.front();
++                if (config_declared_disc.is_relative()) {
++                    const std::filesystem::path r = resolve_existing_runtime_path(
++                        config_declared_disc.string().c_str(), argv[0]);
++                    if (!r.empty()) config_declared_disc = r;
++                }
++                config_declared_disc =
++                    normalize_disc_path_for_launch(config_declared_disc);
++                resolved_disc = config_declared_disc;
++            }
+             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
+             if (gc.runtime.has_settings_path)
+                 g_cfg_settings_file = gc.runtime.settings_path;
+@@ -12645,6 +12753,8 @@ int main(int argc, char** argv) {
+                 discover_sibling_titles(argv[0]);
+             g_featured_rows_cfg = gc.runtime.featured_feature_rows;
+             g_feature_presets_cfg = gc.runtime.feature_presets;
++            if (gc.runtime.has_cheats_page_note)
++                g_cheats_page_note_cfg = gc.runtime.cheats_page_note;
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+             if (gc.runtime.has_mods_dir && !gc.runtime.mods_dir.empty())
+@@ -13065,6 +13175,20 @@ int main(int argc, char** argv) {
+         } catch (const std::exception& ex) {
+             std::fprintf(stderr, "psxrecomp: failed to load --game %s: %s\n",
+                          game_config_path, ex.what());
++            /* SAY SO. This build is GUI-subsystem, so stderr goes nowhere a
++             * player will ever look: a game.toml the loader rejects made the
++             * window never appear and the process vanish with no message at
++             * all -- indistinguishable, from the outside, from a corrupt
++             * install or a silently failing exe. The message box names the
++             * file and quotes the loader, which is usually the whole diagnosis
++             * (a mistyped key, a value out of range). */
++            launcher_warning("Configuration Error",
++                std::string("This disc's game.toml could not be loaded, so the "
++                            "game cannot start.\n\n") + ex.what() +
++                "\n\nFile:\n" + game_config_path +
++                "\n\nIf you edited it, undo the change; otherwise re-run "
++                "Setup to reinstall it (a copy of the current default is "
++                "written beside it as game.toml.new).");
+             return 1;
+         }
+     }
+@@ -13189,8 +13313,18 @@ int main(int argc, char** argv) {
+             bios_path = settings_bios_storage.c_str();
+             bios_explicit = true;
+         }
+-        if (us.has_disc_path && !disc_override_path)
++        if (us.has_disc_path && !disc_override_path && g_sibling_active < 0) {
++            /* SIBLING-TITLE INSTALLS IGNORE THIS ENTIRELY (the g_sibling_active
++             * test). Each title is a build of exactly ONE disc image, fixed
++             * when it was recompiled; changing discs means switching titles,
++             * not repointing this one. Meanwhile [disc] path lives in the
++             * settings file the titles SHARE, so it holds whichever disc ran
++             * last - and letting that through launched the Arcade build
++             * against the Simulation image. There is no legitimate case where
++             * a remembered path should beat what this build's own game.toml
++             * declares, so it does not get to try. */
+             resolved_disc = normalize_disc_path_for_launch(us.disc_path);
++        }
+         /* Multi-disc precedence. [disc] selected is authoritative ONLY WHEN
+          * PRESENT; absent it, [disc] path decides and the index is derived
+          * from it.
+@@ -13415,16 +13549,23 @@ int main(int argc, char** argv) {
+         }
+     }
+ 
+-    /* Scan <exe_dir>/mods and load persisted enable/option state. Everything
+-     * downstream — the launcher Mods tab (gi.mods), disc patching, the
+-     * psx_mod_set_* callbacks — is inert until this runs. */
++    /* Scan the mods directory and load persisted enable/option state.
++     * Everything downstream — the launcher Mods tab (gi.mods), disc patching,
++     * the psx_mod_set_* callbacks — is inert until this runs. */
+     {
+         std::string mod_error;
+         /* Directory name is configurable ([runtime] mods_dir, default "mods")
+          * so a port can match the folder to what its launcher calls the
+-         * content (e.g. GT2's Patches/Cheats split ships a "patches" dir). */
++         * content (e.g. GT2's Patches/Cheats split ships a "patches" dir).
++         * It stays a PLAIN name — the config loader rejects separators so it
++         * can never escape — and is resolved against shared_config_dir(), so
++         * a multi-title install keeps ONE enhancement tree beside the shared
++         * settings.toml. Which enhancements are ticked is a property of the
++         * player, not of the disc: what must not cross discs is handled by
++         * each feature's [[feature.target]], which makes a feature the
++         * running disc does not have inert rather than applied. */
+         if (!PSXRecompV4::mod_runtime_initialize(
+-                exe_dir_from_argv(argv[0]) / mods_dir_name, game_id,
++                shared_config_dir(argv[0]) / mods_dir_name, game_id,
+                 game_entry_pc, text_guard_exe_path, &mod_error)) {
+             std::fprintf(stderr, "psxrecomp: mods unavailable: %s\n",
+                          mod_error.c_str());
+@@ -13731,6 +13872,13 @@ int main(int argc, char** argv) {
+                     }
+                 }
+             }
++            /* The launcher's seed is what it SHOWS as well as what it saves:
++             * the disc art, the verification badge and the Play button all
++             * hang off this path, so withholding it (an earlier attempt to
++             * keep a shared settings file tidy) left the launcher with no
++             * disc and stopped it responding to keyboard or pad at all.
++             * Let it through; a sibling title ignores the saved value on
++             * load and re-pins to its own game.toml disc regardless. */
+             if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
+             seed.memcard_dir = memcard_dir;          seed.has_memcard_dir = true;
+             seed.memcard1_enabled = memcard1_enabled; seed.has_memcard1_enabled = true;
+@@ -14010,9 +14158,30 @@ int main(int argc, char** argv) {
+                             validate_disc_image(rui_initial_disc, game_id);
+                         disc_ok = dv.opened && dv.has_header;
+                     }
+-                    if (!disc_ok) rui_initial_disc.clear();
++                    if (!disc_ok) {
++                        /* SAY SO. Clearing the disc puts the launcher into its
++                         * first-run setup flow (needs_setup below) instead of
++                         * the normal Play page - which, to someone who expected
++                         * to press Play, looks like a launcher that has simply
++                         * stopped responding to the keyboard and the pad. It
++                         * used to happen in silence; a relative disc path that
++                         * did not resolve from the current directory was enough
++                         * to trigger it. */
++                        std::fprintf(stderr,
++                            "psxrecomp: launcher DISCARDED the disc it was "
++                            "given (%s): %s. Opening setup instead.\n",
++                            rui_initial_disc.c_str(),
++                            std::filesystem::exists(rui_initial_disc)
++                                ? "the image could not be read"
++                                : "no such file from this working directory");
++                        rui_initial_disc.clear();
++                    }
+                 }
+                 gi.needs_setup = (!bios_ok || !disc_ok) ? 1 : 0;
++                if (gi.needs_setup)
++                    std::fprintf(stderr,
++                        "psxrecomp: launcher opening in SETUP mode (bios_ok=%d "
++                        "disc_ok=%d)\n", bios_ok ? 1 : 0, disc_ok ? 1 : 0);
+             }
+ #if defined(PSX_HAS_GAME_CODEGEN)
+             /* Local codegen: missing generated/ or MOTK_FORCE_SETUP opens the
+@@ -14025,8 +14194,9 @@ int main(int argc, char** argv) {
+ #endif /* PSX_HAS_SETUP_WIZARD */
+             apply_sibling_titles_to_game_info(&gi);
+             apply_featured_rows_to_game_info(&gi);
+-        apply_feature_presets_to_game_info(&gi);
+             apply_feature_presets_to_game_info(&gi);
++            if (!g_cheats_page_note_cfg.empty())
++                gi.cheats_page_note = g_cheats_page_note_cfg.c_str();
+             launcher_boot_timing_mark("host:setup_checks_done");
+ #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+             g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;
+@@ -14323,6 +14493,7 @@ int main(int argc, char** argv) {
+                         qs.has_frame_interpolation_fps = true;
+                         qs.skip_launcher = ls.skip_launcher != 0;
+                         qs.has_skip_launcher = true;
++                        stamp_active_title(qs);
+                         if (!PSXRecompV4::save_user_settings(sp, qs))
+                             std::fprintf(stderr,
+                                 "psxrecomp: WARNING: settings.toml save failed on "
+@@ -14482,6 +14653,7 @@ int main(int argc, char** argv) {
+                 }
+                 g_video_win_w = seed.window_width;
+                 /* Persist the user's choices next to the exe. */
++                stamp_active_title(seed);
+                 if (!PSXRecompV4::save_user_settings(
+                         settings_file_path(argv[0]), seed))
+                     std::fprintf(stderr,
+@@ -14593,6 +14765,18 @@ int main(int argc, char** argv) {
+         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
+         return 1;
+     }
++    /* Re-pin a sibling title to its OWN disc, last thing before the image is
++     * resolved and mounted. Between config load and here, resolved_disc passes
++     * through the shared settings file, the launcher's disc field and the
++     * cached disc.cfg - each a place where another title's image can arrive,
++     * and the arcade build booting the Simulation disc is what that looks
++     * like. A build recompiled from one disc has exactly one correct image, so
++     * this is not a preference to be remembered: only an explicit --disc on
++     * the command line (a developer running a variant image) may override it,
++     * and switching discs is switching titles. */
++    if (g_sibling_active >= 0 && !disc_override_path &&
++        !config_declared_disc.empty())
++        resolved_disc = config_declared_disc;
+     if (game_config_path || disc_override_path || !resolved_disc.empty()) {
+         resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
+         if (game_config_path && resolved_disc.empty()) {

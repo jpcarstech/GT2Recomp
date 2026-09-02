@@ -1,0 +1,94 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 20c56c2..2920274 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -7428,10 +7428,24 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+             first = last;
+         }
+         if (visible_features.empty()) {
+-            ImGui::TextColored(col(th.text_muted),
+-                               "%s",
+-                               feature_count ? ui_text("No matching features.")
+-                                             : ui_text("No mod features installed."));
++            const bool cheats_note = m->mod_group_filter == 2 &&
++                                     m->cheats_page_note &&
++                                     m->cheats_page_note[0] &&
++                                     m->mod_search[0] == '\0';
++            if (cheats_note) {
++                /* The port's own words for an empty Cheats page: why there
++                 * is nothing here and where the cheats went, instead of a
++                 * generic "no matching features" that reads as a bug. */
++                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
++                                       ImGui::GetContentRegionAvail().x);
++                ImGui::TextColored(col(th.text_muted), "%s", m->cheats_page_note);
++                ImGui::PopTextWrapPos();
++            } else {
++                ImGui::TextColored(col(th.text_muted),
++                                   "%s",
++                                   feature_count ? ui_text("No matching features.")
++                                                 : ui_text("No mod features installed."));
++            }
+         }
+     }
+     ImGui::EndChild();
+@@ -9040,7 +9054,9 @@ void draw_ui(LauncherModel* m, const LauncherTheme& th, int logical_w, int logic
+              * "Patches" (enhancements/fixes) and "Cheats" (gameplay unlocks)
+              * — the names say what is inside. Without one, the single legacy
+              * "Mods" entry stays, unchanged for every other game. */
+-            const bool mods_split = m->mods && mods_have_cheat_features(m);
++            const bool mods_split = m->mods &&
++                (mods_have_cheat_features(m) ||
++                 (m->cheats_page_note && m->cheats_page_note[0]));
+             const int count = 1 + (m->mods ? (mods_split ? 2 : 1) : 0) +
+                               (m->has_assist_tools ? 1 : 0) +
+                               ((m->credits_text && m->credits_text[0]) ? 1 : 0);
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 0b4d3b1..6ab2a1f 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -399,6 +399,7 @@ void launcher_model_init(LauncherModel* m,
+         m->num_featured_mod_rows = game->num_featured_mod_rows;
+         m->feature_presets       = game->feature_presets;
+         m->num_feature_presets   = game->num_feature_presets;
++        m->cheats_page_note      = game->cheats_page_note;
+         m->hide_rebind          = game->hide_rebind != 0;
+         m->has_mouse_controls   = game->has_mouse_controls != 0;
+         m->has_gyro_controls    = game->has_gyro_controls != 0;
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 70a4de2..91d9806 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -301,6 +301,10 @@ typedef struct {
+     const RecompLauncherCFeaturePreset* feature_presets;
+     int  num_feature_presets;
+ 
++    // Keep the Cheats page offered even with nothing to list; the text shown
++    // there meanwhile (GameInfo.cheats_page_note). NULL => legacy collapse.
++    const char* cheats_page_note;
++
+     // ---- rebind-page opt-out (GameInfo.hide_rebind) ------------------------
+     bool hide_rebind;
+     // ---- mouse controls (GameInfo.has_mouse_controls; Snap) ----------------
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 08319b1..195b3a5 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -1454,6 +1454,18 @@ typedef struct RecompLauncherCGameInfo {
+      * Borrowed; must outlive run_window. */
+     const RecompLauncherCFeaturePreset* feature_presets;
+     int  num_feature_presets;
++
++    /* ---- Cheats page, even when empty (appended additively) --------------
++     * The dashboard offers a separate "Cheats" entry only while some listed
++     * feature sits in the reserved "Cheats" group; with none, it collapses
++     * back to the single "Mods" entry. A multi-disc port whose cheats exist
++     * for one disc and not another would then change shape between discs -
++     * "Patches" + "Cheats" here, "Mods" there - and a player who had cheats
++     * yesterday sees them vanish with no word why. Set this to keep the
++     * Cheats page in place; the text is what the page says while it has
++     * nothing to list (why, and where the cheats went). NULL => today's
++     * behavior. Borrowed; must outlive run_window. */
++    const char* cheats_page_note;
+ } RecompLauncherCGameInfo;
+ 
+ /* recomp_launcher_run_window return codes */

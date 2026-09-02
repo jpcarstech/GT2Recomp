@@ -1,0 +1,60 @@
+# Autofilled by tools/new_project_layout/probe_disc.py from your legal dump.
+# Review before shipping. Runtime quirks / overlay seeds still need hand work.
+
+[game]
+name = "Gran Turismo 2 (Arcade Mode) (v1.1)"
+id = "SCUS-94455"
+players = 2
+exe = "disc/SCUS_944.55"
+disc = "disc/Gran Turismo 2 (Arcade Mode) (v1.1).cue"
+load_address = "0x80010000"
+entry_pc = "0x8005D5C0"
+text_size = "0x00099000"
+stack_base = "0x00000000"
+
+# Digests are for data Track 01 (first BINARY FILE / TRACK 01).
+[prepare_disc]
+out_dir = "disc"
+bin_name = "Gran Turismo 2 (Arcade Mode) (v1.1).bin"
+cue_name = "Gran Turismo 2 (Arcade Mode) (v1.1).cue"
+boot_exe = "SCUS_944.55"
+known_sizes = [729606864]
+known_md5 = [
+  "79befcdb7e725daff04bce3c4aafb321",
+]
+known_sha1 = [
+  "68f226780ef551b746e1a0964541570ec04c8060",
+]
+known_crc32 = [
+  "b444f497",
+]
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+out_dir = "generated"
+strict = true
+
+# Same trusted entry hook as the Combined title: GT2 defeats both game-start
+# detectors (HLE handoff + overlay text overwrite); entry address verified
+# byte-identical across SCUS_944.55 / .88 / Combined.
+mod_function_entry_funcs = ["0x8005D5C0"]
+
+[runtime]
+title_label = "Arcade"
+settings_path = "../settings.toml"
+window_title = "Gran Turismo 2 (Arcade Mode) (v1.1) Recompiled"
+memcard_dir = "saves"
+
+[video]
+renderer = "opengl"
+aspect_ratio = "4:3"
+
+[controller]
+default_mode = "digital"
+
+# Online mount gate: digests + track count + optional TOC fingerprint
+# (see docs/NETPLAY.md).
+[netplay]
+require_cue = true
+required_tracks = 1
+required_disc_fp = "610e2b0d1d8f63854e60ef3556f8e6871d3a16bb536af7ac08a48a3305acb570"

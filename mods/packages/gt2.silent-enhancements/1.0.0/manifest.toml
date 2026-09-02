@@ -8,8 +8,17 @@ license = "See upstream repository"
 resolver = "declarative"
 save_compatibility = "shared"
 
+# Both GT2 discs, plus the fan-made Combined Disc (which also reports
+# SCUS-94488). Verified against DuckStation's bundled patch database: Silent's
+# 60 FPS / widescreen / draw-distance / 8MB-buffer / full-LOD codes are
+# byte-identical on the Arcade and Simulation discs, because the race engine
+# overlay loads at the same addresses on both. Features that genuinely differ
+# per disc carry their own [[feature.target]] below.
 [[target]]
 game_id = "SCUS-94488"
+
+[[target]]
+game_id = "SCUS-94455"
 
 [[feature]]
 id = "overclock"
@@ -22,7 +31,7 @@ default_enabled = false
 feature = "overclock"
 id = "percent"
 label = "CPU overclock %"
-description = "How much faster than a real PS1 CPU to run. GT2's race engine cannot fill 60 frames per second at stock speed (100) — that is why the game shipped at 30 fps — so with 60 FPS enabled, values below ~150 will run in slow motion. 200 is a good default; raise it if heavy scenes still dip."
+description = "How much faster than a real PS1 CPU to run. At the original 30 fps, 200 keeps the game at full speed with full-detail AI cars and the longer draw distance on — those are extra work for the PS1 CPU, and GT2 already dipped with six cars in view on the console. Choosing 60 FPS raises this to 325 automatically (the value Silent ships with the 60 FPS patch; DuckStation applies the same), because the race engine cannot fill 60 frames per second below roughly 150. Higher costs more of YOUR CPU for every emulated frame, so do not go past what the scene needs."
 type = "integer"
 min = 100
 max = 400
@@ -36,13 +45,29 @@ id = "gt2.overclock"
 [[feature]]
 id = "60fps"
 name = "60 FPS"
-description = "Runs the game at 60 frames per second instead of 30, and restores the tire smoke and rear-view-mirror effects to full rate at the higher frame rate. Applies in Simulation-mode gameplay; takes effect when a race (re)loads. Requires the CPU Overclock feature (above) to actually reach 60 — at stock speed the engine cannot fill 60 fps and races run in slow motion. FMV playback is left fully authentic: the frame-rate patches disengage during movies and re-engage afterward. Known upstream caveats: existing replays and Rally-mode AI ghosts are not compatible with 60 FPS."
+description = "Runs the game at 60 frames per second instead of 30, and restores the tire smoke and rear-view-mirror effects to full rate at the higher frame rate. Applies to races on every disc (the codes are identical on the Arcade and Simulation discs); takes effect when a race (re)loads. Requires the CPU Overclock feature (above) to actually reach 60 — at stock speed the engine cannot fill 60 fps and races run in slow motion. FMV playback is left fully authentic: the frame-rate patches disengage during movies and re-engage afterward. Known upstream caveats: existing replays and Rally-mode AI ghosts are not compatible with 60 FPS."
 group = "Performance"
 default_enabled = false
 
 [[plugin]]
 feature = "60fps"
 id = "gt2.silent60fps"
+
+# 60 FPS doubles the game's simulation rate, so the emulated CPU has to do a
+# frame's work in half the time - it cannot without the overclock. Enabling
+# 60fps therefore switches overclock ON and sets it to 325%; switching
+# overclock off cascades 60fps off. (Original 30 fps: 200% is the default.) The reverse is deliberately NOT a dependency: overclock stands
+# on its own, because full-detail AI cars and the longer draw distance are
+# real extra work for the emulated CPU/GTE even at 30 fps - GT2 already
+# dropped frames on the console with six cars in view, and those patches
+# push it further. "Original (30 fps)" with the overclock on is the game at
+# its own frame rate, just no longer struggling.
+[[constraint]]
+feature = "60fps"
+kind = "requires_feature"
+requires_feature = "overclock"
+requires_option = "percent"
+requires_value = "325"
 
 [[feature]]
 id = "aspect"
@@ -113,6 +138,13 @@ name = "Arcade: Unlock All Tracks"
 description = "Unlocks every arcade-mode track in all menus (1P, 2P, rally, time trial). The Combined Disc rebuilds arcade mode, so the classic GameShark codes do not apply - this patches the game's own unlock check (reverse-engineered from this disc) so every course passes it. Menus are rebuilt when you enter Arcade mode, so enter (or re-enter) Arcade mode after enabling."
 group = "Cheats"
 default_enabled = false
+# Combined Disc only: its arcade mode is rebuilt, so these patch the game's
+# own unlock check rather than using the classic GameShark writes. The plain
+# Arcade disc gets arcade_all_tracks_disc instead. Pinned by exe hash because
+# the Combined Disc reports the Simulation serial.
+[[feature.target]]
+game_id = "SCUS-94488"
+exe_sha256 = "3e77a7a1ac9ba673efb20a703de60b8504029bec54c94f3cb98476293cf74c0b"
 
 [[plugin]]
 feature = "arcade_all_tracks"
@@ -124,7 +156,23 @@ name = "Arcade: Unlock All Cars"
 description = "Unlocks the extra arcade cars: patches the unlock-flag test in the menu code (reverse-engineered from the Combined Disc - the classic GameShark completion codes do not apply to this rebuilt arcade mode). Enter (or re-enter) Arcade mode after enabling."
 group = "Cheats"
 default_enabled = false
+# Combined Disc only (see arcade_all_tracks).
+[[feature.target]]
+game_id = "SCUS-94488"
+exe_sha256 = "3e77a7a1ac9ba673efb20a703de60b8504029bec54c94f3cb98476293cf74c0b"
 
 [[plugin]]
 feature = "arcade_all_cars"
 id = "gt2.arcadecars"
+
+# ---- plain Arcade disc: NO unlock cheats shipped ------------------------
+# The published GameShark unlock codes for SCUS-94455 (DuckStation's cheat
+# DB, "Arcade Disc" section) are for the v1.0 pressing - the file says so in
+# its header - and this port targets v1.1. On v1.1 those addresses land on
+# something else entirely: applied every VBlank they corrupted the game's
+# input path, and keyboard AND pad went dead until they were switched off
+# (2026-09-02, confirmed by toggling). No v1.1-verified source exists, so
+# nothing ships here until the unlock check is reverse-engineered from the
+# v1.1 arcade overlay the way the Combined Disc features above were. Rule:
+# a cheat that writes into game memory ships only after it has been run on
+# the exact disc revision it targets.

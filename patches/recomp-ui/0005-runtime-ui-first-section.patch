@@ -1,0 +1,40 @@
+diff --git a/src/common/recomp_runtime_ui.c b/src/common/recomp_runtime_ui.c
+index 8d4745b..7f6c7a5 100644
+--- a/src/common/recomp_runtime_ui.c
++++ b/src/common/recomp_runtime_ui.c
+@@ -63,6 +63,15 @@ RecompRuntimeUi *recomp_runtime_ui_create(const RecompRuntimeUiConfig *config) {
+             if (same_text(section, ui->sections[j])) known = 1;
+         if (!known) ui->sections[ui->section_count++] = section;
+     }
++    if (config->first_section && *config->first_section) {
++        for (size_t j = 1; j < ui->section_count; ++j) {
++            if (!same_text(config->first_section, ui->sections[j])) continue;
++            const char *hoist = ui->sections[j];
++            for (size_t k = j; k > 0; --k) ui->sections[k] = ui->sections[k - 1];
++            ui->sections[0] = hoist;
++            break;
++        }
++    }
+     return ui;
+ }
+ 
+diff --git a/src/recomp_runtime_ui.h b/src/recomp_runtime_ui.h
+index b62df55..beeb82d 100644
+--- a/src/recomp_runtime_ui.h
++++ b/src/recomp_runtime_ui.h
+@@ -144,6 +144,15 @@ typedef struct RecompRuntimeUiConfig {
+      * coupling the shared UI to a particular operating system.
+      */
+     uint32_t presentation_flags;
++
++    /*
++     * Optional: the section to list FIRST. Sections otherwise appear in the
++     * order their first item does, which puts a host's own extra sections
++     * after the standard Display/Audio/System ones - fine for tuning knobs,
++     * wrong for the thing a player opens the menu for (a multi-disc port's
++     * "Disc" switch). NULL or no match leaves the order as it is.
++     */
++    const char *first_section;
+ } RecompRuntimeUiConfig;
+ 
+ enum {

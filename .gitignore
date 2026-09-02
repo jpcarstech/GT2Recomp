@@ -41,3 +41,8 @@ starvation_dump.jsonl
 compile_cache.txt
 retail-test/
 build-retail/
+
+# Per-disc build logs (written by local_build.sh)
+titles/*/build.log
+titles/*/configure.log
+titles/*/generate.log

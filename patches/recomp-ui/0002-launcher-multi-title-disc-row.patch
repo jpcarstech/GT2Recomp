@@ -1,0 +1,259 @@
+From 93064f44b171e686006a176e08e0b5b1504b2dfd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 2 Sep 2026 05:12:50 +0000
+Subject: [PATCH] launcher: multi-title Disc row (sibling builds,
+ relaunch-based switch)
+
+GameInfo grows title_labels/title_exe_paths/num_titles/active_title
+(appended additively). num_titles > 1 draws a Disc dropdown above Disc
+Selection in the game panel; picking an installed sibling commits
+LNG_ACTION_SWITCH_TITLE and run_window returns
+RECOMP_LAUNCHER_RESULT_SWITCH_TITLE with the exe in
+recomp_launcher_relaunch_exe(). Uninstalled titles draw disabled with a
+'not installed' tag. Settings edits are committed before the switch so
+they survive into the shared settings file.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NxMCZTBx1i7VUd7SkdD9Sx
+---
+ src/common/backends/imgui/launcher_imgui.cpp | 43 ++++++++++++++++++++
+ src/common/launcher_model.c                  | 25 ++++++++++++
+ src/common/launcher_model.h                  | 23 ++++++++++-
+ src/common/launcher_ng_capi.c                | 12 ++++++
+ src/recomp_launcher.h                        | 33 +++++++++++++++
+ 5 files changed, 135 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 43022ab..8c73c67 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -1073,6 +1073,46 @@ void draw_disc_selector(LauncherModel* m, const LauncherTheme& th, float availw)
+     ImGui::Dummy(ImVec2(0, px(10)));
+ }
+ 
++// "Disc" dropdown for a multi-TITLE install (GameInfo.title_*): sibling
++// recompiled builds side by side, each its own exe (Arcade / Simulation /
++// Combined). Picking another INSTALLED row commits the switch immediately —
++// the launcher tears down and the host spawns that title's exe, landing the
++// player back in this dashboard with the other disc active. Known but
++// uninstalled titles draw disabled with a "not installed" tag so players
++// learn the option exists. Draws nothing for single-title installs.
++void draw_title_selector(LauncherModel* m, const LauncherTheme& th, float availw) {
++    const int count = m->num_titles;
++    if (count <= 1 || !m->title_labels) return;
++    const int active = m->active_title;
++    const char* active_label =
++        (active >= 0 && active < count && m->title_labels[active])
++            ? m->title_labels[active] : "";
++
++    ImGui::TextColored(col(th.text_muted), "%s", ui_text("Disc"));
++    ImGui::Dummy(ImVec2(0, px(4)));
++    ImGui::SetNextItemWidth(availw);
++    if (ImGui::BeginCombo("##title_selection", ui_text(active_label))) {
++        for (int i = 0; i < count; ++i) {
++            const char* lab = m->title_labels[i] ? m->title_labels[i] : "";
++            const bool installed = launcher_model_title_installed(m, i);
++            if (!installed) {
++                char row[160];
++                snprintf(row, sizeof(row), "%s %s", lab,
++                         ui_text("(not installed)"));
++                ImGui::BeginDisabled(true);
++                ImGui::Selectable(row, false);
++                ImGui::EndDisabled();
++                continue;
++            }
++            if (ImGui::Selectable(lab, i == active))
++                launcher_model_switch_title(m, i);
++            if (i == active) ImGui::SetItemDefaultFocus();
++        }
++        ImGui::EndCombo();
++    }
++    ImGui::Dummy(ImVec2(0, px(10)));
++}
++
+ // Disc-verdict block (verify.mode==1 systems, e.g. PSX): a verdict icon +
+ // headline, followed by a Serial/Region/ISO-header checklist. Replaces the
+ // CRC/SHA "verified" line that mode==0 (cart/ROM-hash) systems draw instead
+@@ -1124,6 +1164,9 @@ void draw_verdict_block(LauncherModel* m, const LauncherTheme& th, float availw)
+     // describe the SELECTED disc (each disc of a set carries its own serial),
+     // so the control that decides which disc that is has to read first.
+     // Single-disc titles never compose this.
++    // The sibling-TITLE row reads first of all: it decides which BUILD the
++    // rest of the panel (and the checklist below) is even describing.
++    draw_title_selector(m, th, availw);
+     draw_disc_selector(m, th, availw);
+ 
+     // Checklist: Serial / Region / ISO header. Before a disc is chosen, show
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 2c5ed2e..53f239d 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -389,6 +389,12 @@ void launcher_model_init(LauncherModel* m,
+         m->num_audio_devices    = game->num_audio_devices;
+         m->renderer_labels      = game->renderer_labels;
+         m->num_renderers        = game->num_renderers;
++        m->title_labels         = game->title_labels;
++        m->title_exe_paths      = game->title_exe_paths;
++        m->num_titles           = game->num_titles;
++        m->active_title         =
++            clampi(game->active_title, 0,
++                   game->num_titles > 0 ? game->num_titles - 1 : 0);
+         m->hide_rebind          = game->hide_rebind != 0;
+         m->has_mouse_controls   = game->has_mouse_controls != 0;
+         m->has_gyro_controls    = game->has_gyro_controls != 0;
+@@ -907,6 +913,25 @@ void launcher_model_select_disc(LauncherModel* m, int idx) {
+     launcher_model_set_rom(m, launcher_model_disc_path(m, idx));
+ }
+ 
++bool launcher_model_title_installed(const LauncherModel* m, int idx) {
++    if (!m || idx < 0 || idx >= m->num_titles) return false;
++    if (!m->title_exe_paths) return false;
++    const char* exe = m->title_exe_paths[idx];
++    return exe && exe[0];
++}
++
++void launcher_model_switch_title(LauncherModel* m, int idx) {
++    if (!m || m->num_titles <= 1) return;
++    if (idx < 0 || idx >= m->num_titles) return;
++    if (idx == m->active_title) return;
++    if (!launcher_model_title_installed(m, idx)) return;
++    safe_copy(m->relaunch_exe, sizeof(m->relaunch_exe),
++              m->title_exe_paths[idx]);
++    /* The host persists the pick and spawns the exe; committing the action
++     * tears the launcher down exactly like RELAUNCH does. */
++    m->action = LNG_ACTION_SWITCH_TITLE;
++}
++
+ /* Cheap existence probe. The model has no stat() wrapper and does not want
+  * one: everywhere else it already opens the file it cares about. */
+ static int lm_path_exists(const char* path) {
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 67cb1bf..d25dcff 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -51,7 +51,9 @@ typedef enum {
+     LNG_ACTION_NONE = 0,   // still running
+     LNG_ACTION_LAUNCH,     // boot the game with committed settings
+     LNG_ACTION_QUIT,       // user quit
+-    LNG_ACTION_RELAUNCH    // quit + host should exec rebuilt binary
++    LNG_ACTION_RELAUNCH,   // quit + host should exec rebuilt binary
++    LNG_ACTION_SWITCH_TITLE // quit + host should spawn the picked sibling
++                            // title's exe (model.relaunch_exe carries it)
+ } LngAction;
+ 
+ // Representative subset of the SNES pad for the rebind UI. This enum is the
+@@ -278,6 +280,17 @@ typedef struct {
+     const char* const* renderer_labels;
+     int  num_renderers;
+ 
++    // ---- multi-title installs (GameInfo.title_*) ---------------------------
++    // Sibling recompiled builds installed side by side, each its own exe.
++    // num_titles > 1 grows the game panel's "Disc" dropdown; picking a row
++    // with an installed exe commits LNG_ACTION_SWITCH_TITLE (relaunch_exe
++    // carries the target). A NULL/empty exe path marks a known-but-not-
++    // installed title: drawn disabled, never committable.
++    const char* const* title_labels;
++    const char* const* title_exe_paths;
++    int  num_titles;
++    int  active_title;
++
+     // ---- rebind-page opt-out (GameInfo.hide_rebind) ------------------------
+     bool hide_rebind;
+     // ---- mouse controls (GameInfo.has_mouse_controls; Snap) ----------------
+@@ -617,6 +630,14 @@ const char* launcher_model_disc_path(const LauncherModel* m, int idx);
+ // indices are ignored; re-selecting the current disc is a no-op.
+ void launcher_model_select_disc(LauncherModel* m, int idx);
+ 
++// ---- multi-title installs ------------------------------------------------
++// True when title `idx` has an installed exe (title_exe_paths entry set).
++bool launcher_model_title_installed(const LauncherModel* m, int idx);
++// Switch to sibling title `idx`: copies its exe into relaunch_exe and
++// commits LNG_ACTION_SWITCH_TITLE so run_window returns SWITCH_TITLE to the
++// host. Ignored for out-of-range/uninstalled titles and for the active one.
++void launcher_model_switch_title(LauncherModel* m, int idx);
++
+ // ---- per-slot disc paths (setup wizard) ---------------------------------
+ // Bind one slot's image without changing which disc is selected. This is what
+ // the wizard's per-disc rows call: a player locating disc 3 is telling us
+diff --git a/src/common/launcher_ng_capi.c b/src/common/launcher_ng_capi.c
+index 910f715..a8a146e 100644
+--- a/src/common/launcher_ng_capi.c
++++ b/src/common/launcher_ng_capi.c
+@@ -88,6 +88,18 @@ int recomp_launcher_run_window(const char* window_title,
+         return RECOMP_LAUNCHER_RESULT_LAUNCH;
+     }
+ 
++    if (act == LNG_ACTION_SWITCH_TITLE) {
++        /* Sibling-title switch (the Disc row): hand the picked exe to the
++         * host through the same channel RELAUNCH uses, and commit the edited
++         * settings so choices made before the switch survive into the file
++         * the titles share. */
++        launcher_model_commit(&model, io);
++        if (model.relaunch_exe[0])
++            snprintf(g_last_relaunch_exe, sizeof(g_last_relaunch_exe),
++                     "%s", model.relaunch_exe);
++        return RECOMP_LAUNCHER_RESULT_SWITCH_TITLE;
++    }
++
+     /* Quit (window close): commit the edited settings back to the caller
+      * too. The host persists the Settings panel on quit-without-play, and
+      * without this commit it saved the caller's untouched pre-edit snapshot
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index fc60ab2..72be8cb 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -1381,6 +1381,32 @@ typedef struct RecompLauncherCGameInfo {
+      * Return 0 on success, like persist_setup. Uses persist_setup_ctx. */
+     int (*persist_setup_discs)(void* ctx, const char* const* disc_paths,
+                                int disc_count, const char* bios_path);
++
++    /* ---- multi-title installs (appended additively) ----------------------
++     * SIBLING TITLES: separate recompiled builds installed side by side,
++     * each with its OWN exe (e.g. a game sold as an Arcade disc and a
++     * Simulation disc, each recompiled from the player's own dump). This is
++     * NOT the multi-image `discs` roster above — that swaps images under ONE
++     * build; a title switch relaunches into a DIFFERENT build.
++     *
++     * When num_titles > 1 the game panel grows a "Disc" dropdown of
++     * title_labels (active_title preselected). Picking another row commits
++     * immediately: run_window tears down and returns
++     * RECOMP_LAUNCHER_RESULT_SWITCH_TITLE with title_exe_paths[picked]
++     * available from recomp_launcher_relaunch_exe(); the HOST persists the
++     * choice and spawns that exe (typically with --launcher, so the player
++     * lands back in this same dashboard with the other disc active).
++     *
++     * title_exe_paths entries must be absolute; a NULL/empty entry marks a
++     * title that is known but not installed — its row is drawn disabled with
++     * a "not installed" tag rather than hidden, so players learn the option
++     * exists. NULL arrays / num_titles <= 1 (and every host that predates
++     * this field) => no row, byte-for-byte today's panel. Borrowed; must
++     * outlive the run_window call. */
++    const char* const* title_labels;
++    const char* const* title_exe_paths;
++    int  num_titles;
++    int  active_title;
+ } RecompLauncherCGameInfo;
+ 
+ /* recomp_launcher_run_window return codes */
+@@ -1388,11 +1414,18 @@ typedef struct RecompLauncherCGameInfo {
+ #define RECOMP_LAUNCHER_RESULT_QUIT         1
+ #define RECOMP_LAUNCHER_RESULT_UNAVAILABLE  2
+ #define RECOMP_LAUNCHER_RESULT_RELAUNCH     3
++/* The player picked a different sibling title from the Disc row (GameInfo
++ * title_labels/title_exe_paths). The picked exe is available from
++ * recomp_launcher_relaunch_exe(); the host persists the choice and spawns
++ * it (usually with --launcher), then exits. Only hosts that set
++ * num_titles > 1 can ever see this code. */
++#define RECOMP_LAUNCHER_RESULT_SWITCH_TITLE 4
+ 
+ // Returns: 0 = LAUNCH (boot out_rom_path with the edited *io),
+ //          1 = QUIT (caller should exit),
+ //          2 = UNAVAILABLE (assets/GL failed — caller boots as if skipped),
+ //          3 = RELAUNCH (host should exec recomp_launcher_relaunch_exe()).
++//          4 = SWITCH_TITLE (host spawns recomp_launcher_relaunch_exe()).
+ int recomp_launcher_run_window(const char* window_title,
+                              RecompLauncherCSettings* io,
+                              const RecompLauncherCGameInfo* game,
+-- 
+2.43.0
+

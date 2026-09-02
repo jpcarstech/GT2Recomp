@@ -1,0 +1,33 @@
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index d64c98cc..a876c748 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -15252,12 +15252,27 @@ void debug_server_check_watchpoints(void)
+ void debug_server_shutdown(void)
+ {
+     /* Stop the I/O thread: clear the flag, close the listen socket to break the
+-     * blocking accept(), then join. */
++     * blocking accept(), then join.
++     *
++     * POSIX: close() of a listening fd does NOT unblock another thread's
++     * accept() on Linux — the io thread stays parked and the join below
++     * deadlocks (Windows' closesocket does abort accept, which is why only
++     * Linux quits hung). shutdown() first: it returns ENOTCONN for a
++     * listening socket but reliably kicks accept() awake with EINVAL. */
+     s_io_running = 0;
+     if (s_listen != SOCK_INVALID) {
++#ifndef _WIN32
++        shutdown(s_listen, SHUT_RDWR);
++#endif
+         sock_close(s_listen);
+         s_listen = SOCK_INVALID;
+     }
++#ifndef _WIN32
++    /* Same reasoning for a connected client: the io thread may be parked in
++     * recv(), which close() alone does not interrupt on Linux. */
++    if (s_client != SOCK_INVALID)
++        shutdown(s_client, SHUT_RDWR);
++#endif
+     if (s_io_thread) {
+         if (s_io_mutex) { SDL_LockMutex(s_io_mutex); SDL_CondSignal(s_io_resp_cv); SDL_UnlockMutex(s_io_mutex); }
+         SDL_WaitThread(s_io_thread, NULL);

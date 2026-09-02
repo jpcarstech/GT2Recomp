@@ -1,0 +1,185 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 8c73c67..33f1ccf 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -2629,6 +2629,26 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+             launcher_model_toggle_renderer(m);
+     }
+ 
++    // Promoted mod-feature rows (GameInfo.featured_mod_rows): the headline
++    // enhancement toggles ("Frame rate") as plain settings rows, backed by
++    // the same provider as the Mods page. Unavailable rows (wrong disc /
++    // package not installed) draw nothing.
++    for (int fr = 0; fr < m->num_featured_mod_rows; ++fr) {
++        const RecompLauncherCFeaturedModRow* r = &m->featured_mod_rows[fr];
++        if (!launcher_model_featured_row_available(m, fr)) continue;
++        const bool on = launcher_model_featured_row_enabled(m, fr);
++        row_label(r->label ? r->label : "", th);
++        ImGui::PushID(fr + 0x46524d00);  /* 'FRM' + index */
++        const char* value = on ? (r->on_label ? r->on_label : "On")
++                               : (r->off_label ? r->off_label : "Off");
++        if (ImGui::Button(ui_text(value), ImVec2(px(220), px(30))))
++            launcher_model_featured_row_set(m, fr, !on);
++        ImGui::PopID();
++        if (r->help && r->help[0] &&
++            ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
++            ImGui::SetTooltip("%s", ui_text(r->help));
++    }
++
+     if (m->has_supersampling) {
+         row_label("Supersampling", th);
+         ImGui::PushID("supersampling");
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 53f239d..82e1bdd 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -395,6 +395,8 @@ void launcher_model_init(LauncherModel* m,
+         m->active_title         =
+             clampi(game->active_title, 0,
+                    game->num_titles > 0 ? game->num_titles - 1 : 0);
++        m->featured_mod_rows     = game->featured_mod_rows;
++        m->num_featured_mod_rows = game->num_featured_mod_rows;
+         m->hide_rebind          = game->hide_rebind != 0;
+         m->has_mouse_controls   = game->has_mouse_controls != 0;
+         m->has_gyro_controls    = game->has_gyro_controls != 0;
+@@ -913,6 +915,60 @@ void launcher_model_select_disc(LauncherModel* m, int idx) {
+     launcher_model_set_rom(m, launcher_model_disc_path(m, idx));
+ }
+ 
++/* ---- promoted mod-feature rows ------------------------------------------ */
++static int lm_featured_find(const LauncherModel* m, const char* pkg,
++                            const char* fid, RecompLauncherCModFeature* out) {
++    int n, i;
++    if (!m || !m->mods || !m->mods->feature_count || !m->mods->feature_get)
++        return 0;
++    if (!pkg || !fid) return 0;
++    n = m->mods->feature_count(m->mods->ctx);
++    for (i = 0; i < n; ++i) {
++        RecompLauncherCModFeature f;
++        if (!m->mods->feature_get(m->mods->ctx, i, &f)) continue;
++        if (strcmp(f.package_id, pkg) == 0 && strcmp(f.id, fid) == 0) {
++            if (out) *out = f;
++            return 1;
++        }
++    }
++    return 0;
++}
++
++bool launcher_model_featured_row_available(const LauncherModel* m, int idx) {
++    const RecompLauncherCFeaturedModRow* r;
++    int i;
++    if (!m || idx < 0 || idx >= m->num_featured_mod_rows) return false;
++    r = &m->featured_mod_rows[idx];
++    if (!r->feature_ids || r->num_feature_ids <= 0) return false;
++    for (i = 0; i < r->num_feature_ids; ++i)
++        if (!lm_featured_find(m, r->package_id, r->feature_ids[i], NULL))
++            return false;
++    return true;
++}
++
++bool launcher_model_featured_row_enabled(const LauncherModel* m, int idx) {
++    const RecompLauncherCFeaturedModRow* r;
++    RecompLauncherCModFeature f;
++    if (!m || idx < 0 || idx >= m->num_featured_mod_rows) return false;
++    r = &m->featured_mod_rows[idx];
++    if (!r->feature_ids || r->num_feature_ids <= 0) return false;
++    if (!lm_featured_find(m, r->package_id, r->feature_ids[0], &f))
++        return false;
++    return f.enabled != 0;
++}
++
++void launcher_model_featured_row_set(LauncherModel* m, int idx, bool enabled) {
++    const RecompLauncherCFeaturedModRow* r;
++    int i;
++    if (!m || idx < 0 || idx >= m->num_featured_mod_rows) return;
++    if (!m->mods || !m->mods->feature_enable) return;
++    r = &m->featured_mod_rows[idx];
++    if (!r->feature_ids) return;
++    for (i = 0; i < r->num_feature_ids; ++i)
++        (void)m->mods->feature_enable(m->mods->ctx, r->package_id,
++                                      r->feature_ids[i], enabled ? 1 : 0);
++}
++
+ bool launcher_model_title_installed(const LauncherModel* m, int idx) {
+     if (!m || idx < 0 || idx >= m->num_titles) return false;
+     if (!m->title_exe_paths) return false;
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index d25dcff..86ce902 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -291,6 +291,12 @@ typedef struct {
+     int  num_titles;
+     int  active_title;
+ 
++    // ---- promoted mod-feature rows (GameInfo.featured_mod_rows) ------------
++    // First-class settings toggles backed by the mods provider; see
++    // launcher_model_featured_row_*().
++    const RecompLauncherCFeaturedModRow* featured_mod_rows;
++    int  num_featured_mod_rows;
++
+     // ---- rebind-page opt-out (GameInfo.hide_rebind) ------------------------
+     bool hide_rebind;
+     // ---- mouse controls (GameInfo.has_mouse_controls; Snap) ----------------
+@@ -630,6 +636,18 @@ const char* launcher_model_disc_path(const LauncherModel* m, int idx);
+ // indices are ignored; re-selecting the current disc is a no-op.
+ void launcher_model_select_disc(LauncherModel* m, int idx);
+ 
++// ---- promoted mod-feature rows -------------------------------------------
++// Availability: every feature id of row `idx` is listed by the provider for
++// the running title (an untargeted/uninstalled package lists nothing, so its
++// row silently vanishes rather than drawing a dead toggle).
++bool launcher_model_featured_row_available(const LauncherModel* m, int idx);
++// Current state: feature_ids[0] enabled per the provider. false when
++// unavailable.
++bool launcher_model_featured_row_enabled(const LauncherModel* m, int idx);
++// Flip every feature of the row to `enabled` through the provider (persists
++// like any Mods-page toggle; applied by the usual commit on PLAY).
++void launcher_model_featured_row_set(LauncherModel* m, int idx, bool enabled);
++
+ // ---- multi-title installs ------------------------------------------------
+ // True when title `idx` has an installed exe (title_exe_paths entry set).
+ bool launcher_model_title_installed(const LauncherModel* m, int idx);
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 72be8cb..8a85e1a 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -886,6 +886,21 @@ typedef struct RecompLauncherCDisc {
+     const char* path;
+ } RecompLauncherCDisc;
+ 
++/* Promoted mod-feature row (GameInfo.featured_mod_rows): a first-class
++ * settings toggle backed by the same provider as the Mods page. Toggling
++ * flips every feature in feature_ids together (a headline feature plus its
++ * prerequisites, e.g. 60fps + the CPU overclock it needs to reach 60); the
++ * row reads as ON when feature_ids[0] is enabled. */
++typedef struct RecompLauncherCFeaturedModRow {
++    const char* label;       /* row label, e.g. "Frame rate" */
++    const char* off_label;   /* value text when off, e.g. "Original (30 fps)" */
++    const char* on_label;    /* value text when on,  e.g. "60 FPS" */
++    const char* help;        /* optional tooltip; NULL => none */
++    const char* package_id;  /* provider package the features live in */
++    const char* const* feature_ids;  /* flipped together; [0] is the state */
++    int num_feature_ids;
++} RecompLauncherCFeaturedModRow;
++
+ typedef struct RecompLauncherCGameInfo {
+     const char*    name;
+     const char*    region;
+@@ -1407,6 +1422,17 @@ typedef struct RecompLauncherCGameInfo {
+     const char* const* title_exe_paths;
+     int  num_titles;
+     int  active_title;
++
++    /* ---- promoted mod-feature rows (appended additively) -----------------
++     * See RecompLauncherCFeaturedModRow above: the one or two enhancement
++     * toggles casual players actually look for ("Frame rate"), drawn as
++     * plain settings rows without sending them into the package browser. A
++     * row whose package/features the provider does not list for the running
++     * title (wrong disc, not installed) is not drawn. NULL/0 => no rows,
++     * byte-for-byte today's settings page. Borrowed; must outlive
++     * run_window. */
++    const RecompLauncherCFeaturedModRow* featured_mod_rows;
++    int  num_featured_mod_rows;
+ } RecompLauncherCGameInfo;
+ 
+ /* recomp_launcher_run_window return codes */

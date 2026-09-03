@@ -41,9 +41,24 @@ mod_function_entry_funcs = ["0x8005D5C0"]
 
 [runtime]
 title_label = "Arcade"
-settings_path = "../settings.toml"
+# (no settings_path in the BUILD variant: settings.toml, input.ini, keybinds.ini
+# and mods/ all sit beside the exe in build/, which is where CMake stages the
+# mod packages. The installed variant, game.runtime.toml, shares them.)
 window_title = "Gran Turismo 2 (Arcade Mode) (v1.1) Recompiled"
 memcard_dir = "saves"
+# Performance (2026-09-03, see docs/PERFORMANCE.md): the debug server's
+# per-store / per-block hooks are dev tooling and cost ~14% of a race frame
+# at 60 fps + 325% - silenced from boot (PSX_DEBUG_HOT_HOOKS=1 or the
+# `hot_hooks` debug command re-arms them for a lab session). The framework's
+# idle_skip (fast-forward through RAM-polling wait loops) is deliberately
+# NOT on: measured on a fixed guest interval it made the 60 fps race 15%
+# SLOWER (its per-iteration detector costs more than the few skips it
+# lands; 2026-09-03, docs/PERFORMANCE.md).
+debug_hot_hooks = false
+# Native overlay cache on in the lab too (no autocompile command: shards are
+# compiled by hand with tools/compile_overlays.py into build/cache - see
+# CLAUDE.md "Rebuilding a title in the lab").
+overlay_cache = true
 
 [video]
 renderer = "opengl"

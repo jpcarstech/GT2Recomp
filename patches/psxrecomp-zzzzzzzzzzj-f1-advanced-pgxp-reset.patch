@@ -1,0 +1,118 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index ff0d731b..502a23fe 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6570,6 +6570,7 @@ static const char kPgxpVertexCache[] = "pgxp.vertex_cache";
+ static const char kPgxpCpuMode[]     = "pgxp.cpu_mode";
+ static const char kPgxpDepth[]       = "pgxp.depth";
+ static const char kPgxpTransDepth[]  = "pgxp.transparent_depth";
++static const char kPgxpReset[]       = "pgxp.reset";
+ static const char *const kPgxpToleranceChoices[] = {
+     "0.1 px", "0.25 px", "0.5 px", "1.0 px", "2.0 px", "Unlimited (-1)" };
+ static const float kPgxpToleranceValues[] = { 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, -1.0f };
+@@ -6598,6 +6599,22 @@ static int pgxp_ui_get(const char *key, int *out) {
+     else return 0;
+     return 1;
+ }
++/* The shipped GT2 configuration, identical to the PGXP mod's activation
++ * (mod_builtin_pgxp.c) - the one place that list lives is there; this
++ * mirrors it for the in-game reset row. */
++static void pgxp_ui_reset_to_gt2_defaults(void) {
++    gte_geometry_correction_set(1);
++    gpu_texture_correction_set(1);
++    gte_pgxp_culling_set(1);
++    gte_preserve_proj_set(1);
++    gpu_pgxp_color_correction_set(0);
++    pgxp_set_tolerance(-1.0f);
++    gpu_pgxp_disable_2d_set(0);
++    pgxp_set_vertex_cache(0);
++    pgxp_set_cpu_mode(0);
++    gpu_pgxp_depth_set(0);
++    gpu_pgxp_depth_transparent_set(0);
++}
+ static int pgxp_ui_set(const char *key, int v) {
+     if (std::strcmp(key, kPgxpGeometry) == 0) {
+         gte_geometry_correction_set(v != 0);
+@@ -6917,6 +6934,10 @@ static int runtime_ui_run_action(void *opaque,
+         if (context && context->ui) recomp_runtime_ui_close(context->ui);
+         return 1;
+     }
++    if (std::strcmp(item->key, kPgxpReset) == 0) {
++        pgxp_ui_reset_to_gt2_defaults();
++        return 1;
++    }
+     if (std::strcmp(item->key, kRuntimeDiscTitleSwitch) == 0) {
+         if (!f1_title_switch_ready() || psx_netplay_active()) return 0;
+         /* Defer: close the menu so its pause loop unwinds, then the main
+@@ -7031,40 +7052,47 @@ static void runtime_settings_ui_ensure_created(void) {
+         { kFmvCrop, "Graphics", "Crop FMVs",
+           "Drop the black bars inside movie frames + CRT overscan; pixel aspect kept",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        /* PGXP tuning - live, not persisted. The DuckStation knob set only:
+-         * the runtime's own extra mechanisms stay debug-port-only (pgxp cmd). */
+-        { kPgxpGeometry, "PGXP", "Geometry correction",
+-          "Sub-pixel vertices from the GTE shadow (DS knob)",
++        /* "Advanced": PGXP tuning - live, not persisted. The DuckStation knob
++         * set only; the runtime's own extra mechanisms stay debug-port-only.
++         * GT2 ships every knob at its lab-verified value (see
++         * mod_builtin_pgxp.c) so nobody needs this page; it exists for
++         * people who want to see what each knob does, and the reset row
++         * below puts everything back. */
++        { kPgxpReset, "Advanced", "Reset PGXP to GT2 defaults",
++          "Back to the shipped, lab-verified configuration",
++          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
++        { kPgxpGeometry, "Advanced", "PGXP: geometry correction",
++          "Sub-pixel vertices from the GTE shadow. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpTexture, "PGXP", "Perspective-correct textures",
+-          "Per-vertex W from GTE depth (DS knob)",
++        { kPgxpTexture, "Advanced", "PGXP: perspective-correct textures",
++          "Per-vertex W from GTE depth. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpCulling, "PGXP", "Culling correction",
+-          "NCLIP on full-precision projections (DS knob)",
++        { kPgxpCulling, "Advanced", "PGXP: culling correction",
++          "NCLIP on full-precision projections. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpPreserve, "PGXP", "Preserve projection precision",
+-          "Keep unrounded GTE projection (DS knob)",
++        { kPgxpPreserve, "Advanced", "PGXP: preserve projection precision",
++          "Keep the unrounded GTE projection. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpColor, "PGXP", "Color correction",
+-          "Perspective-correct Gouraud colours (DS knob)",
++        { kPgxpColor, "Advanced", "PGXP: color correction",
++          "Perspective-correct Gouraud colours. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpTolerance, "PGXP", "Geometry tolerance",
+-          "Max precise-vs-native distance (DS knob)",
++        { kPgxpTolerance, "Advanced", "PGXP: geometry tolerance",
++          "Max precise-vs-native distance. GT2 default: Unlimited",
+           RECOMP_RUNTIME_UI_CHOICE, 0, 5, 1, kPgxpToleranceChoices, 6, nullptr },
+-        { kPgxpDisable2d, "PGXP", "Disable on 2D polygons",
+-          "Any untracked corner -> whole poly native (DS)",
++        { kPgxpDisable2d, "Advanced", "PGXP: disable on 2D polygons",
++          "Any untracked corner -> whole poly native. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpVertexCache, "PGXP", "Vertex cache",
+-          "Precise lookup by packed word (DS, inaccurate)",
++        { kPgxpVertexCache, "Advanced", "PGXP: vertex cache",
++          "Screen-position fallback (breaks 2D backdrops). GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpCpuMode, "PGXP", "CPU mode",
+-          "Track precision through CPU arithmetic (DS)",
++        { kPgxpCpuMode, "Advanced", "PGXP: CPU mode",
++          "Track precision through CPU arithmetic. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpDepth, "PGXP", "Depth buffer",
+-          "Z-test proven-depth triangles (DS knob)",
++        { kPgxpDepth, "Advanced", "PGXP: depth buffer",
++          "Z-test proven-depth triangles (seam pinholes). GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpTransDepth, "PGXP", "Depth buffer: transparent",
+-          "Also Z-test semi-transparent polys (DS knob)",
++        { kPgxpTransDepth, "Advanced", "PGXP: depth buffer, transparent",
++          "Also Z-test semi-transparent polys. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+     };
+ 

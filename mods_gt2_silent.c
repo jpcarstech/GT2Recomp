@@ -441,21 +441,80 @@ static void gt2_arcade_cars_vblank(void) {
     }
 }
 
-/* ---- plain Arcade disc (SCUS-94455): no unlock cheats -------------------
- * There used to be two VBlank writers here applying the published GameShark
- * unlock codes (0x800F364E.. track masks, 0x801C93F8.. completion record).
- * Those codes are for the v1.0 pressing - DuckStation's cheat DB says so in
- * the file header - and this port targets v1.1, where the same addresses
- * hold something else. Asserted every VBlank they corrupted the input path:
- * keyboard and pad both dead, restored the moment they were switched off
- * (2026-09-02). Removed rather than "fixed" because there is no v1.1 source
- * to fix them from; the honest path is to reverse-engineer the unlock check
- * from the v1.1 arcade overlay, as gt2_arcade_tracks/cars_vblank above do
- * for the Combined Disc. Until then the Arcade disc simply has no unlock
- * cheats - which is the 1999 experience, not a regression.
- */
+/* ---- plain Arcade disc (SCUS-94455) -------------------------------------
+ * The published GameShark unlock codes for this serial (0x800F364E.. track
+ * counts, 0x801C93F8.. completion record) are for the v1.0 pressing; on
+ * v1.1 every save-struct address sits 0x370 higher, and asserted every
+ * VBlank the v1.0 writes corrupted the input path (2026-09-02). They were
+ * removed, and the v1.1 arcade overlay reverse-engineered instead: its
+ * unlock predicate (0x8002357C), item walker (0x8001D120) and beaten-flag
+ * array (0x801C9768) are byte-for-byte the code the Combined Disc features
+ * above patch - the Combined Disc's arcade mode IS the v1.1 arcade code -
+ * so those two features now target SCUS-94455 as well. Lab-verified on the
+ * v1.1 Arcade disc: course counts 3/0/3/0/1/3/1 -> 21/21/23/23/9/21/6, the
+ * course list runs to "21. Rome-Night", Class-S grows from 8 to 10 cars
+ * (docs/CHEAT_VERIFICATION.md, docs/evidence/). */
+
+/* ---- Silent's remaining patches, verbatim from DuckStation's database ----
+ * Executed by gameshark_vm.c with DuckStation's own code semantics (see
+ * docs/duckstation-cheat-format.md). The tables are generated from the
+ * "Rev 1" (v1.1) files in mods/db/duckstation/ by tools/cht_to_c.py and
+ * carry Silent's overlay-identity guards, so each does nothing until its
+ * overlay is resident. Each runs only while its feature is enabled (the
+ * runtime invokes a VBlank plugin only when its feature is in the plan). */
+#include "gameshark_vm.h"
+#include "mods_gt2_silent_codes.h"
+#include "mods_gt2_silent_codes_sim.h"
+/* Community Simulation-disc cheats re-derived for v1.1 (mods/db/gt2recomp/
+ * SCUS-94488_v1.1.cht): the v1.0/v1.2 codes shifted to the v1.1 save layout
+ * (+0x370), code sites checked against the v1.1 GT-mode overlay, every one
+ * run in the lab - docs/CHEAT_VERIFICATION.md. Each is A4-guarded on a
+ * GT-mode menu overlay word, so nothing is written while the race overlay
+ * (or arcade mode on the Combined Disc) occupies that memory. */
+#include "mods_gt2_v11_codes_sim.h"
+
+#define GT2_GS_PLUGIN(fn, cheat)                                   \
+    static void fn(void) {                                         \
+        static GsState st;                                         \
+        if (!psx_mod_game_started() || gt2_fmv_active()) return;   \
+        (void)gs_run(&cheat, &st, 1);                              \
+    }
+GT2_GS_PLUGIN(gt2_gs_metric_vblank,     gs_metric_units)
+GT2_GS_PLUGIN(gt2_gs_hudmirror_vblank,  gs_hud_mirror)
+GT2_GS_PLUGIN(gt2_gs_replaycams_vblank, gs_replay_cams)
+GT2_GS_PLUGIN(gt2_gs_bgm_vblank,        gs_bgm_switch)
+GT2_GS_PLUGIN(gt2_gs_endurance_vblank,  gs_true_endurance)
+GT2_GS_PLUGIN(gt2_gs_eventgen_vblank,   gs_fixed_event_gen)
+GT2_GS_PLUGIN(gt2_gs_cash_vblank,       gs_v11_cash)
+GT2_GS_PLUGIN(gt2_gs_moneykeep_vblank,  gs_v11_money_never_dec)
+GT2_GS_PLUGIN(gt2_gs_anycar_vblank,     gs_v11_any_car)
+GT2_GS_PLUGIN(gt2_gs_goldall_vblank,    gs_v11_gold_all)
+GT2_GS_PLUGIN(gt2_gs_golds_vblank,      gs_v11_gold_s)
+GT2_GS_PLUGIN(gt2_gs_goldia_vblank,     gs_v11_gold_ia)
+GT2_GS_PLUGIN(gt2_gs_goldib_vblank,     gs_v11_gold_ib)
+GT2_GS_PLUGIN(gt2_gs_goldic_vblank,     gs_v11_gold_ic)
+GT2_GS_PLUGIN(gt2_gs_golda_vblank,      gs_v11_gold_a)
+GT2_GS_PLUGIN(gt2_gs_goldb_vblank,      gs_v11_gold_b)
+GT2_GS_PLUGIN(gt2_gs_racesdone_vblank,  gs_v11_races_done)
 
 PSX_MOD_CONSTRUCTOR(gt2_register_silent_enhancements) {
+    (void)psx_mod_register_vblank_plugin("gt2.gs-metric",     gt2_gs_metric_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-hudmirror",  gt2_gs_hudmirror_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-replaycams", gt2_gs_replaycams_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-bgm",        gt2_gs_bgm_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-endurance",  gt2_gs_endurance_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-eventgen",   gt2_gs_eventgen_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-cash",       gt2_gs_cash_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-moneykeep",  gt2_gs_moneykeep_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-anycar",     gt2_gs_anycar_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-goldall",    gt2_gs_goldall_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-golds",      gt2_gs_golds_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-goldia",     gt2_gs_goldia_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-goldib",     gt2_gs_goldib_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-goldic",     gt2_gs_goldic_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-golda",      gt2_gs_golda_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-goldb",      gt2_gs_goldb_vblank);
+    (void)psx_mod_register_vblank_plugin("gt2.gs-racesdone",  gt2_gs_racesdone_vblank);
     (void)psx_mod_register_vblank_plugin("gt2.display-aspect",
                                          gt2_aspect_vblank);
     (void)psx_mod_register_vblank_plugin("gt2.drawdistance",

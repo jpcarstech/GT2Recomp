@@ -1,0 +1,91 @@
+From 729dc6c8ff49df51bdb55d11f7e121d7d9db545f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 02:20:37 +0000
+Subject: [PATCH] spu: sample-event deadline queries read SPUCNT directly
+ instead of snapshotting the whole global state
+
+---
+ runtime/include/spu.h    |  2 ++
+ runtime/src/interrupts.c | 14 +++++++-------
+ runtime/src/spu.c        |  6 ++++++
+ 3 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/include/spu.h b/runtime/include/spu.h
+index badec733..d8948f5f 100644
+--- a/runtime/include/spu.h
++++ b/runtime/include/spu.h
+@@ -81,6 +81,8 @@ typedef struct SpuGlobalState {
+ 
+ void spu_get_voice_state(int voice, SpuVoiceState* out);
+ void spu_get_global_state(SpuGlobalState* out);
++/* SPUCNT only - the cheap read for hot deadline queries. */
++uint16_t spu_ctrl_reg(void);
+ /* Debug peek into SPU sample RAM (spu_ram TCP command). */
+ uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len);
+ 
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+index 6e8764e6..16c9ae15 100644
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -429,7 +429,6 @@ static int spu_sample_event_mode(void) {
+ }
+ 
+ uint32_t psx_spu_sample_event_cycles_to_next(void) {
+-    SpuGlobalState state;
+     g_spu_sample_deadline_queries++;
+     if (!spu_sample_event_mode()) {
+         g_spu_sample_mode_rejects++;
+@@ -439,8 +438,10 @@ uint32_t psx_spu_sample_event_cycles_to_next(void) {
+         g_spu_sample_pump_null_rejects++;
+         return UINT32_MAX;
+     }
+-    spu_get_global_state(&state);
+-    if ((state.ctrl & 0x0040u) == 0) {
++    /* One register, not the whole global-state snapshot: this runs on every
++     * device deadline recompute (spu_ctrl_reg, spu.c). */
++    const uint16_t ctrl = spu_ctrl_reg();
++    if ((ctrl & 0x0040u) == 0) {
+         g_spu_sample_ctrl_rejects++;
+         return UINT32_MAX;
+     }
+@@ -460,9 +461,8 @@ void psx_spu_sample_event_service(void) {
+     g_spu_sample_service_checks++;
+     if (!spu_sample_event_mode() || !s_midframe_audio_pump)
+         return;
+-    SpuGlobalState state;
+-    spu_get_global_state(&state);
+-    if ((state.ctrl & 0x0040u) != 0) {
++    const uint16_t ctrl = spu_ctrl_reg();
++    if ((ctrl & 0x0040u) != 0) {
+         g_spu_sample_enabled_services++;
+         g_spu_sample_last_service_phase = (uint32_t)(psx_cycle_count % 768u);
+     }
+@@ -471,7 +471,7 @@ void psx_spu_sample_event_service(void) {
+         if ((psx_get_cycle_count() % 768u) != 0)
+             g_spu_sample_deferred_mismatches++;
+     }
+-    if ((state.ctrl & 0x0040u) != 0 &&
++    if ((ctrl & 0x0040u) != 0 &&
+         (psx_get_cycle_count() % 768u) == 0) {
+         g_spu_sample_service_pumps++;
+         s_midframe_audio_pump();
+diff --git a/runtime/src/spu.c b/runtime/src/spu.c
+index 1c987b91..a61578b6 100644
+--- a/runtime/src/spu.c
++++ b/runtime/src/spu.c
+@@ -1657,6 +1657,12 @@ void spu_get_global_state(SpuGlobalState* out) {
+                     | (((spu_regs[reg_index(0x1F801D82u)] >> 15) & 1u) << 1);
+ }
+ 
++/* SPUCNT (0x1F801DAA) alone, for the per-deadline sample-event queries in
++ * interrupts.c: they need one bit (IRQ9 enable) and were paying for the full
++ * spu_get_global_state() - two 24-voice scans and a memset - on every device
++ * deadline recompute, ~10% of the main thread in a GT2 race (2026-09-03). */
++uint16_t spu_ctrl_reg(void) { return spu_regs[reg_index(0x1F801DAAu)]; }
++
+ uint64_t spu_event_total(void) { return s_event_seq; }
+ 
+ uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
+-- 
+2.43.0
+

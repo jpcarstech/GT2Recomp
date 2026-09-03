@@ -1,0 +1,112 @@
+; Gran Turismo 2 (USA) (Simulation Mode) (Rev 1) [SCUS-94488] - v1.1 cheats derived by GT2Recomp
+; The community "Simulation Disc" cheats in DuckStation's cheats.zip are for the
+; v1.0 / v1.2 pressings. On v1.1 the save/profile structure sits 0x370 bytes
+; higher (base 0x801C96B0 instead of 0x801C9340), so every data code below is
+; the community code shifted by +0x370; the code-patch sites were checked
+; instruction by instruction against the v1.1 GT-mode overlay. Every entry
+; here was run on the v1.1 Simulation disc in the lab with a screenshot of the
+; result - see docs/CHEAT_VERIFICATION.md. Guarded (A4) on a word of the
+; GT-mode menu overlay that no cheat touches, so nothing is written while the
+; race overlay (or, on the Combined Disc, arcade mode) occupies that memory.
+
+[A Ton Of Cash]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Description = Credits held at 99,999,999 while in the GT-mode menus (the v1.0 code wrote 0x801D0FC8, dead memory on v1.1; the v1.1 credits word is 0x801D1338 = profile 0 + 0x4014).
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+901D1338 05F5E0FF
+00000000 FFFF
+
+[Money Never Decreases]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Description = The two purchase paths store the reduced balance with sw v1,0x4014(sN); both stores become no-ops (the community code's 0x2400 halfword, on the same instructions at the same addresses on v1.1). Restored when the cheat is switched off.
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+A7017A42 AE232400
+A7017D4A AE432400
+00000000 FFFF
+
+[Any Car Can Play Any Circuit]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Description = The horsepower-limit check at 0x800148E0 (beq v0,v1,+0xC) becomes an unconditional branch, the community patch on the identical v1.1 instruction. Restored when switched off.
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+A70148E2 10431000
+00000000 FFFF
+
+[Have All Gold Licenses]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Description = All 60 licence tests (6 classes x 10, records of 0xA4 bytes from 0x801CAAC8 = save base + 0x1418) marked gold (halfword 0x0400). GAME STATUS shows 60 gold cups and the S badge; every test lists a gold trophy.
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50003CA4 0000
+801CAAC8 0400
+00000000 FFFF
+
+[Gold Super License]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50000AA4 0000
+801CAAC8 0400
+00000000 FFFF
+
+[Gold Licenses I-A]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50000AA4 0000
+801CB130 0400
+00000000 FFFF
+
+[Gold Licenses I-B]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50000AA4 0000
+801CB798 0400
+00000000 FFFF
+
+[Gold Licenses I-C]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50000AA4 0000
+801CBE00 0400
+00000000 FFFF
+
+[Gold Licenses A]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50000AA4 0000
+801CC468 0400
+00000000 FFFF
+
+[Gold Licenses B]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50000AA4 0000
+801CCAD0 0400
+00000000 FFFF
+
+[All Races Completed]
+Author = community (DuckStation cheats.zip, v1.0/v1.2), re-derived for v1.1 by GT2Recomp
+Description = The race-completion flag array (68 halfwords from 0x801C97C8 = save base + 0x118) filled with 0x1111, as the community code did on v1.0. GAME STATUS then reports the game complete (over 100%, as that code always did); the Arcade disc reads the same save to unlock its Simulation credits.
+Type = Gameshark
+Activation = EndFrame
+A4017A3C 00741823
+50004402 0000
+801C97C8 1111
+00000000 FFFF

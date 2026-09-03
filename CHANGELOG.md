@@ -1,5 +1,141 @@
 # Changelog
 
+## 0.3.0 — every Silent patch, cheats on both discs, 60 FPS measured (2026-09-03)
+
+### Enhancements
+- **All of Silent's GT2 patches now ship, run VERBATIM from DuckStation's
+  patch database.** New on both discs: **Metric Units**, **HUD & Mirror Toggle
+  (L3)** — tap to cycle the rear-view mirror, hold to hide the HUD — **Replay
+  Cameras in Race (R1)**, and **BGM Switch (R3)** — tap for the next track,
+  hold to mute. New on the Simulation disc: **True Endurance** (the Rome 2
+  Hours event ends after two real hours, as in the PS2 games) and **Fixed
+  Event Generator**. The previously shipped five (60 FPS, widescreen, draw
+  distance, full-detail AI, 8 MB buffers) are unchanged and are the same
+  versions as the database's current entries — nothing is duplicated.
+- How: a small interpreter for DuckStation's GameShark code format
+  (`gameshark_vm.c`, semantics from DuckStation's own specification in
+  `docs/duckstation-cheat-format.md`) executes the database entries as data.
+  `tools/cht_to_c.py` turns the two hash-specific "Rev 1" (= v1.1) files in
+  `mods/db/duckstation/` into C tables, refusing at build time any opcode the
+  interpreter does not implement. Every one of the four shared patches is
+  byte-identical between the Arcade and Simulation database files. The
+  interpreter is unit-tested against Silent's real code — `tests/run.sh`
+  proves the BGM state machine (tap/hold/wrap/mute), the L3 tap-vs-hold
+  detection, the R1 hold and replay restore chain, and that a patch writes
+  nothing while its overlay is not resident.
+- One framework addition to make the button-driven patches possible:
+  `psx_mod_controller_buttons()` — the button word the game itself sees this
+  frame, after mapping, keybinds and the analog/digital policy.
+
+### 60 FPS performance — measured, three fixes, one decoupling
+- **Measured first** (`docs/PERFORMANCE.md`): on a real PC a 60 FPS race is
+  CPU-bound in *native* emulation code — the GPU costs nothing even at 16×
+  supersampling, the interpreter is negligible once the native cache is
+  warm. So the fixed costs on the emulation path were profiled and cut:
+- **The native cache had a hole.** The background shard compiler failed on
+  GT2's biggest overlay (the menu/race code at 0x80018000) with an
+  unresolved symbol on both discs, leaving that code to per-function
+  island shards and the interpreter. Fixed (shard ABI v22 — existing
+  caches are rebuilt over the first few sessions, so expect those to be a
+  little slower than the last one you played).
+- **Dev instrumentation off at play time:** the debug server's per-store
+  fingerprinting, frame recorder and per-block observer are silenced from
+  boot (`debug_hot_hooks = false`; `PSX_DEBUG_HOT_HOOKS=1` re-arms them),
+  and the SPU's per-deadline query no longer snapshots the whole SPU state
+  to read one bit. Together with a memo on the static-code validity check:
+  **+30% on the lab's 60 FPS race at 325%.**
+- **60 FPS no longer forces the 325% overclock.** Choosing 60 FPS still
+  switches the CPU overclock on, but the percent is yours — lowering it no
+  longer switches 60 FPS off (it did, through a manifest constraint). Host
+  time scales with the overclock whether the game needs the cycles or not,
+  so if 60 stutters, try 200 or 250 on the Mods page before giving up on
+  it; 325 (Silent's figure) remains the safe upper value.
+- Measured and rejected: the framework's idle-loop skipping (15% slower at
+  60 FPS in GT2's DrawSync/VSync loops, off), PGXP costs ~12% at 60 FPS
+  (a visual choice, still in the Enhanced preset).
+- `Benchmark GT2.cmd` in the game folder writes a `gt2_benchmark.txt` with
+  the runtime's own counters (guest Hz, host time split, interpreter and
+  native-cache activity) for a race — the file to send with a performance
+  report.
+- Savestates from earlier builds do not load on this one (the state carries
+  the codegen/ABI tag that changed with the shard fix).
+- `Tidy GT2 folder.cmd` (`tools\tidy_game_folder.ps1`): moves the pre-0.2
+  single-build leftovers at the game root, any second complete install in a
+  subfolder, lab disc chunks and freeze dumps into `_old\`, and the release
+  tooling into `release\`, so the root holds one exe to start; says which
+  build is installed and offers `Setup GT2.cmd` when `gt2recomp.bundle` is
+  newer than it. Never deletes; idempotent.
+
+### F1 menu
+- PGXP tuning now lives under an **Advanced** section at the bottom of the
+  F1 menu, each row stating the GT2 default, with a **Reset PGXP to GT2
+  defaults** row. The shipped configuration is the lab-verified one from the
+  PGXP work (geometry, perspective-correct textures, culling correction and
+  preserve-projection on; tolerance unlimited; colour correction,
+  disable-on-2D, vertex cache, CPU mode and depth buffer off) and is applied
+  automatically whenever the PGXP mod is on — nobody has to tune anything.
+  The stale `pgxp_tolerance = 0.1` in the runtime config (ignored while the
+  mod owns the setting) is gone, with an accurate note in its place.
+- **Change disc...** (the hot mount still offered in single-disc installs)
+  refuses an image whose serial is not this build's: the Simulation disc
+  cannot be mounted into the Arcade build or vice versa. A build is a static
+  recompilation of one executable, and cheats activated for one disc would
+  keep writing their addresses into the other disc's memory. Multi-disc
+  installs never had the row; their disc switch restarts into the other
+  build, so no cheat state can cross over.
+
+### Cheats — the plain discs get theirs, verified on v1.1
+- **Why the community codes never worked here:** both discs keep the save
+  state in one structure that sits at 0x801C9340 on v1.0 and **0x801C96B0
+  on v1.1** — 0x370 bytes higher. Every published data code for GT2 was
+  written against v1.0, so on v1.1 it lands short: the credits code writes
+  dead memory, the Arcade unlock codes hit the input path. Each cheat below
+  was re-derived for v1.1 and run in the lab with a screenshot of the result
+  (`docs/CHEAT_VERIFICATION.md`, `docs/evidence/`).
+- **Arcade disc: Unlock All Tracks / Unlock All Cars.** The v1.1 arcade
+  code turned out to be byte-identical to the Combined Disc's arcade mode,
+  whose unlock-check patches already shipped; those two features now
+  target the Arcade disc too. Every course table fills (the 1P list runs to
+  "21. Rome-Night") and the extra class cars appear.
+- **Simulation disc, eleven cheats:** A Ton Of Cash, Money Never
+  Decreases, Any Car Can Enter Any Race, All Gold Licences and one per
+  licence class (Super, I-A, I-B, I-C, A, B), All Races Completed. All
+  pure data (`mods/db/gt2recomp/SCUS-94488_v1.1.cht`) for the GameShark
+  interpreter, which gained the `50` slide opcode; every one is guarded on a
+  GT-mode menu-overlay word so nothing is written mid-race, or in arcade
+  mode on the Combined Disc.
+- Not shipped, with the reason documented: Start With $99,000,000+, Max
+  Cash After One Race, the "alternate" gold code, Stop Race Timer, Hit/Tap
+  AI, and the "Both Discs" race codes (their pad-word address is not the
+  pad word on v1.1).
+
+### Known issues
+- **60 FPS is CPU-heavy.** A 60 FPS race is emulation work on one core at up
+  to 3.25× the PlayStation's clock; on many PCs that sags in races while
+  menus stay at 60. The GPU is not involved (supersampling makes no
+  difference). What helps: a lower **CPU overclock %** on the Mods page
+  (200–250 — this no longer switches 60 FPS off), a few sessions for the
+  native-code cache to warm (let `Play GT2.cmd` finish its compile step),
+  and PGXP off if you must (~12% of a 60 fps frame). Original (30 fps) with
+  the Enhanced preset is a solid 30 everywhere. `Benchmark GT2.cmd` writes
+  the numbers to send with a performance report.
+- **Old 30 fps replays and Rally ghosts** do not play back correctly at
+  60 FPS (a property of Silent's patch, as on DuckStation).
+- **Cheats are per disc.** The Arcade unlocks are on the Arcade disc's
+  Cheats page, the money/licence/race cheats on the Simulation disc's; the
+  Combined Disc keeps its own set. The Simulation cheats change the save
+  file the game is holding — on a garage you care about, save first. Not
+  shipped and why: `docs/CHEAT_VERIFICATION.md`.
+- **Savestates from 0.2.0 do not load** on this build (the native-code
+  cache ABI changed with the shard fix; the state carries that tag). Memory
+  cards and replays are unaffected.
+- The first sessions after a build run slower (the native-code cache is
+  rebuilt for the new ABI), and the boot "Loading Save Data" screen takes a
+  while.
+- Upgrading from 0.1.x: the enhancement folder is renamed `patches\` →
+  `mods\` on the first setup run; `Tidy GT2 folder.cmd` moves the rest of
+  the old layout into `_old\`.
+
 ## 0.2.0 — multi-disc: build from your own Arcade + Simulation dumps (2026-09-02)
 
 **The GT2 Combined Disc is no longer required.** Setup now builds directly

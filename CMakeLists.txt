@@ -31,7 +31,7 @@ psxrecomp_add_game_runtime(psx-runtime
 
     GEN_MARKER "generated/SCUS_944.88_dispatch.c"
     GEN_FULL_GLOB "generated/SCUS_944.88_full_*.c"
-    CODEGEN_SETUP_SOURCES codegen_setup.c mods_gt2_silent.c
+    CODEGEN_SETUP_SOURCES codegen_setup.c mods_gt2_silent.c gameshark_vm.c
     CODEGEN_SETUP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 

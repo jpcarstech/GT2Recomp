@@ -17,3 +17,7 @@ into the game folder's `diagnostics\` / `dumps\`. Not installed by default;
 | `show_video.ps1`, `win_burst.ps1`, `scan_xbank.ps1`, `export_disc_chunks.ps1` | Misc capture/transfer helpers |
 
 See `docs/PGXP_Lessons_GT2Recomp.docx` for how these were used.
+
+`release/` holds John's GitHub push scripts (`push_update.cmd`,
+`fix_release_tag.cmd`); they live in the game folder's `release\` subfolder,
+not in `tools\` — see CLAUDE.md "Releasing".

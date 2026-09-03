@@ -1,0 +1,480 @@
+# Gran Turismo 2 (USA) (Simulation Mode) (Rev 1) [SCUS-94488]
+[Widescreen 16:9]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+OverrideAspectRatio = 16:9
+DisableWidescreenRendering = True
+# "Help" the game unload segments that normally are left unwritten to,
+# so further cheat detection is more reliable. This is safe as it overwrites dead code.
+A4052A64 801EF8EF # Reset the race overlay for Arcade
+8005D598 0000
+80057010 0000
+00000000 FFFF
+A4052B20 000000E7 # Reset the race overlay for Simulation
+8005D598 0000
+80057010 0000
+00000000 FFFF
+# Car Selection (Arcade)
+A4020A74 3084007F
+A701E55C FF80FF56
+A701E564 008000AA
+# Car Selection 2P Battle (Arcade)
+A70201A8 FF97FF74
+A70201B0 0069008C
+# Pre-race screen (Arcade)
+A7015350 014001AA
+00000000 FFFF
+# Race
+A401F888 AEB40008
+A70100D0 FF60FF2B
+A70100D4 00A000D5
+00000000 FFFF
+# Race (Rear view mirror)
+A403EC6C 02602021
+A70295E4 FFC4FFB0
+A70295E8 003C0050
+00000000 FFFF
+# Post-race screen #1
+A4057010 260201C0
+# a1 -> t1, *will* change visuals of some screens!
+# Other screens will get slightly resized to compensate for this.
+A7049736 A485A489
+A7049EB4 00C8010A
+A7049EBC 302100C8
+A7049EBE 00A03406
+A704C100 00C8010A
+A704C108 302100C8
+A704C10A 00A03406
+# Bonus screen (Licenses)
+# Use free space to re-fit li $a1, 160h \ sh $a1, C4h($a0)
+A704DFE8 00000160
+A704DFEA 00002405
+A704DFF4 022000C4
+A704DFF6 8FB2A485
+A704DFD0 016001D5
+# Results screen
+A7050B80 FF50FF16
+A7050B88 00B000EA
+00000000 FFFF
+# Post-race screen #2
+A405D598 8005A5B4
+A705802C 00C8010A
+A7058034 302100C8
+A7058036 00A03406
+A70588E0 00C8010A
+A70588E8 302100C8
+A70588EA 00A03406
+# Bonus screen (Trophy)
+A70599C4 016001D5
+00000000 FFFF
+# GT Mode screens (Simulation)
+A40244EC 800229D8
+A701CDF4 00B30086
+A701CDFC FFCEFFDB
+A701CE04 03200258
+00000000 FFFF
+
+[Widescreen 21:9]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+OverrideAspectRatio = 21:9
+DisableWidescreenRendering = True
+# "Help" the game unload segments that normally are left unwritten to,
+# so further cheat detection is more reliable. This is safe as it overwrites dead code.
+A4052A64 801EF8EF # Reset the race overlay for Arcade
+8005D598 0000
+80057010 0000
+00000000 FFFF
+A4052B20 000000E7 # Reset the race overlay for Simulation
+8005D598 0000
+80057010 0000
+00000000 FFFF
+# Car Selection (Arcade)
+A4020A74 3084007F
+A701E55C FF80FF20
+A701E564 008000E0
+# Car Selection 2P Battle (Arcade)
+A70201A8 FF97FF49
+A70201B0 006900B7
+# Pre-race screen (Arcade)
+A7015350 01400230
+00000000 FFFF
+# Race
+A401F888 AEB40008
+A70100D0 FF60FEE8
+A70100D4 00A00118
+00000000 FFFF
+# Race (Rear view mirror)
+A403EC6C 02602021
+A70295E4 FFC4FF97
+A70295E8 003C0069
+00000000 FFFF
+# Post-race screen #1
+A4057010 260201C0
+# a1 -> t1, *will* change visuals of some screens!
+# Other screens will get slightly resized to compensate for this.
+A7049736 A485A489
+A7049EB4 00C8015E
+A7049EBC 302100C8
+A7049EBE 00A03406
+A704C100 00C8015E
+A704C108 302100C8
+A704C10A 00A03406
+# Bonus screen (Licenses)
+# Use free space to re-fit li $a1, 160h \ sh $a1, C4h($a0)
+A704DFE8 00000160
+A704DFEA 00002405
+A704DFF4 022000C4
+A704DFF6 8FB2A485
+A704DFD0 01600268
+# Results screen
+A7050B80 FF50FECC
+A7050B88 00B00134
+00000000 FFFF
+# Post-race screen #2
+A405D598 8005A5B4
+A705802C 00C8015E
+A7058034 302100C8
+A7058036 00A03406
+A70588E0 00C8015E
+A70588E8 302100C8
+A70588EA 00A03406
+# Bonus screen (Trophy)
+A70599C4 01600268
+00000000 FFFF
+# GT Mode screens (Simulation)
+A40244EC 800229D8
+A701CDF4 00B30066
+A701CDFC FFCEFFE4
+A701CE04 032001C9
+00000000 FFFF
+
+[60 FPS]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent, asasega
+Description = When this patch is in use, existing replays and AI ghost in Rally events will break. Consider switching back to 30 FPS for those events.
+OverrideCPUOverclock = 325
+DisallowForAchievements = True
+E01D5634 0002
+301D5634 0001
+A401F888 AEB40008
+# Re-enable tire smoke
+A70168C8 00020000
+# Re-enable sky in the read view mirror
+A7019644 00020000
+00000000 FFFF
+# Re-enable rear view mirror
+A003EC6C 02602021
+A7029548 00020000
+
+[Metric units]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+# "Help" the game unload segments that normally are left unwritten to,
+# so further cheat detection is more reliable. This is safe as it overwrites dead code.
+A0052A64 801EF8EF # Reset the race overlay for Arcade
+80057010 0000
+A0052B20 000000E7 # Reset the race overlay for Simulation
+80057010 0000
+# Localization changes
+# mph text -> km/h text (lap times)
+A71C6A27 706D6D6B
+A71C6A29 0068682F
+# ft text -> m text (Arcade)
+A70F853D 7466006D
+# lb text -> kg text (Arcade)
+A70F8435 626C676B
+# lb-ft text -> kgm text (Arcade)
+A70F8474 626C676B
+A70F8476 662D2F6D
+A70F8478 2F746425
+A70F847A 64257072
+A70F847C 7072006D
+A70F8487 626C676B
+A70F8489 662D2F6D
+A70F848B 2F74257E
+A70F848D 257E7264
+A70F848F 72646D70
+A70F8491 6D700000
+# lb-ft text -> kgm text (Arcade graph)
+A70F835A 626C676B
+A70F835C 662D006D
+# mph launch speed -> km/h launch speed text (License tests)
+A71C6EA9 706D6D6B
+A71C6EAB 0068682F
+# lb text -> kg text (Simulation garage)
+A71EF476 626C676B
+# lb-ft text -> kgm text (Simulation garage)
+A71C2EA7 626C676B
+A71C2EA9 662D206D
+A71C2EAB 2074202F
+A71C2EAD 202F0000
+# Code changes
+A403EC6C 02602021
+# mph text -> km/h text (speedometer)
+A702F6F4 B0D8A0C0
+A702F6F6 39233922
+# Speed unit scaling
+A7030568 000D0016
+A703056C FBDD8000
+00000000 FFFF
+A4020A74 3084007F
+# Weight unit scaling (Arcade)
+A7018AC8 13030000
+A7018ACA 00090000
+A7018AD0 30230000
+A7018AD2 00463446
+# Torque unit scaling (Arcade)
+A7018C0C 17C30000
+A7018C0E 000234A8
+A7018C20 40230000
+A7018C22 00620000
+# Torque graph scaling (Arcade)
+A7019798 18230004
+A701979A 00629683
+A70198B2 ACC3ACC4
+00000000 FFFF
+# Speed unit scaling (License tests)
+A4057010 260201C0
+A704D984 37C30000
+A704D986 00069506
+A704D994 30230000
+A704D996 00460000
+00000000 FFFF
+A40244EC 800229D8
+# Weight unit scaling (Simulation screens)
+A701C968 48100000
+A701C974 302303A4
+A701C976 00468D26
+A701C564 48100000
+A701C570 302303A4
+A701C572 00468D26
+# Torque unit scaling (Simulation screens)
+A701C808 40230000
+A701C80A 00620000
+00000000 FFFF
+
+[Full detail AI cars]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = Requires the "Use 8MB RAM for polygon buffers" patch.
+OverrideCPUOverclock = 325
+A401F888 AEB40008
+A7014344 00405112
+A7014346 16A00800
+A7014348 00030001 # Set to 0003 to force the lowest LOD
+00000000 FFFF
+
+[Slightly higher draw distance]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = Benefits from "Use 8MB RAM for polygon buffers" patch.
+OverrideCPUOverclock = 325
+A403EC6C 02602021
+A7020420 0004810D
+A7020422 14400800
+00000000 FFFF
+
+[HUD & rear view mirror toggle ]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = Allows to toggle the rear view mirror by tapping L3 (cycling between “always on”, “default” and “always off”) and toggle the entire HUD by holding L3.
+A403EC6C 02602021
+D7010001 00000200
+A002951C 1040000C
+9002951C 00000001 # Always on
+A002951C 0800A554
+9002951C 1040000C # Default
+A002951C 00000000
+9002951C 0800A554 # Always off
+# Fixup canary
+A002951C 00000001
+9002951C 00000000
+00000000 FFFF
+00000000 FFFF
+A403EC6C 02602021
+D701003C 00000200
+F502942C 0022A52E
+F502942E 14400800
+F502941C BA040000
+F502941E 0C000000
+00000000 FFFF
+00000000 FFFF
+
+[Replay cameras in race]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = Makes all replay cameras accessible in race, and allows to switch the cinematic camera by holding R1.
+A401F888 AEB40008
+A701031C 00030009
+A7010370 40F045C1
+C30A92BC 0001 # Replay off
+A701171C 0106010E
+A7011778 45E945D7
+00000000 FFFF
+00000000 FFFF
+A401F888 AEB40008
+# Hold R1 to trigger a cinematic camera
+C30A92BC 0001 # Replay off
+D701001E 01000008
+F5010148 40B6427F
+F5010A4C 006C8021
+F5010A4E 8C700000
+301FFA89 0002
+00000000 FFFF
+00000000 FFFF
+00000000 FFFF
+# Restore everything when replay is enabled
+A401F888 AEB40008
+C40A92BC 0000
+D001171C 010E
+8001171C 0106
+D0011778 45D7
+80011778 45E9
+A0010A4C 00008021
+90010A4C 8C70006C
+00000000 FFFF
+00000000 FFFF
+
+[True Endurance]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = "Millenium In Rome 2 Hours Endurance" event ends after 2 hours, regardless of how many laps were finished (like in PS2 Gran Turismos).
+# "Help" the game unload segments that normally are left unwritten to,
+# so further cheat detection is more reliable. This is safe as it overwrites dead code.
+A0052A64 801EF8EF # Reset the race overlay for Arcade
+80057010 0000
+A0052B20 000000E7 # Reset the race overlay for Simulation
+80057010 0000
+# Sets 2h Rome Endurance to 255 laps and hides the lap counter
+A4057010 260201C0
+# Set the endurance flag manually for 255 lap races, so replays work properly
+E01D563B 00FF
+E0046ED5 0000
+30046ED5 0001
+# Time limited race off
+E0046ED5 0000
+A602CE1C 00020006 # Restore the max laps counter
+# Time limited race on
+C4046ED5 0000
+A702CE1C 00060002 # Turn off the max laps counter
+# Set laps to 255
+E01D563B 0063
+301D563B 00FF
+00000000 FFFF
+00000000 FFFF
+
+[BGM Switch]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = This patch allows for switching the in-race music by pressing R3. Holding R3 will mute music instead.
+# Check for the R3 key
+D702003C 02000400
+51050005 01
+00000000 FFFF
+# If held for over 60 frames, mute
+52900002 0000003C
+51050005 02
+00000000 FFFF
+# If released before 60 frames passed, switch
+52900002 00000000
+52100005 01
+51050005 03
+00000000 FFFF
+00000000 FFFF
+# Obtain the pointers only if we need it
+51050003 00
+A403EC6C 02602021
+52130005 02
+51810003 0002F4EC
+51060304 000002EE
+00000000 FFFF
+00000000 FFFF
+# If the audio pointer is 0, abort (so we don't have to check again)
+52130005 02
+52900003 00000000
+51050005 00
+00000000 FFFF
+00000000 FFFF
+# Switch BGM
+52100005 03
+52150004 05
+51030404 01
+52120004 05
+51050004 00
+00000000 FFFF
+00000000 FFFF
+00000000 FFFF
+# Unmute
+52100005 03
+52100004 FE
+51050004 00
+00000000 FFFF
+00000000 FFFF
+# Mute
+52100005 02
+52150004 05
+51050004 FE
+00000000 FFFF
+00000000 FFFF
+# Apply changes
+52910003 00000000
+51830303 000002EE
+51040403 00
+51050005 00
+00000000 FFFF
+
+[Fixed Event Generator]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = Improves randomly generated events (One-Make races and Event Generator races) by fixing the course generation.
+A40244EC 800229D8
+# new_paramaS -> new_parmaS
+A7023037 6D61616D
+A7023039 53610053
+# Add mini/rev_mini (Autumn Ring Mini) to random events
+A70231AC 494C6572
+A70231AE 25535F76
+A70231B0 3230696D
+A70231B2 0064696E
+A70231B4 494C0000
+A0050D98 00000000
+90050D98 800231AC
+A0050D9C 800231AC
+90050D9C 800231B0
+A0050DA0 800231B4
+90050DA0 00000000
+00000000 FFFF
+
+[Use 8MB RAM for polygon buffers]
+Type = Gameshark
+Activation = EndFrame
+Author = Silent
+Description = A patch code moving the polygon buffers to the dev RAM area and doubling their size. Required by other patches that make the game render more geometry on screen at once.
+Enable8MBRAM = True
+A401F888 AEB40008
+# Codes will be skipped if RAM mirroring is in place (8MB mode disabled)
+D121F88A AEB4
+A7016A6C 000E8020
+D121F88A AEB4
+A7016A70 57000000
+D121F88A AEB4
+A7016A7C 00030007
+D121F88A AEB4
+A7016A78 28210000
+D121F88A AEB4
+A7016A7A 02250000
+D121F88A AEB4
+A7016A88 80000000
+00000000 FFFF

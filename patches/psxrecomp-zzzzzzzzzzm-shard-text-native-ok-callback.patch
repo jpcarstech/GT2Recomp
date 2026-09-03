@@ -1,0 +1,111 @@
+From ad3ae756c27b5871b903e5bee231c07c6ce31b8b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 01:00:10 +0000
+Subject: [PATCH] overlay shards: text_native_ok callback (ABI v22) so the
+ emitter's stale-static guards link inside a DLL shard
+
+---
+ runtime/include/overlay_api.h                 | 18 ++++++++++++++-
+ .../include/overlay_dispatch_preamble.c.inc   |  8 +++++++
+ runtime/src/overlay_loader.c                  | 23 +++++++++++++++++++
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/include/overlay_api.h b/runtime/include/overlay_api.h
+index 6ce7251b..a7e632a8 100644
+--- a/runtime/include/overlay_api.h
++++ b/runtime/include/overlay_api.h
+@@ -93,7 +93,9 @@
+  *      host/DLL flavor mix — base-flavour DLLs and hosts are untouched, so
+  *      the version stays. The emit-content change (PGXP_*() macros in all
+  *      generated C) is covered by the codegen hash + CODEGEN_VER below. */
+-#define PSX_OVERLAY_ABI_VERSION 21
++/* v22: text_native_ok forwarder so the emitter's stale-static guards link
++ *      inside a shard (see the field). */
++#define PSX_OVERLAY_ABI_VERSION 22
+ 
+ /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
+  * record consumes one slot, even when another DLL carries an identical
+@@ -334,6 +336,20 @@ typedef struct {
+      * load-bearing. The ABI version bump that arms this ships with the
+      * emitter change (Phase 2 of ENHANCEMENTS.md G1 value propagation). */
+     const PGXPHooks *pgxp;
++
++    /* ABI v22: stale-static guard forwarder. The emitter guards every direct
++     * jal to a known function and every fall-through into the next function
++     * with psx_game_text_native_ok(target) — in overlay-resident code too.
++     * A shard cannot link the host's static-table validator, and until this
++     * field existed the unresolved reference failed the whole-region
++     * compile: GT2's 44 KB menu/race overlay at 0x80018000 never got a
++     * region shard and ran through island shards and the interpreter. In a
++     * shard the question is "may I call my own compiled copy of target
++     * directly?", which the loader answers from its candidate state: 1 iff
++     * the entry at target is currently VALID (byte-identical to its capture,
++     * generation unchanged); anything else routes through dispatch, which
++     * validates and runs the same shard function anyway. */
++    int (*text_native_ok)(uint32_t addr);
+ } OverlayCallbacks;
+ 
+ #ifdef __cplusplus
+diff --git a/runtime/include/overlay_dispatch_preamble.c.inc b/runtime/include/overlay_dispatch_preamble.c.inc
+index ac0e9fc5..7650fd82 100644
+--- a/runtime/include/overlay_dispatch_preamble.c.inc
++++ b/runtime/include/overlay_dispatch_preamble.c.inc
+@@ -43,6 +43,14 @@ void overlay_init(const OverlayCallbacks *cbs) {
+     if (g_cbs.bail_resolved)  g_psx_bail_resolved_p = g_cbs.bail_resolved;
+ }
+ 
++/* Stale-static guard (ABI v22): may this shard call its own compiled copy of
++ * `addr` directly? Answered by the loader's candidate state; a host without
++ * the callback, or an unknown/invalid entry, says no and the call goes
++ * through dispatch instead (same native code, validated there). */
++int psx_game_text_native_ok(uint32_t addr) {
++    return g_cbs.text_native_ok ? g_cbs.text_native_ok(addr) : 0;
++}
++
+ void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
+     overlay_flush_cycles();
+     (void)ra;
+diff --git a/runtime/src/overlay_loader.c b/runtime/src/overlay_loader.c
+index db82cbbd..7f4a4726 100644
+--- a/runtime/src/overlay_loader.c
++++ b/runtime/src/overlay_loader.c
+@@ -2497,6 +2497,11 @@ static void init_callbacks(void) {
+             };
+             s_callbacks.pgxp = &pgxp_hooks_table;
+         }
++        /* ABI v22: stale-static guard forwarder (see overlay_api.h). */
++        {
++            extern int overlay_loader_shard_target_ok(uint32_t addr);
++            s_callbacks.text_native_ok = overlay_loader_shard_target_ok;
++        }
+     }
+ }
+ 
+@@ -3620,6 +3625,24 @@ static int overlay_find_by_range(uint32_t phys) {
+     return best;
+ }
+ 
++/* Shard-side stale-static guard (OverlayCallbacks.text_native_ok, ABI v22):
++ * 1 iff a registered candidate at addr is VALID and no watched page of its
++ * code changed since that was established - the same generation-gated test
++ * the dispatch chain below applies before running an entry native, minus the
++ * re-hash (an entry that needs one is simply routed through dispatch, which
++ * performs it). Device-touching and blacklisted entries say no. */
++int overlay_loader_shard_target_ok(uint32_t addr) {
++    if (!s_active) return 0;
++    uint32_t phys = addr & 0x1FFFFFFFu;
++    for (int i = idx_head(phys); i >= 0; i = s_cand[i].next) {
++        const Candidate *c = &s_cand[i];
++        if (c->state != ENTRY_VALID || c->device_touch) continue;
++        if (cand_gensum(c) != c->val_gen) continue;
++        return 1;
++    }
++    return 0;
++}
++
+ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
+     uint32_t phys = addr & 0x1FFFFFFFu;
+     /* Overlay dispatch is a no-op when the overlay loader is inactive
+-- 
+2.43.0
+

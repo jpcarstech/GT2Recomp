@@ -188,6 +188,7 @@ resulting exe imports only Windows system DLLs.
 |---|---|
 | `titles/<name>/` | Per-disc build config: `game.toml` (build variant + probe digests), `seeds/`, CMake project, `codegen_setup.*`, `mods_gt2_silent.c`, and `game.runtime.toml` (installed beside that disc's exe) |
 | `tools-win/local-build/gt2_stub.c` | The root `Gran Turismo 2 Recompiled.exe`: starts the disc you used last |
+| `tools-win/local-build/*.cmd`, `*.ps1` | Installed into the game folder: `Setup`/`Play`/`Diagnose`/`Benchmark`/`Tidy GT2 folder.cmd` at the root, helpers in `tools\` |
 | `game.toml`, `seeds/`, `CMakeLists.txt`, `codegen_setup.*`, `mods_gt2_silent.c` | The Combined title at the repo root (CI + pre-0.2 flow; `titles/combined/` is the installed variant) |
 | `psxrecomp/`, `recomp-ui/` | Framework and launcher submodules, pinned to upstream commits |
 | `patches/` | Everything this port changes in the framework, applied at build time ([`patches/README.md`](../patches/README.md)) |

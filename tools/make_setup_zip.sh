@@ -37,11 +37,11 @@ with the "Disc" row in that settings window, or in the game:
 F1 -> Disc -> Switch disc.
 In game: F1 = settings + disc switch, F7 = save states, F8 = rewind.
 
-KNOWN ISSUES: 60 FPS is experimental and runs sluggish on current builds -
-stay on Original (30 fps) for now. Mods and cheats are per disc and each
-needs its own testing; the plain Arcade/Simulation discs ship no cheats
-yet (the published codes are for the wrong disc revision). More of both
-will come as they are verified. Full list: the README on GitHub.
+KNOWN ISSUES: 60 FPS needs a fast CPU - if it stutters, lower the CPU
+overclock on the Mods page (200-250) or go back to Original (30 fps).
+Old 30 fps replays and Rally ghosts do not play back right at 60. Cheats
+are per disc (Arcade unlocks on the Arcade disc, the money/licence/race
+cheats on the Simulation disc). Full list: the README on GitHub.
 
 Good to know:
   - Your garage follows you: memory cards are shared between the discs, so
@@ -51,6 +51,8 @@ Good to know:
     more of itself to PC code while you play and briefly after you quit).
   - Re-run "Setup GT2.cmd" (now in the game folder) any time to update, or
     after adding another disc image (only the new disc takes the full time).
+  - Folder got messy (older layouts, a second copy of the game)? "Tidy GT2
+    folder.cmd" moves the leftovers into _old\ - nothing is deleted.
   - Nothing is uploaded anywhere; everything is built from your own discs.
   - Optional: put your own PS1 BIOS dump (scph1001.bin) in the folder before
     setup. Not required - a free BIOS is included.

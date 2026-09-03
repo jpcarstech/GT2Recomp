@@ -31,7 +31,7 @@ default_enabled = false
 feature = "overclock"
 id = "percent"
 label = "CPU overclock %"
-description = "How much faster than a real PS1 CPU to run. At the original 30 fps, 200 keeps the game at full speed with full-detail AI cars and the longer draw distance on — those are extra work for the PS1 CPU, and GT2 already dipped with six cars in view on the console. Choosing 60 FPS raises this to 325 automatically (the value Silent ships with the 60 FPS patch; DuckStation applies the same), because the race engine cannot fill 60 frames per second below roughly 150. Higher costs more of YOUR CPU for every emulated frame, so do not go past what the scene needs."
+description = "How much faster than a real PS1 CPU to run. At the original 30 fps, 200 keeps the game at full speed with full-detail AI cars and the longer draw distance on — those are extra work for the PS1 CPU, and GT2 already dipped with six cars in view on the console. At 60 FPS the race engine needs roughly 150 or more to fill every frame; Silent ships 325 with his patch (DuckStation applies the same), which is the safe upper figure. Every percent costs YOUR CPU on the frames the game is busy (the idle part of a frame is skipped for free), so if 60 FPS stutters on your PC, try a lower value here — 200 or 250 — before giving up on it."
 type = "integer"
 min = 100
 max = 400
@@ -55,8 +55,12 @@ id = "gt2.silent60fps"
 
 # 60 FPS doubles the game's simulation rate, so the emulated CPU has to do a
 # frame's work in half the time - it cannot without the overclock. Enabling
-# 60fps therefore switches overclock ON and sets it to 325%; switching
-# overclock off cascades 60fps off. (Original 30 fps: 200% is the default.) The reverse is deliberately NOT a dependency: overclock stands
+# 60fps therefore switches overclock ON; the PERCENT is the player's (default
+# 200; Silent's 325 is the safe upper figure). It used to be pinned to 325 by
+# this constraint, which made the launcher switch 60 FPS OFF whenever the
+# overclock was lowered - the two are decoupled since 0.3.0 so a player can
+# find the lowest overclock their PC holds 60 at. Switching overclock off
+# still cascades 60fps off. The reverse is deliberately NOT a dependency: overclock stands
 # on its own, because full-detail AI cars and the longer draw distance are
 # real extra work for the emulated CPU/GTE even at 30 fps - GT2 already
 # dropped frames on the console with six cars in view, and those patches
@@ -66,8 +70,6 @@ id = "gt2.silent60fps"
 feature = "60fps"
 kind = "requires_feature"
 requires_feature = "overclock"
-requires_option = "percent"
-requires_value = "325"
 
 [[feature]]
 id = "aspect"
@@ -132,16 +134,99 @@ default_enabled = false
 feature = "full_lod_ai"
 id = "gt2.fulllod"
 
+# ---- Silent's remaining patches, run VERBATIM from DuckStation's patch
+# database (mods/db/duckstation/*.cht, "Rev 1" = v1.1) by gameshark_vm.c -
+# no hand translation. Every line of these four is byte-identical between
+# the Arcade and Simulation database files, so they inherit the package's
+# targets. Each carries Silent's own overlay-identity guard (A4 line), so it
+# does nothing on a screen where its overlay is not resident.
+[[feature]]
+id = "metric_units"
+name = "Metric Units"
+description = "Shows speeds, distances, weights and power in metric units (km/h, km, kg, PS) instead of the NTSC release's imperial ones. Silent's patch, applied verbatim from DuckStation's database."
+group = "Visual"
+default_enabled = false
+
+[[plugin]]
+feature = "metric_units"
+id = "gt2.gs-metric"
+
+[[feature]]
+id = "hud_mirror_toggle"
+name = "HUD & Mirror Toggle (L3)"
+description = "Tap L3 in a race to cycle the rear-view mirror between always on, default and always off; hold L3 (about a second) to toggle the whole HUD. Silent's patch, applied verbatim from DuckStation's database."
+group = "Quality of Life"
+default_enabled = false
+
+[[plugin]]
+feature = "hud_mirror_toggle"
+id = "gt2.gs-hudmirror"
+
+[[feature]]
+id = "replay_cameras"
+name = "Replay Cameras in Race (R1)"
+description = "Makes every replay camera available while racing, and lets you switch the cinematic camera by holding R1 for half a second. Silent's patch, applied verbatim from DuckStation's database."
+group = "Quality of Life"
+default_enabled = false
+
+[[plugin]]
+feature = "replay_cameras"
+id = "gt2.gs-replaycams"
+
+[[feature]]
+id = "bgm_switch"
+name = "BGM Switch (R3)"
+description = "Press R3 during a race to skip to the next music track; hold R3 for a second to mute the music. Silent's patch, applied verbatim from DuckStation's database."
+group = "Quality of Life"
+default_enabled = false
+
+[[plugin]]
+feature = "bgm_switch"
+id = "gt2.gs-bgm"
+
+# Simulation-disc only: these sites exist in the Simulation program alone.
+[[feature]]
+id = "true_endurance"
+name = "True Endurance"
+description = "The \"Millennium in Rome 2 Hours\" endurance event ends after two real hours regardless of how many laps were finished, as in the PS2 Gran Turismos, instead of after a fixed lap count. Silent's patch, applied verbatim from DuckStation's database. Simulation disc only."
+group = "Gameplay"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "true_endurance"
+id = "gt2.gs-endurance"
+
+[[feature]]
+id = "fixed_event_generator"
+name = "Fixed Event Generator"
+description = "Improves the randomly generated events (One-Make races and Event Generator races) by fixing their course generation, which the original game gets wrong. Silent's patch, applied verbatim from DuckStation's database. Simulation disc only."
+group = "Gameplay"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "fixed_event_generator"
+id = "gt2.gs-eventgen"
+
 [[feature]]
 id = "arcade_all_tracks"
 name = "Arcade: Unlock All Tracks"
-description = "Unlocks every arcade-mode track in all menus (1P, 2P, rally, time trial). The Combined Disc rebuilds arcade mode, so the classic GameShark codes do not apply - this patches the game's own unlock check (reverse-engineered from this disc) so every course passes it. Menus are rebuilt when you enter Arcade mode, so enter (or re-enter) Arcade mode after enabling."
+description = "Unlocks every arcade-mode track in all menus (1P, 2P, rally, time trial). Patches the game's own unlock check (reverse-engineered from the v1.1 arcade code, which the Arcade disc and the Combined Disc share) so every course passes it. Menus are rebuilt when you enter Arcade mode, so enter (or re-enter) Arcade mode after enabling."
 group = "Cheats"
 default_enabled = false
-# Combined Disc only: its arcade mode is rebuilt, so these patch the game's
-# own unlock check rather than using the classic GameShark writes. The plain
-# Arcade disc gets arcade_all_tracks_disc instead. Pinned by exe hash because
-# the Combined Disc reports the Simulation serial.
+# Patches the game's own unlock check rather than writing the classic
+# GameShark data (those codes are for the v1.0 Arcade disc). The three code
+# words are byte-identical on the v1.1 Arcade disc (SCUS-94455) and the
+# Combined Disc's rebuilt arcade mode - verified in the lab on both, see
+# docs/CHEAT_VERIFICATION.md - and the write-if-match guard means the patch
+# only ever lands on that exact code. The Combined Disc is pinned by exe hash
+# because it reports the Simulation serial.
+[[feature.target]]
+game_id = "SCUS-94455"
+
 [[feature.target]]
 game_id = "SCUS-94488"
 exe_sha256 = "3e77a7a1ac9ba673efb20a703de60b8504029bec54c94f3cb98476293cf74c0b"
@@ -153,10 +238,13 @@ id = "gt2.arcadetracks"
 [[feature]]
 id = "arcade_all_cars"
 name = "Arcade: Unlock All Cars"
-description = "Unlocks the extra arcade cars: patches the unlock-flag test in the menu code (reverse-engineered from the Combined Disc - the classic GameShark completion codes do not apply to this rebuilt arcade mode). Enter (or re-enter) Arcade mode after enabling."
+description = "Unlocks the extra arcade cars: patches the unlock-flag test in the menu code and marks every road track as beaten on all difficulties (reverse-engineered from the v1.1 arcade code, which the Arcade disc and the Combined Disc share). Enter (or re-enter) Arcade mode after enabling."
 group = "Cheats"
 default_enabled = false
-# Combined Disc only (see arcade_all_tracks).
+# Same code on both discs (see arcade_all_tracks).
+[[feature.target]]
+game_id = "SCUS-94455"
+
 [[feature.target]]
 game_id = "SCUS-94488"
 exe_sha256 = "3e77a7a1ac9ba673efb20a703de60b8504029bec54c94f3cb98476293cf74c0b"
@@ -165,14 +253,162 @@ exe_sha256 = "3e77a7a1ac9ba673efb20a703de60b8504029bec54c94f3cb98476293cf74c0b"
 feature = "arcade_all_cars"
 id = "gt2.arcadecars"
 
-# ---- plain Arcade disc: NO unlock cheats shipped ------------------------
-# The published GameShark unlock codes for SCUS-94455 (DuckStation's cheat
-# DB, "Arcade Disc" section) are for the v1.0 pressing - the file says so in
-# its header - and this port targets v1.1. On v1.1 those addresses land on
-# something else entirely: applied every VBlank they corrupted the game's
-# input path, and keyboard AND pad went dead until they were switched off
-# (2026-09-02, confirmed by toggling). No v1.1-verified source exists, so
-# nothing ships here until the unlock check is reverse-engineered from the
-# v1.1 arcade overlay the way the Combined Disc features above were. Rule:
-# a cheat that writes into game memory ships only after it has been run on
-# the exact disc revision it targets.
+# ---- Simulation disc: community cheats re-derived for v1.1 --------------
+# DuckStation's cheats.zip entries for SCUS-94488 are for the v1.0/v1.2
+# pressings: on v1.1 the whole save/profile structure sits 0x370 bytes
+# higher, so their data writes land in dead memory (credits) or the wrong
+# record. Each cheat below is that code shifted to the v1.1 layout, with the
+# code-patch sites checked instruction by instruction against the v1.1
+# GT-mode overlay, executed by gameshark_vm from mods/db/gt2recomp/
+# SCUS-94488_v1.1.cht, and run in the lab with a screenshot of the result
+# (docs/CHEAT_VERIFICATION.md, docs/evidence/). Every one is guarded on a
+# GT-mode menu-overlay word, so nothing is written during a race - or in
+# arcade mode on the Combined Disc, which reports this serial too.
+# Not shipped (no v1.1 site found, or the code's effect could not be
+# verified): Start With $99,000,000+, Max Cash After One Race, Start With
+# All Gold Licenses (Alternate), Stop Race Timer, Hit/Tap AI, and the
+# "Both Discs" race codes (their pad-word address 0x800A9228 is not the pad
+# word on v1.1).
+
+[[feature]]
+id = "sim_cash"
+name = "Simulation: A Ton Of Cash"
+description = "Holds your credits at 99,999,999 while you are in the GT-mode menus. The community code for the v1.0/v1.2 discs writes an address that is dead memory on v1.1; this is the same cheat re-derived for the v1.1 save layout (credits at 0x801D1338) and verified in the lab."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_cash"
+id = "gt2.gs-cash"
+
+[[feature]]
+id = "sim_money_never_decreases"
+name = "Simulation: Money Never Decreases"
+description = "Buying cars, parts and services no longer deducts credits: the two purchase paths' balance stores become no-ops (the community patch, on instructions verified identical on v1.1). Switching it off restores the original code."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_money_never_decreases"
+id = "gt2.gs-moneykeep"
+
+[[feature]]
+id = "sim_any_car_any_circuit"
+name = "Simulation: Any Car Can Enter Any Race"
+description = "Removes the horsepower limit on race entry, so any car in your garage can enter any event (the community patch, on an instruction verified identical on v1.1). Switching it off restores the original code."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_any_car_any_circuit"
+id = "gt2.gs-anycar"
+
+[[feature]]
+id = "sim_gold_all"
+name = "Simulation: All Gold Licences"
+description = "Every one of the 60 licence tests is marked gold, so every event is open. Re-derived for the v1.1 save layout and verified in the lab (GAME STATUS shows 60 gold cups and the S badge)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_all"
+id = "gt2.gs-goldall"
+
+[[feature]]
+id = "sim_gold_s"
+name = "Simulation: Gold Super Licence"
+description = "All ten Super licence tests marked gold (v1.1 save layout)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_s"
+id = "gt2.gs-golds"
+
+[[feature]]
+id = "sim_gold_ia"
+name = "Simulation: Gold International A Licence"
+description = "All ten International A tests marked gold (v1.1 save layout)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_ia"
+id = "gt2.gs-goldia"
+
+[[feature]]
+id = "sim_gold_ib"
+name = "Simulation: Gold International B Licence"
+description = "All ten International B tests marked gold (v1.1 save layout)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_ib"
+id = "gt2.gs-goldib"
+
+[[feature]]
+id = "sim_gold_ic"
+name = "Simulation: Gold International C Licence"
+description = "All ten International C tests marked gold (v1.1 save layout)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_ic"
+id = "gt2.gs-goldic"
+
+[[feature]]
+id = "sim_gold_a"
+name = "Simulation: Gold A Licence"
+description = "All ten A licence tests marked gold (v1.1 save layout)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_a"
+id = "gt2.gs-golda"
+
+[[feature]]
+id = "sim_gold_b"
+name = "Simulation: Gold B Licence"
+description = "All ten B licence tests marked gold (v1.1 save layout; verified in the lab - the B list shows ten gold trophies while A shows none)."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_gold_b"
+id = "gt2.gs-goldb"
+
+[[feature]]
+id = "sim_all_races_completed"
+name = "Simulation: All Races Completed"
+description = "Fills the race-completion flags so GAME STATUS reports the game complete (over 100%, exactly as the community code always did) and, through the shared save, the Arcade disc unlocks its Simulation credits. Re-derived for the v1.1 save layout and verified in the lab."
+group = "Cheats"
+default_enabled = false
+[[feature.target]]
+game_id = "SCUS-94488"
+
+[[plugin]]
+feature = "sim_all_races_completed"
+id = "gt2.gs-racesdone"

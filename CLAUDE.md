@@ -83,3 +83,62 @@ wholesale (presets, featured rows); `--force-key SECTION.KEY` overwrites one
 scalar the product owns and has moved (used for `mods_dir`). Without the
 right flag, a release that changes layout silently leaves existing installs
 behind — they keep working and quietly stop matching the docs.
+
+## Releasing
+
+Public history is the `release` branch (one clean commit per release whose
+tree is exactly `main`'s at that moment, made with `git commit-tree
+main^{tree} -p release`), pushed by John with `push_update.cmd` from
+`D:\Gran Turismo 2 Recompilation\release\` (the versioned copy is
+`tools-win/dev/release/`; it reads `..\gt2recomp.bundle`, the game-root bundle
+Setup also builds from) — it clones the bundle's `release`,
+rebases onto GitHub main, pushes `main` and tags. The dev history on `main`
+never goes to GitHub.
+
+**Keep local `release` identical to GitHub main.** push_update.cmd rebases,
+so the pushed release commit gets a NEW id; if local `release` is not
+already GitHub's history, every release drifts and the tag ends up pointing
+at a commit that is not on main ("N commits since this release"). After a
+push: `fix_release_tag.cmd <tag>` (re-points the tag at origin/main and writes
+`release\github_main.bundle`), then fetch that bundle here and `update-ref
+refs/heads/release` to it. Done for 0.2.0; `release` == GitHub main
+`49e7523`.
+
+Release checklist: CHANGELOG dated + Known issues → README → `tools/
+make_setup_zip.sh` (attach the zip) → release commit on `release` + tag →
+`tools/make_bundle.sh` → John: push_update.cmd → GitHub "Draft a new
+release" for the tag (John attaches the zip, publishes) → check Actions
+"patch stack" is green → walk the fresh-user path from a zip in Downloads.
+
+## Rebuilding a title in the lab
+
+`ninja` with no target in `titles/<t>/build` also builds the non-PGXP
+`psx-runtime` (never built there: ~650 generated objects, hours). Build the
+executable you run: `ninja Gran_Turismo_2__Simulation__Recompiled_pgxp`
+(under a minute after a mod-source change). The build tree carries its own
+copy of `mods/packages/` and a `mods/state.toml`: copy the manifest over and
+write `[[feature]] package_id/id/enabled` entries there to enable features
+for a `PSX_NO_LAUNCHER=1` run.
+
+## Performance work
+
+Measure before touching anything; `docs/PERFORMANCE.md` has the numbers
+and the method. On a player's PC: `Benchmark GT2.cmd` → `gt2_benchmark.txt`
+(`runtime cadence` lines: `work guest` vs `pacer` vs GL ms/s says CPU- or
+GPU-bound; `dirty insn/s` and `overlay native/interp` say how warm the
+native cache is). In the lab: `tools/lab_race_bench.sh` times a fixed 1500
+guest frames of the same race from savestate slot 2 (re-save it after any
+codegen/ABI change — states carry the tag); the debug server's
+`phase_profile` / `phase_hot` give guest-side shares, and
+`gdb -p PID -batch -ex "bt 4"` sampled in a loop gives host symbols. The lab
+build has `overlay_cache = true`; its shards are compiled by hand:
+`python3 psxrecomp/tools/compile_overlays.py --captures
+titles/arcade/build/overlay_captures.json --game-toml titles/arcade/game.toml
+--recompiler psxrecomp/recompiler/build/psxrecomp-game --runtime-include
+psxrecomp/runtime/include --out-dir /tmp/ovcache --compiler gcc --flavor 6
+--cps --jobs 2`, then copy `<out>/SCUS-94455` into `titles/arcade/build/cache/`
+(rebuild `psxrecomp-game` first whenever a runtime header in the cache tag
+changed — the tool refuses a stale recompiler). Changing
+`runtime/include/debug_server.h` recompiles every generated file (it is
+reached through `psx_runtime.h`); declare new runtime-only symbols in the
+.cpp that needs them instead.

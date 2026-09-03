@@ -17,7 +17,7 @@ set -euo pipefail
 # GitHub checkout (a release being prepared, a stale clone) downgraded itself
 # to the older script on the first run and then failed in that script's terms,
 # with no exe and no hint that the newer script had ever been there.
-GT2_LB_VERSION=2
+GT2_LB_VERSION=4
 GAME_DIR="${1:?usage: local_build.sh <game folder> [source checkout]}"
 GITHUB_URL="${GT2RECOMP_GIT_URL:-https://github.com/jpcarstech/GT2Recomp.git}"
 
@@ -399,6 +399,7 @@ for _t in "${TITLES[@]}"; do
                 --replace runtime.feature_preset \
                 --replace runtime.featured_feature_row \
                 --force-key runtime.mods_dir \
+                --force-key runtime.cheats_page_note \
                 "$D/game.toml.fresh" "$D/game.toml"; then
             rm -f "$D/game.toml.fresh" "$D/game.toml.new"
         else
@@ -463,11 +464,11 @@ command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 && _stubcc=x86_64-w64-mingw32-
 "$_stubcc" -O2 -mwindows -o "$GAME_DIR/Gran Turismo 2 Recompiled.exe" "$SRC/tools-win/local-build/gt2_stub.c"
 # Player-facing scripts: launchers at the game root, helpers in tools/.
 mkdir -p "$GAME_DIR/tools"
-for s in setup_and_build.ps1 "Setup GT2.cmd" "Play GT2.cmd" "Diagnose GT2.cmd"; do
+for s in setup_and_build.ps1 "Setup GT2.cmd" "Play GT2.cmd" "Diagnose GT2.cmd" "Benchmark GT2.cmd" "Tidy GT2 folder.cmd"; do
     cp -f "$SRC/tools-win/local-build/$s" "$GAME_DIR/$s"
 done
 for s in play_gt2.ps1 compile_cache.ps1 run_logged.ps1 organize_game_folder.ps1 \
-         play_software.ps1 capture_screen.ps1; do
+         play_software.ps1 capture_screen.ps1 tidy_game_folder.ps1; do
     cp -f "$SRC/tools-win/local-build/$s" "$GAME_DIR/tools/$s"
     rm -f "$GAME_DIR/$s"   # sweep pre-tools/ root-level copies
 done

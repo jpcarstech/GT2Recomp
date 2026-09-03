@@ -40,6 +40,8 @@ jobs:
             git apply --check "$p" || { echo "FAILED: $p"; exit 1; }
             git apply "$p"; echo "applied $(basename "$p")"
           done
+      - name: gameshark interpreter unit tests (Silent's real GT2 code tables)
+        run: bash tests/run.sh
       - name: shell syntax
         run: bash -n tools-win/local-build/local_build.sh tools/make_bundle.sh
       - name: recompiler tool configures and builds

@@ -1,0 +1,203 @@
+From 749971c4457c9a93bcc0fb976deb9a06c8fe617e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 00:44:47 +0000
+Subject: [PATCH] dirty_ram: memoize static-text range validation per compiled
+ entry (page-generation stamp)
+
+---
+ runtime/src/memory.c | 100 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index 07f8c5b5..5f785d85 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -152,6 +152,8 @@ void memory_clear_low_boot_scratch(void) {
+ #define DIRTY_RAM_PAGE_SHIFT    12          /* 4 KB pages */
+ #define DIRTY_RAM_PAGE_COUNT    (RAM_SIZE >> DIRTY_RAM_PAGE_SHIFT)
+ #define DIRTY_RAM_BITMAP_WORDS  ((DIRTY_RAM_PAGE_COUNT + 31u) / 32u)
++/* Per-page generation for the text range-validation memo (see TextOkEntry). */
++static uint32_t text_page_gen[DIRTY_RAM_PAGE_COUNT];
+ static uint32_t dirty_ram_bitmap[DIRTY_RAM_BITMAP_WORDS];
+ 
+ /* Monotonic generation for RAM-resident CODE changes (kernel install-stub
+@@ -384,8 +386,10 @@ void dirty_ram_clear_image_baseline(void) {
+     if (base >= floor) return;
+     uint32_t first_page = base >> DIRTY_RAM_PAGE_SHIFT;
+     uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+-    for (uint32_t page = first_page; page <= last_page; page++)
++    for (uint32_t page = first_page; page <= last_page; page++) {
+         dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
++        text_page_gen[page]++;
++    }
+ }
+ 
+ /* Text-image divergence guard.
+@@ -418,6 +422,65 @@ static uint32_t g_text_exact_last_mismatch = 0;
+ static uint32_t g_text_exact_last_live = 0;
+ static uint32_t g_text_exact_last_ref = 0;
+ 
++/* ---- Range-validation memo -----------------------------------------------
++ * dirty_ram_text_native_ok_ranges_from() is asked the same question many
++ * thousand times a second: the dirty-RAM interpreter calls
++ * psx_game_text_native_ok_full() after EVERY straight-line block it runs in a
++ * game-text page (a possible hand-off to the compiled function), and every
++ * compiled dispatch into a flagged page validates the entry's full ranges by
++ * memcmp. For a game whose overlays load OVER its boot text (GT2: the race
++ * and menu code arrive from GT2.OVL onto 0x80010000+), the answer for a
++ * covered function is "no" - and was re-established by a failing memcmp,
++ * a mismatch scan and a bitmap walk per interpreted block (measured 2026-09-03,
++ * Arcade v1.1 in a race, cold cache: ~20% of the main thread in this
++ * function, on top of ~30% in the interpreter proper).
++ *
++ * The answer only changes when the bytes or the page flags of the entry's
++ * pages change, so remember it per entry together with a stamp: the sum of
++ * a per-page generation counter over the pages the ranges touch. The store
++ * path bumps a page's generation on every write that differs from the
++ * reference (text_guard_note_write: the only way a validating byte can
++ * change, CPU and DMA stores both funnel there), and every path that flips
++ * page FLAGS without a byte changing (CD-DMA executable marking, baseline
++ * clear, boot reset, bitmap restore, reference bless, guard resync) bumps
++ * every page. A monotonic sum over the entry's pages is an exact change
++ * detector (the same argument as overlay_page_gen below). The cache is
++ * direct-mapped on the ranges pointer (unique per compiled entry); a
++ * collision only costs a re-validation. */
++#define TEXT_OK_CACHE_SIZE 4096u
++typedef struct TextOkEntry {
++    const uint32_t *key;
++    uint32_t stamp;
++    uint32_t ok;
++} TextOkEntry;
++static TextOkEntry s_text_ok_cache[TEXT_OK_CACHE_SIZE];
++uint64_t g_text_ok_cache_hits = 0, g_text_ok_cache_misses = 0;
++
++static inline void text_page_gen_bump(uint32_t phys) {
++    uint32_t pg = phys >> DIRTY_RAM_PAGE_SHIFT;
++    if (pg < DIRTY_RAM_PAGE_COUNT) text_page_gen[pg]++;
++}
++static void text_page_gen_bump_all(void) {
++    for (uint32_t pg = 0; pg < DIRTY_RAM_PAGE_COUNT; pg++) text_page_gen[pg]++;
++}
++/* Stamp of an entry's pages: sum of generations plus the page count, so an
++ * entry whose ranges are all on never-written pages still has a non-zero,
++ * layout-specific value. */
++static uint32_t text_ok_stamp(const uint32_t *lo_len_pairs, uint32_t count) {
++    uint32_t stamp = 0;
++    for (uint32_t i = 0; i < count; i++) {
++        uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
++        uint32_t len = lo_len_pairs[i * 2u + 1u];
++        if (len == 0 || phys >= RAM_SIZE) continue;
++        uint32_t p0 = phys >> DIRTY_RAM_PAGE_SHIFT;
++        uint32_t end = phys + len - 1u;
++        if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
++        uint32_t p1 = end >> DIRTY_RAM_PAGE_SHIFT;
++        for (uint32_t p = p0; p <= p1; p++) stamp += text_page_gen[p] + 1u;
++    }
++    return stamp;
++}
++
+ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
+                                    uint32_t len) {
+     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
+@@ -427,6 +490,7 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
+     text_ref_hi = phys_lo + len;
+     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
++    text_page_gen_bump_all();
+     g_text_native_blocked = 0;
+     g_text_diverged_pages = 0;
+     g_text_exact_mismatches = 0;
+@@ -448,6 +512,10 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size)
+     if (memcmp(ref, buf, (size_t)size) != 0) {
+         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
+         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
++        text_page_gen[page]++;
++        /* A write straddling a page boundary touches the next page too. */
++        if (((phys + (uint32_t)size - 1u) >> DIRTY_RAM_PAGE_SHIFT) != page)
++            text_page_gen_bump(phys + (uint32_t)size - 1u);
+     }
+ }
+ 
+@@ -572,6 +640,9 @@ static int aot_blocked(uint32_t phys) {
+  * Every emitted range is validated in full. A continuation can follow a
+  * backward edge and fetch instructions before exec_pc, so clipping at the
+  * resume address can admit stale static code. */
++static int dirty_ram_text_native_ok_ranges_uncached(const uint32_t *lo_len_pairs,
++                                                    uint32_t count);
++
+ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
+                                          uint32_t count,
+                                          uint32_t exec_pc) {
+@@ -589,6 +660,25 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
+      * (CMR2 overlay corruption, second locus 0x80016B34). A genuinely
+      * patched prologue now blocks the whole entry to the interpreter —
+      * correct, merely slower. */
++    /* Memo lookup (see TextOkEntry above). */
++    const uint32_t stamp = text_ok_stamp(lo_len_pairs, count);
++    TextOkEntry *slot =
++        &s_text_ok_cache[((uintptr_t)lo_len_pairs >> 3) & (TEXT_OK_CACHE_SIZE - 1u)];
++    if (slot->key == lo_len_pairs && slot->stamp == stamp) {
++        g_text_ok_cache_hits++;
++        if (!slot->ok) g_text_native_blocked++;
++        return (int)slot->ok;
++    }
++    g_text_ok_cache_misses++;
++    const int result = dirty_ram_text_native_ok_ranges_uncached(lo_len_pairs, count);
++    slot->key = lo_len_pairs;
++    slot->stamp = stamp;
++    slot->ok = (uint32_t)result;
++    return result;
++}
++
++static int dirty_ram_text_native_ok_ranges_uncached(const uint32_t *lo_len_pairs,
++                                                    uint32_t count) {
+     int any = 0;
+     for (uint32_t i = 0; i < count; i++) {
+         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+@@ -685,8 +775,10 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
+      * dispatch re-runs the compare against the now-updated reference. */
+     uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
+     uint32_t last_page  = (hi - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+-    for (uint32_t page = first_page; page <= last_page; page++)
++    for (uint32_t page = first_page; page <= last_page; page++) {
+         text_diverged_bitmap[page >> 5] &= ~(1u << (page & 31u));
++        text_page_gen[page]++;
++    }
+ }
+ 
+ uint64_t dirty_ram_text_native_blocked(void) { return g_text_native_blocked; }
+@@ -710,6 +802,7 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
+     uint32_t last_page = end >> DIRTY_RAM_PAGE_SHIFT;
+     for (uint32_t page = first_page; page <= last_page; page++) {
+         dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
++        text_page_gen[page]++;
+     }
+     g_dirty_ram_code_gen++;
+ }
+@@ -781,6 +874,7 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
+     /* Bitmap replace bypasses clean→dirty transitions; bump so interpreter
+      * site caches keyed on g_dirty_ram_code_gen cannot survive a restore. */
+     g_dirty_ram_code_gen++;
++    text_page_gen_bump_all();
+ }
+ 
+ /* ---- Inc3: watched overlay pages + per-page generation counters ---------
+@@ -812,6 +906,7 @@ void dirty_ram_reset_for_boot(void) {
+     memset(g_dirty_ram_dispatch_pc_bitmap, 0,
+            sizeof(g_dirty_ram_dispatch_pc_bitmap));
+     g_dirty_ram_code_gen++;
++    text_page_gen_bump_all();
+ }
+ 
+ void overlay_watch_set_range(uint32_t phys, uint32_t len) {
+@@ -865,6 +960,7 @@ void dirty_ram_text_guard_resync_after_restore(void) {
+     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
+     g_text_diverged_pages = 0;
++    text_page_gen_bump_all();
+ }
+ 
+ void overlay_watch_invalidate_after_ram_restore(void) {
+-- 
+2.43.0
+

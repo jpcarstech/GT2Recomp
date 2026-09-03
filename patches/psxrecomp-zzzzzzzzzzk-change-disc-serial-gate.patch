@@ -1,0 +1,70 @@
+From a04a1e8e0575e798f1132a7ee0b31ed9afe77dd7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 2 Sep 2026 22:56:05 +0000
+Subject: [PATCH] runtime menu: Change disc... refuses an image whose serial is
+ not the build's game id
+
+---
+ runtime/src/main.cpp | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 502a23fe..985a1b7d 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6462,6 +6462,16 @@ static SDL_Keycode runtime_settings_menu_open_key = 0;
+ static void runtime_settings_menu_sync_overlay(void);
+ static void controller_port_route_toggle(void);
+ 
++/* The serial this build was compiled against ([game] id), for the hot
++ * "Change disc..." row: a title is a static recompilation of ONE executable,
++ * so mounting a disc that boots a different one (the other disc of a
++ * two-disc game, say) leaves the guest running code the build never
++ * recompiled - and every mod whose activation was decided by game_id at
++ * start-up keeps patching the old game's addresses into the new game's RAM.
++ * Declared multi-disc sets keep their per-disc serials (see
++ * expected_serial_for_disc), so a genuine disc 2 of a set still mounts. */
++static std::string g_runtime_game_id;
++
+ #if defined(RECOMP_LAUNCHER)
+ static RecompRuntimeUi *g_runtime_settings_ui;
+ 
+@@ -6780,6 +6790,27 @@ static int runtime_ui_change_disc(PsxRuntimeUiContext *context) {
+                       2600);
+         return 0;
+     }
++    {
++        const DiscValidation check =
++            validate_disc_image(picked, g_runtime_game_id);
++        if (check.opened && check.has_header && !check.id_matches) {
++            const std::string expect =
++                expected_serial_for_disc(picked, g_runtime_game_id);
++            char message[320];
++            std::snprintf(message, sizeof(message),
++                          "Disc not changed: that image is %s, this build runs %s",
++                          identity.detected_serial.empty()
++                              ? "another game"
++                              : identity.detected_serial.c_str(),
++                          uppercase_ascii(expect).c_str());
++            host_osd_push(message, 3200);
++            std::fprintf(stderr,
++                         "psxrecomp: change disc refused: %s (%s) is not %s\n",
++                         picked, identity.detected_serial.c_str(),
++                         expect.c_str());
++            return 0;
++        }
++    }
+ 
+     char scex[4];
+     const char *scex_ptr = nullptr;
+@@ -12718,6 +12749,7 @@ int main(int argc, char** argv) {
+             const auto gc = PSXRecompV4::load_game_config(game_config_path);
+             game_name = gc.name;
+             game_id   = gc.id;
++            g_runtime_game_id = game_id;
+             game_region = gc.region;
+             game_players = gc.players;
+             /* CTR ND intro: an older workaround (PSX_ND_SIB_FLAP_LAST=1) skipped
+-- 
+2.43.0
+

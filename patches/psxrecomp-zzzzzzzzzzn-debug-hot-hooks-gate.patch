@@ -1,0 +1,356 @@
+From 1152498b5169d05bdcd4b60b3649acc91f4ce95e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 01:38:45 +0000
+Subject: [PATCH] debug server: [runtime] debug_hot_hooks gate (env
+ PSX_DEBUG_HOT_HOOKS, hot_hooks command) silences the
+ per-store/per-block/per-call dev hooks from boot
+
+---
+ recompiler/src/config_loader.cpp |  3 ++
+ recompiler/src/config_loader.h   | 10 +++++
+ runtime/src/debug_server.c       | 68 ++++++++++++++++++++++++++++----
+ runtime/src/main.cpp             |  7 ++++
+ runtime/src/memory.c             | 30 ++++++++------
+ 5 files changed, 98 insertions(+), 20 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index f132a64a..209cd70a 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -610,6 +610,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+     if (runtime.contains("idle_skip")) {
+         rt.idle_skip = toml::find<bool>(runtime, "idle_skip");
+     }
++    if (runtime.contains("debug_hot_hooks")) {
++        rt.debug_hot_hooks = toml::find<bool>(runtime, "debug_hot_hooks");
++    }
+     if (runtime.contains("overlay_autocompile_cmd")) {
+         rt.overlay_autocompile_cmd =
+             toml::find<std::string>(runtime, "overlay_autocompile_cmd");
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index a754f18d..901b8bf9 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -400,6 +400,16 @@ struct RuntimeConfig {
+     // debug command and PSX_IDLE_SKIP environment variable support live A/B.
+     bool                  idle_skip = false;
+ 
++    // debug_hot_hooks: the debug server's per-store / per-block / per-call
++    // instrumentation (first-divergence fingerprint hashing, frame recorder
++    // events, write traces, dispatch trace, watchpoints). Dev tooling that
++    // costs a function call on every guest store and every basic block;
++    // false silences all of it from boot (the same gate FMV playback
++    // already uses) until the `hot_hooks` debug command or
++    // PSX_DEBUG_HOT_HOOKS=1 turns it back on. Default true = upstream
++    // behaviour.
++    bool                  debug_hot_hooks = true;
++
+     // overlay_autocompile_cmd: variant-capture automation (step 2.8). A
+     // shell command (run via cmd.exe /C, cwd = project root) that compiles
+     // overlay_captures.json into the cache — normally the project's
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index a876c748..7141e8da 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -132,6 +132,44 @@ static int    s_in_command = 0;            /* 1 while emu runs process_command
+ static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
+ static volatile int s_fmv_quiet = 0;
+ 
++/* Persistent hot-hook gate. The per-store / per-block / per-call hooks
++ * below (trace_write_check, trace_mmio_*, cyc_observe, log_call_entry's
++ * tail, trace_dispatch, watchpoints, record_frame's frame bookkeeping) are
++ * dev tooling: fingerprint hashing on every guest store, the frame recorder,
++ * write traces. They already fall silent during FMV via s_fmv_quiet because
++ * their cost is measurable; a game that never needs them at play time can
++ * keep them silent from boot ([runtime] debug_hot_hooks = false: GT2 in a
++ * race, warm native cache, 60 fps + 325% overclock: 38.4 -> 43.8 VBlank/s
++ * on the lab box, 2026-09-03). PSX_DEBUG_HOT_HOOKS=1/0 overrides the config
++ * and the `hot_hooks` command flips it live, so a lab session or a support
++ * case can arm them without a rebuild. Everything that feeds the crash /
++ * freeze reports and is updated before these gates (the recent-function
++ * ring, the native stack guard) keeps running. */
++static volatile int s_hot_hooks_off = 0;
++/* Exported mirror of s_hot_hooks_off for the store chokepoints in memory.c,
++ * which test it before calling into here at all (the call itself was
++ * measurable on every guest store). */
++int g_debug_hot_hooks_off = 0;
++
++void debug_server_set_hot_hooks(int on)
++{
++    s_hot_hooks_off = on ? 0 : 1;
++    g_debug_hot_hooks_off = s_hot_hooks_off;
++}
++
++void debug_server_configure_hot_hooks(int config_on)
++{
++    const char *env = getenv("PSX_DEBUG_HOT_HOOKS");
++    int on = env && env[0] ? (env[0] != '0') : config_on;
++    s_hot_hooks_off = on ? 0 : 1;
++    g_debug_hot_hooks_off = s_hot_hooks_off;
++    if (!on)
++        fprintf(stdout, "psxrecomp: debug hot hooks off%s\n",
++                env && env[0] ? " (environment override)" : " (game config)");
++}
++
++int debug_server_hot_hooks(void) { return s_hot_hooks_off ? 0 : 1; }
++
+ void debug_server_set_fmv_quiet(int quiet)
+ {
+     static int enabled = -1;
+@@ -147,6 +185,8 @@ int debug_server_fmv_quiet(void)
+     return s_fmv_quiet ? 1 : 0;
+ }
+ 
++#define HOT_HOOKS_SILENT() (s_fmv_quiet || s_hot_hooks_off)
++
+ /* ---- Frame counter (set by record_frame caller) ---- */
+ /* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
+  * ring-buffer entries with the current frame for cross-correlation. */
+@@ -2079,7 +2119,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
+     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
+     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
+ #endif
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     ls_suppress_begin();
+     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
+     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
+@@ -2678,7 +2718,7 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
+     (void)block_leader_phys;
+     return;
+ #else
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     uint32_t phys = block_leader_phys & 0x1FFFFFFFu;
+     /* ND debug: PSX_ND_WOOD_CLEAR80=1 clears model+184 bit0x80 at the flag-load
+      * leader so 0x5CF/'cras' models enter NdIntroWoodBatchSetup's textured path.
+@@ -2762,7 +2802,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
+     (void)func_addr;
+     return;
+ #endif
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     ls_suppress_begin();
+     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
+      * (normalized) block leader. Sampled before the block runs. */
+@@ -10066,7 +10106,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+     (void)phys; (void)old_val; (void)new_val; (void)width;
+     return;
+ #endif
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
+     fp_record_write(phys, new_val, g_debug_last_store_pc);
+     {
+@@ -10095,7 +10135,7 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
+     (void)addr; (void)val; (void)width;
+     return;
+ #endif
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     /* First-divergence fingerprint + frame recorder also see device writes. */
+     fp_record_mmio(addr, val, g_debug_last_store_pc);
+     rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
+@@ -10143,7 +10183,7 @@ void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
+     (void)addr; (void)val; (void)width;
+     return;
+ #endif
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     rec_event(REC_KIND_MMIO_R, addr, val, g_debug_last_store_pc,
+               debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
+     if (!s_mmio_rtrace || s_mmio_rtrace_range_count == 0) return;
+@@ -14107,6 +14147,17 @@ static void handle_phase_hot(int id, const char *json)
+ /* idle_skip: idle-loop cycle-skip status + runtime toggle.
+  *   {"cmd":"idle_skip"}              -> counters
+  *   {"cmd":"idle_skip","enable":0|1} -> toggle, then counters */
++/* hot_hooks: {"cmd":"hot_hooks","enable":0|1} flips the persistent gate on
++ * the per-store / per-block / per-call debug hooks (see s_hot_hooks_off);
++ * no field = query. */
++static void handle_hot_hooks(int id, const char *json)
++{
++    int en = json_get_int(json, "enable", -1);
++    if (en == 0 || en == 1) debug_server_set_hot_hooks(en);
++    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"fmv_quiet\":%d}",
++             id, debug_server_hot_hooks(), s_fmv_quiet ? 1 : 0);
++}
++
+ static void handle_idle_skip(int id, const char *json)
+ {
+     extern int      g_idle_skip_enabled;
+@@ -14225,6 +14276,7 @@ static const CmdEntry s_commands[] = {
+     { "warm_cd_route",     handle_warm_cd_route },
+     { "phase_hot",         handle_phase_hot },
+     { "idle_skip",         handle_idle_skip },
++    { "hot_hooks",         handle_hot_hooks },
+     { "lockstep",          handle_lockstep },
+     { "lockstep_func",     handle_lockstep_func },
+     { "ping",              handle_ping },
+@@ -15132,7 +15184,7 @@ void debug_server_poll(void)
+ 
+ void debug_server_record_frame(void)
+ {
+-    if (s_fmv_quiet) {
++    if (HOT_HOOKS_SILENT()) {
+         s_history_count = s_frame_count + 1;
+         s_frame_count++;
+         return;
+@@ -15231,7 +15283,7 @@ uint64_t debug_server_frame_count(void) { return s_frame_count; }
+ 
+ void debug_server_check_watchpoints(void)
+ {
+-    if (s_fmv_quiet) return;
++    if (HOT_HOOKS_SILENT()) return;
+     if (s_client == SOCK_INVALID) return;
+ 
+     for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 985a1b7d..d85af2b0 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -71,6 +71,10 @@ extern "C" void psx_event_step_conservative_env_init(void);
+ #include "recomp_audio_drc.h"
+ #include "memcard.h"
+ #include "debug_server.h"
++/* Declared here, not in debug_server.h: that header reaches every generated
++ * translation unit through psx_runtime.h, and a change there recompiles the
++ * whole game. */
++extern "C" void debug_server_configure_hot_hooks(int config_on);
+ #include "crash_trace.h"
+ #include "freeze_heartbeat.h"
+ #include "config_loader.h"
+@@ -12902,6 +12906,9 @@ int main(int argc, char** argv) {
+                              idle_env ? " (environment override)" : "");
+                 psx_precise_slice_init_from_env();
+             }
++#ifndef PSX_NO_DEBUG_TOOLS
++            debug_server_configure_hot_hooks(gc.runtime.debug_hot_hooks ? 1 : 0);
++#endif
+             for (uint32_t site : gc.vsync_event_horizon_sites)
+                 psx_vsync_query_hle_add_event_horizon_site(site);
+             for (uint32_t site : gc.vsync_event_horizon_extra_sites)
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index 5f785d85..914018f0 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -1148,6 +1148,12 @@ extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
+                                            uint32_t new_val, uint8_t width);
+ extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
+ extern void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width);
++/* [runtime] debug_hot_hooks = false (debug_server.c): skip the calls above
++ * entirely on the store/MMIO chokepoints. */
++extern int  g_debug_hot_hooks_off;
++#define DBG_TRACE_WRITE(...) do { if (!g_debug_hot_hooks_off) debug_server_trace_write_check(__VA_ARGS__); } while (0)
++#define DBG_TRACE_MMIO_W(...) do { if (!g_debug_hot_hooks_off) debug_server_trace_mmio_write(__VA_ARGS__); } while (0)
++#define DBG_TRACE_MMIO_R(...) do { if (!g_debug_hot_hooks_off) debug_server_trace_mmio_read(__VA_ARGS__); } while (0)
+ /* Targeted main-RAM read watch (debug_server.c). Flag gates the hot read path. */
+ extern int  g_ram_read_watch_active;
+ extern void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val);
+@@ -1317,14 +1323,14 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
+ static uint32_t mmio_read32(uint32_t addr) {
+     psx_devices_mmio_sync();
+     uint32_t v = mmio_read32_impl(addr);
+-    debug_server_trace_mmio_read(addr, v, 4);
++    DBG_TRACE_MMIO_R(addr, v, 4);
+     return v;
+ }
+ 
+ static void mmio_write32(uint32_t addr, uint32_t val) {
+     psx_devices_mmio_sync();
+     SHADOW_NOTE_MMIO();
+-    debug_server_trace_mmio_write(addr, val, 4);
++    DBG_TRACE_MMIO_W(addr, val, 4);
+     /* Memory control: 0x1F801000..0x1F801020 */
+     if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
+         mem_ctrl[(addr - 0x1F801000u) >> 2] = val;
+@@ -1434,14 +1440,14 @@ static uint16_t mmio_read16_impl(uint32_t addr) {
+ static uint16_t mmio_read16(uint32_t addr) {
+     psx_devices_mmio_sync();
+     uint16_t v = mmio_read16_impl(addr);
+-    debug_server_trace_mmio_read(addr, (uint32_t)v, 2);
++    DBG_TRACE_MMIO_R(addr, (uint32_t)v, 2);
+     return v;
+ }
+ 
+ static void mmio_write16(uint32_t addr, uint16_t val) {
+     psx_devices_mmio_sync();
+     SHADOW_NOTE_MMIO();
+-    debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
++    DBG_TRACE_MMIO_W(addr, (uint32_t)val, 2);
+     /* Memory control: 0x1F801000..0x1F80103C — halfword lane RMW. */
+     if (addr >= 0x1F801000u && addr <= 0x1F80103Fu) {
+         uint32_t idx = (addr - 0x1F801000u) >> 2;
+@@ -1553,14 +1559,14 @@ static uint8_t mmio_read8_impl(uint32_t addr) {
+ static uint8_t mmio_read8(uint32_t addr) {
+     psx_devices_mmio_sync();
+     uint8_t v = mmio_read8_impl(addr);
+-    debug_server_trace_mmio_read(addr, (uint32_t)v, 1);
++    DBG_TRACE_MMIO_R(addr, (uint32_t)v, 1);
+     return v;
+ }
+ 
+ static void mmio_write8(uint32_t addr, uint8_t val) {
+     psx_devices_mmio_sync();
+     SHADOW_NOTE_MMIO();
+-    debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
++    DBG_TRACE_MMIO_W(addr, (uint32_t)val, 1);
+     /* Memory control: 0x1F801000..0x1F80103C — byte lane RMW. Tomba2's late
+      * attract byte-writes the EXP1 base register at 0x1F801000; only the
+      * 32-bit path covered the block and the byte path fatal'd. */
+@@ -1871,7 +1877,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
+             }
+         }
+         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
+-        debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
++        DBG_TRACE_WRITE(phys, read_ram_word(phys), val, 4);
+         parity_trace_note_write(phys, 4, effective_store_pc());
+         card_data_writes_check(phys, val, 4);
+         dirty_ram_mark_kernel_write(phys);
+@@ -1904,7 +1910,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
+     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
+     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+         uint32_t off = phys - 0x1F800000u;
+-        debug_server_trace_write_check(phys,
++        DBG_TRACE_WRITE(phys,
+             (uint32_t)scratchpad[off]
+           | ((uint32_t)scratchpad[off + 1] << 8)
+           | ((uint32_t)scratchpad[off + 2] << 16)
+@@ -1999,7 +2005,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
+     uint32_t phys = psx_phys_addr(addr);
+ 
+     if (phys < RAM_SIZE) {
+-        debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
++        DBG_TRACE_WRITE(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+         parity_trace_note_write(phys, 2, effective_store_pc());
+         card_data_writes_check(phys, (uint32_t)val, 2);
+         dirty_ram_mark_kernel_write(phys);
+@@ -2031,7 +2037,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
+     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
+     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+         uint32_t off = phys - 0x1F800000u;
+-        debug_server_trace_write_check(phys,
++        DBG_TRACE_WRITE(phys,
+             (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
+             (uint32_t)val, 2);
+         scratchpad[off]     = (uint8_t)(val);
+@@ -2334,7 +2340,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
+     uint32_t phys = psx_phys_addr(addr);
+ 
+     if (phys < RAM_SIZE) {
+-        debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
++        DBG_TRACE_WRITE(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+         parity_trace_note_write(phys, 1, effective_store_pc());
+         card_data_writes_check(phys, (uint32_t)val, 1);
+         dirty_ram_mark_kernel_write(phys);
+@@ -2362,7 +2368,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
+     }
+     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
+     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+-        debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
++        DBG_TRACE_WRITE(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
+                                        (uint32_t)val, 1);
+         scratchpad[phys - 0x1F800000u] = val;
+         return;
+-- 
+2.43.0
+

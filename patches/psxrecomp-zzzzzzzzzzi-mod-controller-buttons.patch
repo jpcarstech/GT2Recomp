@@ -1,0 +1,46 @@
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index a1e4645e..fb24de03 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -28,6 +28,18 @@ void psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
+ 
+ /* Narrow guest services available to trusted plugin callbacks. */
+ int psx_mod_game_started(void);
++/*
++ * The button word most recently delivered to the console's controller port
++ * `sio_slot` (0 = player 1), ACTIVE-HIGH in the PlayStation's own bit order:
++ * bit 0 Select, 1 L3, 2 R3, 3 Start, 4 Up, 5 Right, 6 Down, 7 Left, 8 L2,
++ * 9 R2, 10 L1, 11 R1, 12 Triangle, 13 Circle, 14 Cross, 15 Square. 0 when
++ * nothing is pressed or the slot is empty. This is what the GAME sees this
++ * frame - after input.ini mapping, keybinds, the analog/digital policy and
++ * netplay - so a plugin that reacts to buttons (a GameShark-style "joker")
++ * agrees with the game about what is held. Read-only; refreshed once per
++ * input sample, so read it from a VBlank plugin.
++ */
++uint32_t psx_mod_controller_buttons(uint32_t sio_slot);
+ uint8_t psx_mod_read_byte(uint32_t address);
+ void psx_mod_write_byte(uint32_t address, uint8_t value);
+ uint16_t psx_mod_read_half(uint32_t address);
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 73a4b539..ff0d731b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -5564,7 +5564,18 @@ static int capture_pad_slot_exclusive(int s, PsxNetPad* out, int present_sio_slo
+     return 1;
+ }
+ 
++/* Latest ACTIVE-HIGH button word per SIO slot, for psx_mod_controller_buttons.
++ * Recorded at the single point every pad state passes through on its way to
++ * the console (local, dev-mode merged, and netplay alike), so a plugin can
++ * never disagree with the game about what is pressed. */
++static uint32_t g_mod_pad_buttons[PSX_MAX_PLAYERS];
++extern "C" uint32_t psx_mod_controller_buttons(uint32_t sio_slot) {
++    return sio_slot < (uint32_t)PSX_MAX_PLAYERS ? g_mod_pad_buttons[sio_slot] : 0u;
++}
++
+ static void apply_pad_slot_to_sio(int s, const PsxNetPad& pad) {
++    if (s >= 0 && s < PSX_MAX_PLAYERS)
++        g_mod_pad_buttons[s] = pad.connected ? (uint32_t)(~pad.buttons & 0xFFFFu) : 0u;
+     if (sio_pad_on_multitap(s) && !sio_get_multitap_analog())
+         sio_set_pad_config_capable(s, 0);
+     sio_set_pad_state_slot(s, pad.buttons);

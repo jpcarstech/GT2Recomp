@@ -41,7 +41,9 @@ geometry correction, longer draw distance, full-detail AI cars, CPU overclock
 — the setup that runs best) or **Authentic 1999** (everything off), then hit
 Play. Every enhancement stays individually switchable underneath. Out of the
 box everything is off: you get the 1999 game, and each enhancement is yours
-to turn on.
+to turn on. The **Cheats** page lists the codes verified for the disc you
+are on — track and car unlocks on the Arcade disc, money, licences and
+race completion on the Simulation disc.
 
 Your garage follows you across discs: memory cards are shared, so Arcade's
 "Load Guest Garage" reads your Simulation garage exactly like on the real
@@ -59,28 +61,31 @@ image from the fan project? Drop it in the folder too — it builds as a third
 switchable disc with its own extras. It's optional; the two plain discs
 cover everything else.
 
-## Known issues (0.2.0)
+## Known issues (0.3.0)
 
-- **60 FPS is not right yet.** On current builds it runs sluggish and uneven
-  even with the CPU overclock it switches on — the doubled simulation rate
-  plus a 325% emulated CPU is more than the native-code cache can carry
-  until it has warmed up over several sessions, and on many PCs more than
-  it can carry at all. Treat it as experimental: **Original (30 fps) with
-  the Enhanced preset is the recommended setup**, and it is a solid 30. If
-  you try 60, give it a few sessions (let `Play GT2.cmd` finish its compile
-  step on exit) before judging it, and turn supersampling down first if it
-  is still heavy.
-- **Mods and cheats are per disc, and each disc needs its own testing.** The
-  Arcade and Simulation discs are different programs; an enhancement or a
-  cheat that works on one has to be verified on the other before it is
-  offered there. Every mod in this release was checked on both plain discs
-  (they turned out to share the same code for all of them). **Cheats have
-  not been:** the published unlock codes for the Arcade disc are for the
-  v1.0 pressing and corrupt the v1.1 disc this port runs — they were what
-  broke controller input in testing — so the plain discs currently ship
-  **no cheats**, and the Cheats page says so. The Combined Disc keeps its
-  own. Expect more mods and cheats in later releases as each is verified
-  per disc; if you know a code that works on v1.1, open an issue.
+- **60 FPS is CPU-heavy.** At 60 the emulated PlayStation does a frame's
+  work every VBlank at up to 3.25× its real clock, and on many PCs that is
+  more emulation work than one core delivers — the frame rate sags in
+  races while menus stay at 60. It is the CPU, not the GPU: supersampling
+  makes no difference, so leave that alone. What helps: lower the **CPU
+  overclock %** on the Mods page (200 or 250 instead of 325 — since 0.3.0
+  this no longer switches 60 FPS off), give the native-code cache a few
+  sessions to warm up (let `Play GT2.cmd` finish its compile step on
+  exit), and if you must, turn PGXP off (about 12% of a 60 fps frame).
+  **Original (30 fps) with the Enhanced preset is a solid 30** on
+  everything and remains the recommended setup. `Benchmark GT2.cmd`
+  writes the numbers to send with a performance report.
+- **Cheats are per disc.** The Arcade and Simulation discs are different
+  programs, so every mod and cheat is verified on the disc it is offered
+  on. The Arcade disc's Cheats page has the track and car unlocks; the
+  Simulation disc's has the money, licence and race-completion cheats; the
+  Combined Disc keeps its own set. The Simulation cheats change the save
+  the game is holding — save your garage first if you care about it. The
+  codes that are *not* offered, and why, are in
+  [`docs/CHEAT_VERIFICATION.md`](docs/CHEAT_VERIFICATION.md); if you know
+  another code that works on v1.1, open an issue.
+- **Savestates made on 0.2.0 do not load** on 0.3.0 (the native-code cache
+  format changed; states carry its tag). Memory cards and replays are fine.
 - The first sessions after a build run slower (the game is still converting
   itself to native code), and the boot "Loading Save Data" screen takes a
   while.
@@ -94,6 +99,14 @@ Something not working? Check the
 screenshot of what you saw. If the game refuses to start or a disc build
 behaves oddly, run **`Diagnose GT2.cmd`** from the game folder and attach the
 `gt2_diag.txt` it writes — it captures what the game itself reports.
+
+Not sure which exe is the current build? `Gran Turismo 2 Recompiled.exe` at
+the top of the game folder is the only one to start (it opens the disc you
+used last; the per-disc exes under `titles\` are what it starts). If the
+folder has picked up leftovers from earlier layouts or a second copy of the
+game in a subfolder, **`Tidy GT2 folder.cmd`** moves all of it into `_old\`
+(nothing is deleted) and offers a rebuild when the installed build is older
+than the source it came with.
 
 ## For developers
 

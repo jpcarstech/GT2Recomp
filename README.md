@@ -4,8 +4,8 @@
 [static recompilation](https://github.com/mstan/psxrecomp) built on your own
 machine from your own discs. Both game discs, switchable in seconds, up to 4K
 and beyond, widescreen, 60 FPS, save states and rewind, DuckStation-grade
-PGXP geometry correction, OpenGL or Vulkan. **No game data lives in this repository or its
-downloads.**
+PGXP geometry correction, OpenGL or Vulkan. **No game data lives in this
+repository or its downloads.**
 
 ## Install
 

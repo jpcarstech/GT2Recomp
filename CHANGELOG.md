@@ -49,18 +49,32 @@
   half resolution, so movies show 2×2 colour blocks at any upscale; this
   reconstructs the colour bilinearly and leaves the detail alone. Off by
   default.
-
-- **Vulkan renderer.** The launcher's Renderer row now offers Software,
-  OpenGL and Vulkan (`[video] offer_vulkan = true` in every title config;
-  an existing game.toml picks the key up on the next Setup). The framework's
-  Vulkan backend rasterises on the GPU with the same 1x-4x supersampling,
-  PGXP and widescreen as OpenGL. Its present path is a plain blit for now:
-  texture filtering beyond bilinear, edge blending, FXAA, the display
-  scaling filters, the FMV crop and chroma smoothing are OpenGL-only until
-  the next release ports them. Vulkan is loaded at run time, and a machine
-  without a Vulkan driver or device falls back to OpenGL with a line in the
-  log instead of exiting at start (framework patch w). Pick Vulkan on Steam
-  Deck; see `docs/STEAM_DECK.md`.
+- **A Vulkan renderer.** The launcher's Renderer row offers Software, OpenGL
+  and Vulkan (`[video] offer_vulkan = true` in every title config; an
+  existing game.toml picks the key up on the next Setup). The Vulkan backend
+  rasterises on the GPU with the same 1x-4x supersampling, PGXP and
+  widescreen as OpenGL. It is loaded at run time, and a machine without a
+  Vulkan driver or device falls back to OpenGL with a line in the log
+  instead of exiting at start (framework patches w, x, y). Pick Vulkan on a
+  Steam Deck; see `docs/STEAM_DECK.md`.
+- **Vulkan draws the same picture OpenGL does.** All eleven texture filters
+  - nearest, bilinear, 3-point, trilinear, JINC2, xBR, Scale2x, Scale3x and
+  the three MMPX variants - plus *Filter 2D elements*, the display aspect,
+  *Display scaling* including sharp-bilinear, post-processing (FXAA), *Crop
+  FMVs*, *FMV filtering* including bicubic, and *FMV chroma smoothing*. Both
+  backends compile the same shader text from the same generated DuckStation
+  blocks, so they cannot drift apart: every filter was compared against
+  OpenGL frame for frame from a fixed save state, five of the eleven
+  pixel-identical and the rest differing by a handful of pixels of
+  floating-point rounding. The FMV crop uses the same static band the OpenGL
+  path does, verified frame-stable across a whole intro movie. Vulkan builds
+  these shaders at compile time rather than on first use, so picking a heavy
+  filter does not stall the way it can on OpenGL; if the present shader pass
+  cannot be built the renderer keeps a plain blit, so a driver that cannot
+  run it still runs the game. **The one exception** is the second half of
+  edge blending - blending the surviving fragments by coverage through a
+  dual-source factor - which the Vulkan pipelines do not set up yet, so
+  *Edge blending* stays softer on OpenGL. Its coverage cutout is there.
 - **Garbled menu text on Vulkan is fixed** (framework patch za). The options
   and load-game menus drew from stale VRAM because the Vulkan backend threw
   away queued texture uploads whenever the display entered or left 24-bit
@@ -76,31 +90,6 @@
   used for readbacks without the matching usage flag. All are undefined
   behaviour on a stricter driver than the one the lab runs, which is exactly
   what a Steam Deck's driver is. Now zero.
-- **Vulkan does the whole texture-filter set** (framework patch y). All
-  eleven modes — nearest, bilinear, 3-point, trilinear, JINC2, xBR, Scale2x,
-  Scale3x and the three MMPX variants — plus *Filter 2D elements* and edge
-  blending's coverage cutout. They are the same shader text the OpenGL
-  backend compiles, from the same generated DuckStation blocks, so the two
-  renderers cannot drift apart; verified mode by mode from a fixed save
-  state, with five of the eleven pixel-identical between backends and the
-  rest differing by a handful of pixels of floating-point rounding. Vulkan
-  compiles these at build time rather than on first use, so switching to a
-  heavy filter does not stall the way it can on OpenGL.
-- **Sharp-bilinear, FXAA and bicubic FMV filtering on Vulkan** (framework
-  patch y). The present is a plain blit for nearest and bilinear and a
-  shader pass for the rest; if that pass cannot be built the renderer keeps
-  the blit, so a driver that cannot run it still runs the game. Edge
-  blending's second half (blending survivors by coverage through a
-  dual-source factor) is the one texture-filter feature still OpenGL-only.
-- **The Vulkan present follows the Display settings** (framework patch x).
-  Its final blit was pinned to 4:3, so a widescreen or 16:10 aspect came out
-  letterboxed wrongly; it now uses the same aspect OpenGL does. *Display
-  scaling* picks the filter, and movies get *Crop FMVs*, *FMV filtering* and
-  *FMV chroma smoothing* — the crop uses the same static band the OpenGL
-  path does, verified frame-stable across a whole intro movie. Still
-  OpenGL-only: texture filtering beyond bilinear, edge blending,
-  post-processing (FXAA) and sharp-bilinear scaling, which need shader
-  passes rather than a blit.
 
 ### Launcher
 - **Display settings open on six rows, not eighteen** (launcher patch 0016).
@@ -127,14 +116,9 @@
   you can see where you are, and Back walks out one level at a time. The
   header also names the disc you are on ("Arcade disc", "Simulation disc"),
   at every level of the menu, so a pause never leaves you guessing which one
-  is running. Quit
-  flushes memory cards through the same path as closing the window, and
-  quit to launcher restarts the disc you are playing back into the launcher.
-- **The launcher's hotkeys table is back to one binding per hotkey**
-  (launcher patch 0015) — the *Secondary* column added in 0010 is gone
-  along with the column headers. `config.ini`'s `[KeyMap]` still accepts a
-  comma-separated list for anyone who wants two keys on one action.
-
+  is running. Quit flushes memory cards through the same path as closing the
+  window, and quit to launcher restarts the disc you are playing back into
+  the launcher.
 - **The launcher fits every screen now.** Its layout is authored at a fixed
   size and the window was only ever allowed to scale *up* (for high-DPI and
   high-resolution desktops); on anything smaller than that design size the
@@ -147,21 +131,20 @@
   the scale is not 1: the font is rasterised at the scale it will be drawn
   at instead of being resampled from a fixed atlas (measurably crisper on a
   4K desktop, which is most of what you would notice on the Neo G9).
-
 - **The disc's own title art** on the game card instead of the placeholder
   cartridge: Setup rips the title screen (`GT2.VOL`, `arcade/title_*.tim`)
   from your disc dump with `tools/rip_gt2_title_art.py` — the PS1's own
   transparency rules, written as the launcher's `assets/img/boxart.tga`.
   Nothing is downloaded and nothing ships with the project; no disc, no art.
-- **Hotkeys have a second binding.** The Hotkeys panel is a Primary /
-  Secondary table; either key triggers the action. Backspace while capturing
-  clears a slot. **Switch disc** is a hotkey on multi-disc installs
-  (unbound by default) — it does what the Disc row's button does.
-- **Hide cursor in fullscreen** (Display, under Fullscreen; on by default):
-  the pointer disappears in borderless and exclusive fullscreen and comes
-  back for the F1 menu and in a window.
-- The launcher sizes itself to the desktop: 1080p is 1×, 1440p 1.33×, 4K
-  2× (OS display scaling above 100 % is honoured as before).
+- **Switch disc is a hotkey** on multi-disc installs (unbound by default) —
+  it does what the Disc row's button does. Backspace while capturing a
+  hotkey clears it. The Hotkeys panel keeps one binding per hotkey
+  (a Secondary column was tried mid-cycle and dropped, launcher patches
+  0010/0015); `config.ini`'s `[KeyMap]` still accepts a comma-separated
+  list for anyone who wants two keys on one action.
+- **Hide cursor in fullscreen** (Display, under *Show advanced settings*; on
+  by default): the pointer disappears in borderless and exclusive fullscreen
+  and comes back for the F1 menu and in a window.
 - **Presets** at the top of Settings → Display: **Original** (how the
   PlayStation drew it — native resolution, no texture filtering, raw pixels,
   movies as decoded) and **Enhanced** (4× supersampling, bilinear texture
@@ -209,9 +192,6 @@
   coverage - which needs a dual-source blend the Vulkan pipelines do not set
   up yet. Both presets leave *Edge blending* off, so this only shows if you
   turn it on yourself.
-- **Netplay runs on the software renderer under Vulkan.** The lockstep path
-  needs a CPU-side VRAM authority that only the software and OpenGL backends
-  provide; a netplay session started on Vulkan quietly uses software.
 
 
 ## 0.3.0 — every Silent patch, cheats on both discs, 60 FPS measured (2026-09-03)

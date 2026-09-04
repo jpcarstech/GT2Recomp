@@ -112,11 +112,14 @@ at a commit that is not on main ("N commits since this release"). After a
 push: `fix_release_tag.cmd <tag>` (re-points the tag at origin/main and writes
 `release\github_main.bundle`), then fetch that bundle here and `update-ref
 refs/heads/release` to it. Done for 0.3.0; `release` == GitHub main
-`51fe002` (the 0.2.0 release commit is `49e7523`). **0.4.0 is cut but not
-yet reconciled**: the local release commit is on `release` with tag
-`v0.4.0`, and after John's push it needs `fix_release_tag.cmd v0.4.0`
-followed by fetching `release\github_main.bundle` here and pointing
-`refs/heads/release` at GitHub's rewritten commit. `fix_release_tag.cmd`
+`51fe002` (the 0.2.0 release commit is `49e7523`). Same for 0.4.0, with no
+reconciliation needed: GitHub main was still `51fe002` at push time, so the
+rebase was a fast-forward and the release commit kept its id - tag `v0.4.0`
+== `6bb16f2`. **Run `git ls-remote <remote>` after any push**: if the tag
+and `refs/heads/main` already agree with local `release`, there is nothing
+to reconcile and `github_main.bundle` can be ignored. `release` is not
+tag-only - an ordinary commit can go on top of it (a docs fix after a
+release), and push_update.cmd pushes it to main without creating a tag. `fix_release_tag.cmd`
 REQUIRES the tag name: run without one on 0.3.0 day, its old default moved
 `v0.2.0` onto the 0.3.0 commit and the tags had to be repaired
 (`repair_tags_0.3.0.cmd`). Also: the GitHub release form must only be
@@ -168,6 +171,20 @@ changed — the tool refuses a stale recompiler). Changing
 `runtime/include/debug_server.h` recompiles every generated file (it is
 reached through `psx_runtime.h`); declare new runtime-only symbols in the
 .cpp that needs them instead.
+
+## Netplay
+
+Not a GT2Recomp feature and not planned (John, 2026-09-04; possibly some day).
+The framework carries netplay and this project inherits only the disc gate -
+the `[netplay]` block in each title's `game.toml` (`require_cue`,
+`required_tracks`, `required_disc_fp`) - which is a disc-identity check, not
+an offered mode. There is no `docs/NETPLAY.md` here despite the comment above
+that block pointing at one; it is the framework's doc. So keep netplay out of
+player-facing docs and release notes: naming it in a Known issues list
+advertises a mode this build does not offer. If it is ever taken up, the one
+thing worth knowing from the Vulkan work: the lockstep path needs a CPU-side
+VRAM authority that only the software and OpenGL backends provide, so a
+netplay session on Vulkan silently falls back to software.
 
 ## Shelved work
 

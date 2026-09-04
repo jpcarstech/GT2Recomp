@@ -98,7 +98,7 @@ help = "60 FPS doubles the game's simulation rate; choosing it switches on the C
 # know that 60 FPS needs the overclock or that full-detail AI needs the 8 MB
 # buffers. Applying one clears the page and switches on exactly what it names.
 [[runtime.feature_preset]]
-label = "Authentic 1999"
+label = "Original"
 description = "Turn everything off and play it exactly as it shipped: 30 fps, 4:3, original draw distance."
 
 [[runtime.feature_preset]]
@@ -152,7 +152,18 @@ stretch_24bpp_stills = true
 
 [video]
 renderer = "opengl"
+# Lists Vulkan in the launcher's Renderer row beside OpenGL. The exe loads
+# Vulkan at run time (no link-time dependency); a machine without a Vulkan
+# driver falls back to OpenGL. Pick Vulkan on Steam Deck (Proton): it is the
+# API the Deck's GPU driver is built around and the one Proton is tuned for.
+offer_vulkan = true
 aspect_ratio = "4:3"   # launcher Settings overrides; "16:10" also valid here
+# GT2's movies (Polyphony logo, intro) are letterboxed with 24 black rows top
+# and bottom. With the launcher's "Crop FMVs" on, this seeds the renderer's
+# band removal so the crop is in place from the first frame and holds through
+# the fades to black, instead of dropping out and popping back (detected
+# bands can only lower it, never raise it).
+fmv_letterbox_rows = 24
 # PGXP: every knob ships at its lab-verified value for GT2 - geometry,
 # perspective-correct textures, culling correction and preserve-projection
 # ON; tolerance UNLIMITED; colour correction, disable-on-2D, vertex cache,

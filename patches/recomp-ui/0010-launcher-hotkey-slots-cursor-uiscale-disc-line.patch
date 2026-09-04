@@ -1,0 +1,403 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 86aa894..51e5633 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -173,7 +173,10 @@ namespace {
+ // controls), so keep all layout tokens in logical units. Fonts are logical-
+ // sized as well; the renderer scales their atlas with the framebuffer.
+ // (Ported from launcher_ng's "Fix launcher DPI layout and text alignment".)
+-float  px(float logical) { return logical; }
++// User UI scale (Settings: "UI scale"): multiplies every layout token; the
++// fonts and ImGui style are rebuilt at the same factor (apply_scale).
++float g_ui_scale = 1.0f;
++float  px(float logical) { return logical * g_ui_scale; }
+ ImVec4 col(const LngColor& c) { return ImVec4(c.r, c.g, c.b, c.a); }
+ // g_th moved to external linkage above the anonymous namespace (see note).
+ 
+@@ -598,7 +601,7 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
+     io.Fonts->Clear();
+     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 2;
+     (void)scale;   // DPI is handled by the framebuffer scale, not by re-scaling layout/fonts
+-    const float body = th.font_body;
++    const float body = th.font_body * g_ui_scale;   // user UI scale does apply
+     // Cover Basic Latin + Latin-1 AND General Punctuation so em/en dashes and
+     // curly quotes used in the game notes render as glyphs, not "?" tofu.
+     static const ImWchar kRanges[] = {
+@@ -697,6 +700,7 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
+ #else
+     style.Colors[ImGuiCol_NavHighlight]    = col(th.focus_ring);
+ #endif
++    if (g_ui_scale != 1.0f) style.ScaleAllSizes(g_ui_scale);
+     ImGui::GetStyle() = style;
+ }
+ 
+@@ -1097,8 +1101,8 @@ void draw_title_selector(LauncherModel* m, const LauncherTheme& th, float availw
+         if (launcher_model_title_installed(m, i)) next = i;
+     }
+ 
+-    ImGui::TextColored(col(th.text_muted), "%s", ui_text("Disc"));
+-    ImGui::Dummy(ImVec2(0, px(4)));
++    // One line: "Disc   Arcade   [Switch to Simulation]".
++    row_label("Disc", th);
+     ImGui::AlignTextToFramePadding();
+     ImGui::TextUnformatted(ui_text(active_label));
+     if (next >= 0) {
+@@ -2687,6 +2691,17 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         if (ImGui::Button(ui_text(launcher_model_fullscreen_label(m)), ImVec2(px(120), px(30))))
+         launcher_model_cycle_fullscreen(m);
+     ImGui::PopID();
++    row_label("Hide cursor in fullscreen", th);
++    ImGui::PushID("hide_cursor_fs");
++    {
++        bool hc = m->s.hide_cursor_fs != 0;
++        if (ImGui::Checkbox("##hide_cursor_fs", &hc))
++            launcher_model_toggle_hide_cursor_fs(m);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("%s", ui_text("Hides the mouse pointer while the game is fullscreen "
++                                            "(borderless or exclusive). The F1 menu shows it again."));
++    }
++    ImGui::PopID();
+     if (m->num_display_layouts > 0) {
+         row_label("Screen layout", th);
+         ImGui::PushID("screen_layout");
+@@ -3401,41 +3416,45 @@ void draw_hotkeys_controls(LauncherModel* m, const LauncherTheme& th) {
+     // catalog. They remain absent for every existing game and have no default
+     // binding when the capability is enabled.
+     if (m->has_solar_sensor) mask |= LNG_HOTKEYS_SOLAR;
+-    // Same responsive grid treatment as the bindings list.
+-    const float cell_w = px(280.0f);
+-    int cols = (int)(ImGui::GetContentRegionAvail().x / cell_w);
+-    cols = cols < 1 ? 1 : (cols > 3 ? 3 : cols);
+-    // Uniform label column: measure the widest bound hotkey name up front so
+-    // every bind button in the grid starts at the same x within its cell —
+-    // aligned left edges (and, since the buttons are fixed-width, aligned right
+-    // edges too), instead of hugging each variable-width label.
+-    float label_w = 0.0f;
+-    for (int h = 0; h < LNG_HK_COUNT; ++h) {
+-        if (!(mask & (1u << h))) continue;
+-        float w = ImGui::CalcTextSize(ui_text(launcher_hotkey_name((LngHotkey)h))).x;
+-        if (w > label_w) label_w = w;
+-    }
+-    label_w += px(16.0f);   // gap between label and its bind button
+-    if (ImGui::BeginTable("hk", cols)) {
++    // Switch disc only means something on a multi-disc install.
++    if (m->num_titles > 1) mask |= LNG_HOTKEYS_SWITCH_DISC;
++    // One row per hotkey, two bind columns: [KeyMap] values are a comma
++    // list the runtime matches any of, shown here as Primary / Secondary.
++    // A capture ends with the key pressed; Backspace or Delete while
++    // capturing clears that slot.
++    const float btn_w = px(130);
++    if (ImGui::BeginTable("hk", 3, ImGuiTableFlags_SizingFixedFit)) {
++        ImGui::TableSetupColumn("Hotkey", ImGuiTableColumnFlags_WidthStretch);
++        ImGui::TableSetupColumn("Primary", ImGuiTableColumnFlags_WidthFixed, btn_w);
++        ImGui::TableSetupColumn("Secondary", ImGuiTableColumnFlags_WidthFixed, btn_w);
++        ImGui::TableNextRow();
++        ImGui::TableNextColumn(); ImGui::TextColored(col(th.text_muted), "%s", ui_text("Hotkey"));
++        ImGui::TableNextColumn(); ImGui::TextColored(col(th.text_muted), "%s", ui_text("Primary"));
++        ImGui::TableNextColumn(); ImGui::TextColored(col(th.text_muted), "%s", ui_text("Secondary"));
+         for (int h = 0; h < LNG_HK_COUNT; ++h) {
+             if (!(mask & (1u << h))) continue;
++            ImGui::TableNextRow();
+             ImGui::TableNextColumn();
+             ImGui::PushID(h);
+-            const char* hkname = ui_text(launcher_hotkey_name((LngHotkey)h));
+             ImGui::AlignTextToFramePadding();
+-            ImGui::TextColored(col(th.text_muted), "%s", hkname);
+-            // Pad with RELATIVE spacing (not absolute x) so the bind button
+-            // starts at a uniform offset within every table cell — absolute
+-            // SameLine() fights ImGui's per-cell cursor tracking and spills
+-            // buttons into the wrong column.
+-            ImGui::SameLine(0.0f, label_w - ImGui::CalcTextSize(hkname).x);
+-            const bool cap = m->hk_capturing && m->capture_hk == (LngHotkey)h;
+-            const char* lbl = cap ? ui_text("[ press... ]")
+-                            : m->hotkeys[h][0] ? m->hotkeys[h] : ui_text("(unbound)");
+-            if (cap) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
+-            if (ImGui::Button(lbl, ImVec2(px(130), 0)))
+-                launcher_model_begin_hk_capture(m, (LngHotkey)h);
+-            if (cap) ImGui::PopStyleColor();
++            ImGui::TextUnformatted(ui_text(launcher_hotkey_name((LngHotkey)h)));
++            for (int slot = 0; slot < 2; ++slot) {
++                ImGui::TableNextColumn();
++                ImGui::PushID(slot);
++                char lbl[64];
++                launcher_binds_hotkey_slot_label(m, (LngHotkey)h, slot, lbl, sizeof(lbl));
++                const bool cap = m->hk_capturing && m->capture_hk == (LngHotkey)h &&
++                                 m->capture_hk_slot == slot;
++                const char* text = cap ? ui_text("[ press... ]")
++                                 : lbl[0] ? lbl : ui_text("(unbound)");
++                if (cap) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
++                if (ImGui::Button(text, ImVec2(btn_w, 0)))
++                    launcher_model_begin_hk_capture_slot(m, (LngHotkey)h, slot);
++                if (cap) ImGui::PopStyleColor();
++                if (ImGui::IsItemHovered())
++                    ImGui::SetTooltip("%s", ui_text("Click, then press the key. Backspace clears it."));
++                ImGui::PopID();
++            }
+             ImGui::PopID();
+         }
+         ImGui::EndTable();
+@@ -7348,7 +7367,9 @@ static void draw_mod_features(LauncherModel* m, const LauncherTheme& th) {
+         set_all_mod_features(m, false);
+     if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("%s", ui_text("Disable every installed mod feature"));
+-    for (int pi = 0; pi < m->num_feature_presets; ++pi) {
++    /* One-click presets belong to the Mods page: on the Cheats page they
++     * would clear the cheats list and switch on enhancements. */
++    for (int pi = 0; pi < m->num_feature_presets && m->mod_group_filter != 2; ++pi) {
+         const RecompLauncherCFeaturePreset* preset = &m->feature_presets[pi];
+         if (!preset->label || !preset->label[0]) continue;
+         ImGui::SameLine();
+@@ -7817,6 +7838,18 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
+         ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y + (play_h - ImGui::GetFrameHeight()) * 0.5f));
+         if (ImGui::Checkbox(ui_text("Skip launcher on boot"), &skip))
+             launcher_model_request_skip_toggle(m);
++        // UI scale: the whole launcher (layout tokens, fonts, style) scales
++        // by this percentage; applied live, persisted with the settings.
++        ImGui::SameLine(0.0f, px(24.0f));
++        ImGui::AlignTextToFramePadding();
++        ImGui::TextColored(col(th.text_muted), "%s", ui_text("UI scale"));
++        ImGui::SameLine(0.0f, px(8.0f));
++        ImGui::SetNextItemWidth(px(160.0f));
++        int pct = m->s.ui_scale > 0 ? m->s.ui_scale : 100;
++        if (ImGui::SliderInt("##ui_scale", &pct, 75, 200, "%d%%"))
++            launcher_model_set_ui_scale(m, pct);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("%s", ui_text("Drag to make the launcher larger or smaller."));
+     } else if (m->view == LNG_VIEW_SETTINGS &&
+                launcher_model_can_restore_defaults(m)) {
+         ImGui::SetCursorScreenPos(
+@@ -9490,9 +9523,16 @@ bool try_capture(LauncherModel* m, const SDL_Event& ev) {
+         launcher_model_cancel_capture(m);
+         return true;
+     }
+-    // hotkey capture: wait past a bare modifier press for the real key
++    // hotkey capture: wait past a bare modifier press for the real key;
++    // Backspace / Delete clear the slot being captured.
+     if (is_modifier_scancode((SDL_Scancode)LNG_EVSCAN(ev))) return true;
+-    launcher_binds_set_hotkey(m, m->capture_hk, (int)LNG_EVKEY(ev), (int)LNG_EVMOD(ev));
++    {
++        const SDL_Scancode sc = (SDL_Scancode)LNG_EVSCAN(ev);
++        const bool clear = (sc == SDL_SCANCODE_BACKSPACE || sc == SDL_SCANCODE_DELETE);
++        launcher_binds_set_hotkey_slot(m, m->capture_hk, m->capture_hk_slot,
++                                       clear ? 0 : (int)LNG_EVKEY(ev),
++                                       clear ? 0 : (int)LNG_EVMOD(ev));
++    }
+     launcher_model_cancel_hk_capture(m);
+     return true;
+ }
+@@ -9751,6 +9791,10 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
+         } while (SDL_PollEvent(&ev));
+ 
+         launcher_platform_refresh_metrics(p);
++        {
++            const float want_ui = (m->s.ui_scale > 0 ? (float)m->s.ui_scale : 100.0f) / 100.0f;
++            if (want_ui != g_ui_scale) { g_ui_scale = want_ui; applied_scale = 0.0f; }
++        }
+         if (applied_scale != p->display_scale) {
+             apply_scale(*th, p->display_scale, font_path.c_str(),
+                         jp_font_path.c_str(), symbols_font_path.c_str(),
+diff --git a/src/common/launcher_binds.c b/src/common/launcher_binds.c
+index bf04464..63bf8ea 100644
+--- a/src/common/launcher_binds.c
++++ b/src/common/launcher_binds.c
+@@ -180,7 +180,7 @@ static const char* kHotkeyKey[LNG_HK_COUNT] = {
+     "WindowBigger", "WindowSmaller", "VolumeUp", "VolumeDown",
+     "DisplayPerf", "ToggleRenderer",
+     "SolarBrighter", "SolarDimmer", "SolarLive",
+-    "Rewind", "SaveStateMenu"
++    "Rewind", "SaveStateMenu", "SwitchDisc"
+ };
+ // Built-in defaults (shown when config.ini has no line; "" = unbound).
+ static const char* kHotkeyDef[LNG_HK_COUNT] = {
+@@ -189,7 +189,7 @@ static const char* kHotkeyDef[LNG_HK_COUNT] = {
+      * (psxrecomp host_keymap reads these from [KeyMap]). */
+     "", "", "Keypad +", "Keypad -", "F", "R",
+     "", "", "",
+-    "F8", "F7"
++    "F8", "F7", ""
+ };
+ 
+ static void copy_str(char* d, size_t cap, const char* s) {
+@@ -1160,9 +1160,39 @@ void launcher_binds_reset_player(LauncherModel* m, int player) {
+ }
+ 
+ void launcher_binds_set_hotkey(LauncherModel* m, LngHotkey h, int keycode, int kmod) {
++    launcher_binds_set_hotkey_slot(m, h, 0, keycode, kmod);
++}
++
++/* [KeyMap] values are a comma-separated list the runtime matches any of
++ * ("F8, Ctrl+R"); the launcher shows the first two as Primary / Secondary.
++ * Writing one slot keeps the other. keycode 0 clears the slot. */
++void launcher_binds_hotkey_slot_label(const LauncherModel* m, LngHotkey h, int slot,
++                                      char* out, size_t cap) {
++    out[0] = 0;
++    if (!m || h < 0 || h >= LNG_HK_COUNT) return;
++    const char* v = m->hotkeys[h];
++    if (!v[0] || !strcmp(v, "(unbound)")) return;
++    const char* comma = strchr(v, ',');
++    const char* p = v; size_t n;
++    if (slot == 0) n = comma ? (size_t)(comma - v) : strlen(v);
++    else { if (!comma) return; p = comma + 1; while (*p == ' ') ++p; n = strlen(p);
++           const char* c2 = strchr(p, ','); if (c2) n = (size_t)(c2 - p); }
++    while (n && (p[n-1] == ' ' || p[n-1] == '\t')) --n;
++    if (n >= cap) n = cap - 1;
++    memcpy(out, p, n); out[n] = 0;
++}
++
++void launcher_binds_set_hotkey_slot(LauncherModel* m, LngHotkey h, int slot, int keycode, int kmod) {
+     if (h < 0 || h >= LNG_HK_COUNT) return;
+-    char val[64];
+-    format_hotkey(keycode, kmod, val, sizeof(val));
++    char mine[64], other[64], val[160];
++    format_hotkey(keycode, kmod, mine, sizeof(mine));
++    launcher_binds_hotkey_slot_label(m, h, slot ? 0 : 1, other, sizeof(other));
++    const char* first  = slot ? other : mine;
++    const char* second = slot ? mine  : other;
++    if (first[0] && second[0]) snprintf(val, sizeof(val), "%s, %s", first, second);
++    else if (first[0])  copy_str(val, sizeof(val), first);
++    else if (second[0]) copy_str(val, sizeof(val), second);   /* primary cleared: the other moves up */
++    else val[0] = 0;
+     keymap_write(kHotkeyKey[h], val);
+     copy_str(m->hotkeys[h], sizeof(m->hotkeys[h]), val[0] ? val : "(unbound)");
+ }
+diff --git a/src/common/launcher_binds.h b/src/common/launcher_binds.h
+index 448efdc..aae26fc 100644
+--- a/src/common/launcher_binds.h
++++ b/src/common/launcher_binds.h
+@@ -114,6 +114,8 @@ int launcher_binds_psx_name_is_custom(const char* guid);
+ // modifier mask; pass keycode==0 to UNBIND. Persists to config.ini [KeyMap]
+ // and refreshes the model's display string.
+ void launcher_binds_set_hotkey(LauncherModel* m, LngHotkey h, int keycode, int kmod);
++void launcher_binds_set_hotkey_slot(LauncherModel* m, LngHotkey h, int slot, int keycode, int kmod);
++void launcher_binds_hotkey_slot_label(const LauncherModel* m, LngHotkey h, int slot, char* out, size_t cap);
+ 
+ // NES Zapper switches were toggled (mouse-as-gun / crosshair). Persists to
+ // keybinds.ini [zapper] via the NES-native bridge's surgical writer; the
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index d9000ce..f81d4b3 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -51,7 +51,7 @@ static const char* kHotkeyNames[LNG_HK_COUNT] = {
+     "Window bigger", "Window smaller", "Volume up", "Volume down",
+     "FPS readout", "Toggle renderer",
+     "Solar level up", "Solar level down", "Resume live solar",
+-    "Rewind", "Save states menu"
++    "Rewind", "Save states menu", "Switch disc"
+ };
+ static const char* kViewNames[7] = {
+     "Dashboard", "Settings", "Controller", "Netplay", "Mods",
+@@ -625,6 +625,8 @@ void launcher_model_init(LauncherModel* m,
+     if (m->has_texture_filter) m->s.texture_filter_2d = m->s.texture_filter_2d ? 1 : 0;
+     if (m->has_texture_filter) m->s.texture_edge_blend = m->s.texture_edge_blend ? 1 : 0;
+     if (m->has_fmv_crop) m->s.fmv_chroma = m->s.fmv_chroma ? 1 : 0;
++    m->s.hide_cursor_fs = m->s.hide_cursor_fs ? 1 : 0;
++    if (m->s.ui_scale != 0) m->s.ui_scale = clampi((m->s.ui_scale / 5) * 5, 75, 200);
+     if (m->has_antialiasing) m->s.post_processing = (m->s.post_processing == 1) ? 1 : 0;
+     /* 0 = unset (a host predating the field): seed the default rather than
+      * letting a memset pin the least useful value. */
+@@ -1644,6 +1646,18 @@ void launcher_model_toggle_fmv_chroma(LauncherModel* m) {
+     m->s.fmv_chroma = !m->s.fmv_chroma;
+ }
+ 
++void launcher_model_toggle_hide_cursor_fs(LauncherModel* m) {
++    if (!m) return;
++    m->s.hide_cursor_fs = !m->s.hide_cursor_fs;
++}
++
++void launcher_model_set_ui_scale(LauncherModel* m, int percent) {
++    if (!m) return;
++    if (percent < 75) percent = 75;
++    if (percent > 200) percent = 200;
++    m->s.ui_scale = (percent / 5) * 5;
++}
++
+ void launcher_model_cycle_post_processing(LauncherModel* m) {
+     /* Present-time post-process AA: far cheaper than MSAA (one shader pass
+      * over the final frame). Off <-> FXAA. */
+@@ -3768,11 +3782,15 @@ void launcher_model_cancel_capture(LauncherModel* m) {
+ }
+ 
+ void launcher_model_begin_hk_capture(LauncherModel* m, LngHotkey h) {
++    launcher_model_begin_hk_capture_slot(m, h, 0);
++}
++void launcher_model_begin_hk_capture_slot(LauncherModel* m, LngHotkey h, int slot) {
+     if (h < 0 || h >= LNG_HK_COUNT) return;
+     m->capturing    = false;
+     m->camera_capturing = false;
+     m->hk_capturing = true;
+     m->capture_hk   = h;
++    m->capture_hk_slot = slot ? 1 : 0;
+ }
+ void launcher_model_cancel_hk_capture(LauncherModel* m) { m->hk_capturing = false; }
+ 
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 10245e4..6542a48 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -100,6 +100,7 @@ typedef enum {
+     LNG_HK_SOLAR_BRIGHTER, LNG_HK_SOLAR_DIMMER, LNG_HK_SOLAR_LIVE,
+     LNG_HK_REWIND, /* PSX local rewind filmstrip → [KeyMap] Rewind */
+     LNG_HK_SAVE_STATE_MENU, /* PSX save-state slot menu → [KeyMap] SaveStateMenu */
++    LNG_HK_SWITCH_DISC, /* multi-disc installs: restart into the next disc → [KeyMap] SwitchDisc */
+     LNG_HK_COUNT
+ } LngHotkey;
+ 
+@@ -597,6 +598,7 @@ typedef struct {
+     bool      capture_assist;      // capture_btn indexes assist bindings
+     bool      hk_capturing;      // capturing a system hotkey
+     LngHotkey capture_hk;
++    int       capture_hk_slot;   // 0 primary, 1 secondary ([KeyMap] values are "a, b")
+     // Per-player bind-label display strings, indexed like capture_btn.
+     // binds[] is slot 0 (the primary bind — every console); binds_alt[] is
+     // slot 1, filled only by bind bridges with two slots per input (N64).
+@@ -607,7 +609,7 @@ typedef struct {
+     // launcher_binds.c's per-console bridge alongside the keyboard labels.
+     char      pad_binds[LNG_MAX_PLAYERS][LNG_MAX_BUTTONS][32];
+     char      camera_binds[LNG_CAMERA_BIND_COUNT][32];
+-    char      hotkeys[LNG_HK_COUNT][32];    // [KeyMap] value strings, e.g. "Ctrl+R"
++    char      hotkeys[LNG_HK_COUNT][64];    // [KeyMap] value strings, e.g. "Ctrl+R" or "F8, Ctrl+R"
+ } LauncherModel;
+ 
+ // Build the model from the inbound C ABI structs. `initial_rom` may be NULL.
+@@ -775,6 +777,8 @@ void launcher_model_toggle_texture_filter(LauncherModel* m);   // Nearest/Biline
+ void launcher_model_toggle_texture_filter_2d(LauncherModel* m); // filter 2D sprites/UI
+ void launcher_model_toggle_texture_edge_blend(LauncherModel* m); // DuckStation edge blending
+ void launcher_model_toggle_fmv_chroma(LauncherModel* m);         // 24-bit chroma smoothing (FMV)
++void launcher_model_toggle_hide_cursor_fs(LauncherModel* m);     // hide pointer in fullscreen
++void launcher_model_set_ui_scale(LauncherModel* m, int percent);  // 75..200, step 5
+ void launcher_model_cycle_post_processing(LauncherModel* m);    // Off/FXAA
+ const char* launcher_model_post_processing_label(const LauncherModel* m);
+ const char* launcher_model_texture_filter_label(const LauncherModel* m);
+@@ -1035,6 +1039,7 @@ void launcher_model_reset_assist_bindings(LauncherModel* m);
+ void launcher_model_cancel_capture(LauncherModel* m);
+ // ---- hotkey capture ----
+ void launcher_model_begin_hk_capture(LauncherModel* m, LngHotkey h);
++void launcher_model_begin_hk_capture_slot(LauncherModel* m, LngHotkey h, int slot);
+ void launcher_model_cancel_hk_capture(LauncherModel* m);
+ 
+ // ---- display-string helpers (single source of truth across backends) ----
+diff --git a/src/common/launcher_system_types.h b/src/common/launcher_system_types.h
+index f353cc4..9fbd4a0 100644
+--- a/src/common/launcher_system_types.h
++++ b/src/common/launcher_system_types.h
+@@ -95,6 +95,7 @@ typedef struct { int mode; /* 0 rom-hash, 1 disc-verdict */ VerifyProbeFn probe;
+ // (currently the three solar controls) are added by the panel at draw time, so
+ // SNES and other non-solar systems keep their byte-identical legacy catalog.
+ #define LNG_HOTKEYS_ALL 0x7FFu
++#define LNG_HOTKEYS_SWITCH_DISC ((uint32_t)(1u << LNG_HK_SWITCH_DISC))
+ #define LNG_HOTKEYS_SOLAR ((uint32_t)((1u << LNG_HK_SOLAR_BRIGHTER) | \
+                                       (1u << LNG_HK_SOLAR_DIMMER) | \
+                                       (1u << LNG_HK_SOLAR_LIVE)))
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 91f1b49..0d30413 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -553,6 +553,8 @@ struct RecompLauncherCSettings {
+     int  texture_filter_2d;   // bool: apply texture_filter to 2D elements (sprites/HUD); 0 keeps them nearest
+     int  texture_edge_blend;  // bool: DuckStation edge blending for the filtered modes (cutout coverage blends the edge)
+     int  fmv_chroma;          // bool: DuckStation 24-bit chroma smoothing on FMV frames
++    int  hide_cursor_fs;      // bool: hide the mouse pointer while the game window is fullscreen
++    int  ui_scale;            // launcher UI scale in percent (0 = unset = 100); 75..200
+     int  post_processing;     // present post-process: 0 = off, 1 = FXAA (host may extend)
+     int  screen_kind;         // 0 raw, 1 CRT, 2 composite, 3 trinitron
+     int  frame_interp;        // bool

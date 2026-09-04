@@ -1,0 +1,2679 @@
+From 92ba7813c0f8bb01ccf6d46aaeea2e37c663939e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 4 Sep 2026 00:05:39 +0000
+Subject: [PATCH] Texture filtering: DuckStation's full set (xBR, Scale2x,
+ Scale3x, MMPX, MMPX Enhanced, MMPX Advanced), edge blending, FMV chroma
+ smoothing
+
+The textured fragment shader is now one program per filter mode
+(PSX_TEXFILTER at the top of the source, built on first use, nearest
+always present for the per-batch 2D case), so a mode's code is the only
+code that program carries. Modes 5..10 are DuckStation's shader blocks
+lifted verbatim by tools/port_duckstation_texfilters.py into
+gpu_gl_texfilters.h (three edits: the xBR I.w typo, MMPX's split #define,
+0u literals for GLSL 3.30) behind a small HLSL-name compat layer; their
+own cutout rule (coverage < 0.5 dropped) applies.
+
+[video] texture_edge_blending: DuckStation's edge blending - filtered
+cutout coverage multiplies the colour and 1-coverage keeps the
+destination through the dual-source factor every opaque texel pass now
+draws with (identical output for fully covered pixels), coverage below
+one half dropped. [video] fmv_chroma_smoothing: DuckStation's 24-bit
+chroma smoothing on the CPU FMV frame before upload (same matrices,
+same even-aligned 2x2 block bilinear; verified against a port of the
+shader to 1 LSB). Shader compiles refresh the starvation watchdog. The
+pgxp debug command takes edge_blend / fmv_chroma live.
+---
+ recompiler/src/config_loader.cpp     |   38 +-
+ recompiler/src/config_loader.h       |   18 +-
+ runtime/include/gpu_gl_renderer.h    |    6 +
+ runtime/src/debug_server.c           |   16 +-
+ runtime/src/gpu_gl_renderer.c        |  317 ++++-
+ runtime/src/gpu_gl_texfilters.h      | 1671 ++++++++++++++++++++++++++
+ runtime/src/main.cpp                 |   50 +-
+ tools/port_duckstation_texfilters.py |   97 ++
+ 8 files changed, 2160 insertions(+), 53 deletions(-)
+ create mode 100644 runtime/src/gpu_gl_texfilters.h
+ create mode 100644 tools/port_duckstation_texfilters.py
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 99f057f4..8d2fc487 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -719,10 +719,21 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+             else if (mode == "3point")    rt.video_texture_filter = 2;
+             else if (mode == "trilinear") rt.video_texture_filter = 3;
+             else if (mode == "jinc2")     rt.video_texture_filter = 4;
++            else if (mode == "xbr")       rt.video_texture_filter = 5;
++            else if (mode == "scale2x")   rt.video_texture_filter = 6;
++            else if (mode == "scale3x")   rt.video_texture_filter = 7;
++            else if (mode == "mmpx")      rt.video_texture_filter = 8;
++            else if (mode == "mmpx_enhanced") rt.video_texture_filter = 9;
++            else if (mode == "mmpx_advanced") rt.video_texture_filter = 10;
+             else throw std::runtime_error(fmt::format(
+                 "[video] texture_filtering must be \"nearest\", \"bilinear\", "
+-                "\"3point\", \"trilinear\" or \"jinc2\": {}", mode));
++                "\"3point\", \"trilinear\", \"jinc2\", \"xbr\", \"scale2x\", "
++                "\"scale3x\", \"mmpx\", \"mmpx_enhanced\" or \"mmpx_advanced\": {}", mode));
+         }
++        if (video.contains("texture_edge_blending"))
++            rt.video_texture_edge_blending = toml::find<bool>(video, "texture_edge_blending");
++        if (video.contains("fmv_chroma_smoothing"))
++            rt.video_fmv_chroma_smoothing = toml::find<bool>(video, "fmv_chroma_smoothing");
+         if (video.contains("fmv_filter")) {
+             const auto mode = toml::find<std::string>(video, "fmv_filter");
+             if (!video_fmv_filter_parse(mode, &rt.video_fmv_filter))
+@@ -2436,6 +2447,20 @@ UserSettings load_user_settings(const fs::path& path) {
+             else if (m == "3point") { s.texture_filter = 2; s.has_texture_filter = true; }
+             else if (m == "trilinear") { s.texture_filter = 3; s.has_texture_filter = true; }
+             else if (m == "jinc2") { s.texture_filter = 4; s.has_texture_filter = true; }
++            else if (m == "xbr") { s.texture_filter = 5; s.has_texture_filter = true; }
++            else if (m == "scale2x") { s.texture_filter = 6; s.has_texture_filter = true; }
++            else if (m == "scale3x") { s.texture_filter = 7; s.has_texture_filter = true; }
++            else if (m == "mmpx") { s.texture_filter = 8; s.has_texture_filter = true; }
++            else if (m == "mmpx_enhanced") { s.texture_filter = 9; s.has_texture_filter = true; }
++            else if (m == "mmpx_advanced") { s.texture_filter = 10; s.has_texture_filter = true; }
++        });
++        if (v.contains("texture_edge_blending")) try_get([&]{
++            s.texture_edge_blending = toml::find<bool>(v, "texture_edge_blending");
++            s.has_texture_edge_blending = true;
++        });
++        if (v.contains("fmv_chroma_smoothing")) try_get([&]{
++            s.fmv_chroma_smoothing = toml::find<bool>(v, "fmv_chroma_smoothing");
++            s.has_fmv_chroma_smoothing = true;
+         });
+         if (v.contains("texture_filtering_2d")) try_get([&]{
+             s.texture_filter_2d = toml::find<bool>(v, "texture_filtering_2d");
+@@ -2797,14 +2822,19 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+     if (s.has_texture_filter) {
+         /* Persist every mode: the earlier bool-shaped serializer silently
+          * downgraded 3-Point (N64) to "bilinear" across restarts. */
+-        static const char* k_tf_names[5] =
+-            { "nearest", "bilinear", "3point", "trilinear", "jinc2" };
+-        const int tf = (s.texture_filter >= 0 && s.texture_filter <= 4)
++        static const char* k_tf_names[11] =
++            { "nearest", "bilinear", "3point", "trilinear", "jinc2", "xbr",
++              "scale2x", "scale3x", "mmpx", "mmpx_enhanced", "mmpx_advanced" };
++        const int tf = (s.texture_filter >= 0 && s.texture_filter <= 10)
+                            ? s.texture_filter : (s.texture_filter ? 1 : 0);
+         f << "texture_filtering = \"" << k_tf_names[tf] << "\"\n";
+     }
+     if (s.has_texture_filter_2d)
+         f << "texture_filtering_2d = " << (s.texture_filter_2d ? "true" : "false") << "\n";
++    if (s.has_texture_edge_blending)
++        f << "texture_edge_blending = " << (s.texture_edge_blending ? "true" : "false") << "\n";
++    if (s.has_fmv_chroma_smoothing)
++        f << "fmv_chroma_smoothing = " << (s.fmv_chroma_smoothing ? "true" : "false") << "\n";
+     if (s.has_post_processing)
+         f << "post_processing = \"" << (s.post_processing == 1 ? "fxaa" : "off") << "\"\n";
+     if (s.has_display_scaling)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 00880c84..d805cac6 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -478,9 +478,18 @@ struct RuntimeConfig {
+     bool                  video_antialiasing = true;
+ 
+     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
+-    // | "3point" (N64 RDP three-point) | "trilinear" | "jinc2" (Hyllian's
+-    // windowed jinc, the DuckStation option). Stored as 0..4.
++    // | "3point" (N64 RDP three-point) | "trilinear" | "jinc2" | "xbr" |
++    // "scale2x" | "scale3x" | "mmpx" | "mmpx_enhanced" | "mmpx_advanced"
++    // (the DuckStation set, its shaders). Stored as 0..10.
+     int                   video_texture_filter = 0;
++    // texture_edge_blending: DuckStation's edge blending - with a filtered
++    // mode, a fragment's cutout coverage (< 0.5 dropped) multiplies its colour
++    // and 1-coverage keeps the destination, so cutout borders get a soft edge.
++    bool                  video_texture_edge_blending = false;
++    // fmv_chroma_smoothing: DuckStation's "Chroma Smoothing for 24-Bit
++    // Display" - bilinear reconstruction of the MDEC's 4:2:0 chroma on FMV
++    // frames, luma untouched; removes the colour blockiness of movies.
++    bool                  video_fmv_chroma_smoothing = false;
+ 
+     // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
+     // (a 320x192-class movie blown up to the window). Only consulted when
+@@ -1299,6 +1308,11 @@ struct UserSettings {
+     bool has_antialiasing   = false; bool antialiasing   = true;
+     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear,4=jinc2
+     bool has_texture_filter_2d = false; bool texture_filter_2d = true; // filter 2D sprites/UI too
++    // texture_edge_blending: DuckStation's edge blending for the filtered
++    // modes (cutout coverage blends the edge). fmv_chroma_smoothing:
++    // DuckStation's 24-bit chroma smoothing on FMV frames.
++    bool has_texture_edge_blending = false; bool texture_edge_blending = false;
++    bool has_fmv_chroma_smoothing  = false; bool fmv_chroma_smoothing  = false;
+     bool has_post_processing = false; int post_processing = 0; // 0=off,1=fxaa
+     // display_scaling: how the finished frame is scaled to the window.
+     // 0 nearest (true nearest at integer ratios, sharp-bilinear at a non-integer
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 31004a8e..b4668a4f 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -129,6 +129,12 @@ void gl_renderer_set_fmv_crop(int native_rows);
+  * seeding fmv_crop's band removal so the crop is static across fades (0 = detect only). */
+ void gl_renderer_set_fmv_letterbox(int native_rows);
+ int  gl_renderer_get_fmv_letterbox(void);
++/* [video] fmv_chroma_smoothing: DuckStation's 24-bit chroma smoothing on FMV frames. */
++void gl_renderer_set_fmv_chroma_smoothing(int on);
++int  gl_renderer_get_fmv_chroma_smoothing(void);
++/* [video] texture_edge_blending: filtered cutout coverage blends the edge (DuckStation). */
++void gl_renderer_set_texture_edge_blend(int on);
++int  gl_renderer_get_texture_edge_blend(void);
+ /* Marks the next CPU present as a 24-bit (FMV) frame; fmv_crop applies only
+  * to those, pinned or not. Cleared after each gl_renderer_present. */
+ void gl_renderer_set_present_fmv(int is_fmv);
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index c021c799..d1a8e437 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5346,10 +5346,16 @@ static void handle_pgxp(int id, const char *json)
+     if (tex >= 0)
+         gpu_texture_correction_set(tex != 0);
+     /* Texture sampling mode (0 nearest 1 bilinear 2 3-point 3 trilinear
+-     * 4 JINC2), live, for filter A/Bs on one frame. Not persisted. */
++     * 4 JINC2 5 xBR 6 Scale2x 7 Scale3x 8 MMPX 9 MMPX Enhanced 10 MMPX
++     * Advanced), edge blending and FMV chroma smoothing, live, for A/Bs on
++     * one frame. Not persisted. */
+     int tf = json_get_int(json, "texfilter", -1);
+-    if (tf >= 0 && tf <= 4)
++    if (tf >= 0 && tf <= 10)
+         gr_set_texture_filter(tf);
++    int eb = json_get_int(json, "edge_blend", -1);
++    if (eb >= 0) gl_renderer_set_texture_edge_blend(eb != 0);
++    int fc = json_get_int(json, "fmv_chroma", -1);
++    if (fc >= 0) gl_renderer_set_fmv_chroma_smoothing(fc != 0);
+     if (geom >= 0 && tex < 0) {
+         /* keep the engine armed consistently with both flags */
+         gpu_texture_correction_set(gpu_texture_correction_enabled());
+@@ -5476,7 +5482,8 @@ static void handle_pgxp(int id, const char *json)
+              "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d,"
+              "\"framewipe\":%d,\"invalidations\":%u,"
+              "\"nclip_precise\":%llu,\"nclip_gated\":%llu,"
+-             "\"nclip_gate_why\":[%llu,%llu,%llu,%llu],\"texfilter\":%d}",
++             "\"nclip_gate_why\":[%llu,%llu,%llu,%llu],\"texfilter\":%d,"
++             "\"edge_blend\":%d,\"fmv_chroma\":%d}",
+              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+              (unsigned)pgxp_test_suppress_depth(), pgxp_test_active(),
+              gpu_pgxp_depth_enabled(),
+@@ -5522,7 +5529,8 @@ static void handle_pgxp(int id, const char *json)
+                 (unsigned long long)g_nclip_gate_why[2]; }),
+              ({ extern uint64_t g_nclip_gate_why[4];
+                 (unsigned long long)g_nclip_gate_why[3]; }),
+-             gr_texture_filter());
++             gr_texture_filter(), gl_renderer_get_texture_edge_blend(),
++             gl_renderer_get_fmv_chroma_smoothing());
+ }
+ 
+ /* pgxp_tri — vertex-coverage census: triangles by number of precise corners
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 1f17579a..149aefb2 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -67,6 +67,8 @@
+ #include "gpu_render.h"
+ #include "gpu_sw_renderer.h"
+ #include "gpu_gl_renderer.h"
++#include "gpu_gl_texfilters.h"   /* DuckStation-ported filter shader blocks (modes 5..10) */
++#include "starvation_ring.h"     /* starvation_watchdog_heartbeat: shader compiles stall this thread */
+ #include "frame_interpolation.h"
+ #include "host_osd.h"
+ #include "psx_savestate_menu.h"
+@@ -510,6 +512,14 @@ static int s_tex_filter = 0;
+  * "exclude 2D polygons" parity). */
+ static int s_tex_filter_2d = 1;
+ void gl_renderer_set_texture_filter_2d(int on) { s_tex_filter_2d = on ? 1 : 0; }
++/* [video] texture_edge_blending: DuckStation's edge blending for the filtered
++ * modes - a fragment's filtered cutout coverage (< 0.5 dropped) multiplies its
++ * colour and 1-coverage keeps the destination, so cutout borders (trees,
++ * fences, crowds) get a soft edge instead of a hard texel outline. Off keeps
++ * the containing-texel rule. Nearest is unaffected either way. */
++static int s_tex_edge_blend = 0;
++void gl_renderer_set_texture_edge_blend(int on) { s_tex_edge_blend = on ? 1 : 0; }
++int  gl_renderer_get_texture_edge_blend(void)   { return s_tex_edge_blend; }
+ /* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
+  * duplicate stencil copy current is deferred until mask checking is requested. */
+ static int s_stencil_valid = 1;
+@@ -1242,8 +1252,15 @@ static const char *TEX_VS =
+     "   * emit the near plane, but they only draw in depth-test-OFF batches. */\n"
+     "  float zn = (a_z >= 0.0) ? (a_z * 2.0 - 1.0) : -1.0;\n"
+     "  gl_Position = vec4(ndc * w, zn * w, w); }\n";
+-static const char *TEX_FS =
+-    "#version 330\n"
++/* Textured fragment shader. One program per texture-filter MODE (0..10,
++ * PSX_TEXFILTER at the top of the source): the nearest path is always
++ * present and u_filter picks it per batch (2D prims with "filter 2D" off),
++ * everything else is that mode's code alone, so the bilinear program does
++ * not pay MMPX Advanced's register footprint. TEX_FS_BODY is the common
++ * front (uniforms, VRAM fetch, helpers); tex_fs_source() assembles
++ * "#version 330 / #define PSX_TEXFILTER n / body / [compat + ported block] /
++ * main". */
++static const char *TEX_FS_BODY =
+     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+     "smooth in vec2 v_uv_p; smooth in vec4 v_col_p; flat in int v_persp;\n"
+     "uniform int u_cpersp;    /* PGXP color correction: perspective colors */\n"
+@@ -1259,7 +1276,9 @@ static const char *TEX_FS =
+     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
+     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
+     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
+-    "uniform int u_filter;    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear 4=JINC2 */\n"
++    "uniform int u_filter;    /* 0 = nearest for this batch, else PSX_TEXFILTER */\n"
++    "uniform int u_edge;      /* edge blending: fragment coverage multiplies the\n"
++    "                            colour and 1-coverage the destination (dual source) */\n"
+     "uniform float u_shift;\n"
+     "int vram_at(int x, int y){\n"
+     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
+@@ -1315,8 +1334,39 @@ static const char *TEX_FS =
+     "  const float wa = 1.382300768, wb = 2.576105976;\n"
+     "  return (x == 0.0) ? wa * wb : sin(x * wa) * sin(x * wb) / (x * x);\n"
+     "}\n"
++    ;
++
++/* HLSL-style names the DuckStation-ported filter blocks are written against
++ * (their shadergen supplies these for GLSL too), plus the two VRAM accessors
++ * they call: SampleFromVRAM returns (rgb, STP) for a texel and vec4(0) for the
++ * 0000h cutout - TRANSPARENT_PIXEL_COLOR - and packUnorm4x8/unpackUnorm4x8
++ * are spelled out so the shader stays at #version 330 (the packing built-ins
++ * are 4.00). Only compiled into the mode >= 5 program variants. */
++static const char *TEX_FS_COMPAT =
++    "#define float4 vec4\n#define float3 vec3\n#define float2 vec2\n"
++    "#define int4 ivec4\n#define int2 ivec2\n#define bool4 bvec4\n"
++    "#define lerp mix\n#define frac fract\n#define saturate(x) clamp((x), 0.0, 1.0)\n"
++    "#define CONSTANT const\n#define GLSL 1\n"
++    "#define VECTOR_EQ(a, b) all(equal((a), (b)))\n"
++    "#define VECTOR_NEQ(a, b) any(notEqual((a), (b)))\n"
++    "#define VECTOR_COMP_EQ(a, b) equal((a), (b))\n"
++    "#define TEXPAGE_VALUE int\n"
++    "#define TRANSPARENT_PIXEL_COLOR vec4(0.0, 0.0, 0.0, 0.0)\n"
++    "vec4 SampleFromVRAM(int texpage, vec2 coords, vec4 uv_limits){\n"
++    "  int raw = fetch_texel(int(floor(coords.x)), int(floor(coords.y)));\n"
++    "  return (raw == 0) ? vec4(0.0) : vec4(col5(raw), float((raw >> 15) & 1));\n"
++    "}\n"
++    "uint packUnorm4x8(vec4 v){\n"
++    "  uvec4 u = uvec4(round(clamp(v, 0.0, 1.0) * 255.0));\n"
++    "  return u.x | (u.y << 8) | (u.z << 16) | (u.w << 24);\n"
++    "}\n"
++    "vec4 unpackUnorm4x8(uint p){\n"
++    "  return vec4(float(p & 255u), float((p >> 8) & 255u), float((p >> 16) & 255u), float(p >> 24)) / 255.0;\n"
++    "}\n";
++
++static const char *TEX_FS_MAIN =
+     "void main(){\n"
+-    "  int stp; vec3 rgb;\n"
++    "  int stp; vec3 rgb; float cov = 1.0;\n"
+     "  /* v_persp is 0 for every prim unless [video] perspective_texturing is on\n"
+     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
+     "   * default is the PS1's affine (noperspective) mapping. */\n"
+@@ -1326,7 +1376,16 @@ static const char *TEX_FS =
+     "    if (raw == 0) discard;\n"
+     "    rgb = col5(raw);\n"
+     "    stp = (raw >> 15) & 1;\n"
+-    "  } else if (u_filter == 2) {\n"
++    "  } else {\n"
++    "#if PSX_TEXFILTER >= 5\n"
++    "    /* DuckStation-ported filter (gpu_gl_texfilters.h): its own cutout rule -\n"
++    "     * the filtered coverage decides, below one half the fragment is gone. */\n"
++    "    uv += vec2(u_shift);\n"
++    "    vec4 tcol; float ia;\n"
++    "    FilteredSampleFromVRAM(0, uv, vec4(v_limits), tcol, ia);\n"
++    "    if (ia < 0.5) discard;\n"
++    "    cov = ia; rgb = clamp(tcol.rgb, 0.0, 1.0); stp = tcol.a >= 0.5 ? 1 : 0;\n"
++    "#elif PSX_TEXFILTER == 2\n"
+     "    /* N64 three-point, the RDP datapath (see rdp_bilerp): the texel\n"
+     "     * cell splits on its diagonal and the sample blends the three corners\n"
+     "     * of the triangle it falls in, with 5-bit fractions and the RDP's\n"
+@@ -1343,7 +1402,7 @@ static const char *TEX_FS =
+     "     * nothing on a PS1 asks for it. */\n"
+     "    uv += vec2(u_shift);\n"
+     "    int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+-    "    if (cA == 0) discard;\n"
++    "    if (u_edge == 0 && cA == 0) discard;\n"
+     "    vec2 st = (uv - vec2(0.5)) * 32.0;              /* 10.5 fixed point */\n"
+     "    int si = int(floor(st.x)), ti = int(floor(st.y));\n"
+     "    int sfrac = si & 31, tfrac = ti & 31;\n"
+@@ -1353,9 +1412,10 @@ static const char *TEX_FS =
+     "    ivec4 c = rdp_bilerp(rdp_texel(r0), rdp_texel(r1), rdp_texel(r2), rdp_texel(r3), sfrac, tfrac);\n"
+     "    ivec4 sv = rdp_bilerp(ivec4(((r0 >> 15) & 1) * 255), ivec4(((r1 >> 15) & 1) * 255),\n"
+     "                          ivec4(((r2 >> 15) & 1) * 255), ivec4(((r3 >> 15) & 1) * 255), sfrac, tfrac);\n"
++    "    cov = float(c.a) / 255.0;\n"
+     "    if (c.a <= 0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
+     "    else { rgb = clamp(vec3(c.rgb) / float(c.a), 0.0, 1.0); stp = (sv.x * 2 >= c.a) ? 1 : 0; }\n"
+-    "  } else if (u_filter == 4) {\n"
++    "#elif PSX_TEXFILTER == 4\n"
+     "    /* JINC2 - Hyllian's windowed-jinc 2-lobe sharper with anti-ringing,\n"
+     "     * the port DuckStation carries (gpu_hw_shadergen.cpp, from Beetle\n"
+     "     * PSX): a 4x4 texel neighbourhood weighted by jinc2_w of the distance\n"
+@@ -1366,7 +1426,7 @@ static const char *TEX_FS =
+     "     * the containing texel like every other mode here. */\n"
+     "    uv += vec2(u_shift);\n"
+     "    int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+-    "    if (cA == 0) discard;\n"
++    "    if (u_edge == 0 && cA == 0) discard;\n"
+     "    vec2 pc = uv;\n"
+     "    ivec2 bi = ivec2(floor(pc - vec2(0.5)));       /* texel c11 of the 4x4 */\n"
+     "    vec2 tc = vec2(bi) + vec2(0.5);\n"
+@@ -1387,9 +1447,10 @@ static const char *TEX_FS =
+     "    acc /= wsum; accs /= wsum;\n"
+     "    acc  = mix(acc,  clamp(acc,  mn,  mx),  0.8);   /* anti-ringing */\n"
+     "    accs = mix(accs, clamp(accs, mns, mxs), 0.8);\n"
++    "    cov = acc.a;\n"
+     "    if (acc.a <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
+     "    else { rgb = clamp(acc.rgb / acc.a, 0.0, 1.0); stp = (accs >= 0.5 * acc.a) ? 1 : 0; }\n"
+-    "  } else {\n"
++    "#else\n"
+     "    /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base\n"
+     "     * (cutout + STP authority), the neighbours lie toward the sub-texel\n"
+     "     * offset and clamp to u_limits, and each texel's weight is gated by\n"
+@@ -1403,7 +1464,7 @@ static const char *TEX_FS =
+     "    int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;\n"
+     "    fx = abs(fx); fy = abs(fy);\n"
+     "    int c00 = fetch_texel(iu, iv);\n"
+-    "    if (c00 == 0) discard;\n"
++    "    if (u_edge == 0 && c00 == 0) discard;\n"
+     "    int c10 = fetch_texel(iu + sx, iv);\n"
+     "    int c01 = fetch_texel(iu, iv + sy);\n"
+     "    int c11 = fetch_texel(iu + sx, iv + sy);\n"
+@@ -1412,6 +1473,9 @@ static const char *TEX_FS =
+     "    float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;\n"
+     "    float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;\n"
+     "    float opac = w00 + w10 + w01 + w11;\n"
++    "    cov = opac;\n"
++    "    if (opac <= 0.0) { rgb = col5(c00); stp = (c00 >> 15) & 1; }\n"
++    "    else {\n"
+     "    rgb = (col5(c00)*w00 + col5(c10)*w10 + col5(c01)*w01 + col5(c11)*w11) / opac;\n"
+     "    float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10\n"
+     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
+@@ -1420,7 +1484,8 @@ static const char *TEX_FS =
+     "     * tent at the same weights and blend by the screen-space LOD --\n"
+     "     * identical to bilinear at magnification, softens minification\n"
+     "     * shimmer the way mip level 1 would. */\n"
+-    "    if (u_filter == 3) {\n"
++    "#if PSX_TEXFILTER == 3\n"
++    "    {\n"
+     "      float lod = clamp(log2(max(fwidth(uv.x), fwidth(uv.y))), 0.0, 1.0);\n"
+     "      if (lod > 0.0) {\n"
+     "        int d10 = fetch_texel(iu + 2*sx, iv);\n"
+@@ -1440,7 +1505,14 @@ static const char *TEX_FS =
+     "        }\n"
+     "      }\n"
+     "    }\n"
++    "#endif\n"
+     "    stp = stpf >= 0.5 ? 1 : 0;\n"
++    "    }\n"
++    "#endif\n"
++    "    /* Edge blending (u_edge): DuckStation's rule - a fragment whose filtered\n"
++    "     * coverage is below one half is dropped, the rest blend by coverage. Off:\n"
++    "     * the containing texel decided above and coverage is not used. */\n"
++    "    if (u_edge != 0 && cov < 0.5) discard;\n"
+     "  }\n"
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+     "  if (u_semipass == 2 && stp == 0) discard;\n"
+@@ -1451,10 +1523,102 @@ static const char *TEX_FS =
+     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
+     "    if (v_semi == 1) rgb *= 0.5; else if (v_semi == 4) rgb *= 0.25;\n"
+     "  }\n"
++    "  /* Edge factor: premultiply the colour and keep 1-ef of the destination\n"
++    "   * (lerp(dst, blended, ef)). Every batch that can carry it draws with\n"
++    "   * dual-source factors ONE / SRC1_ALPHA; the fixed-function STP=1 pass of\n"
++    "   * the isolated path (u_semipass == 2) cannot, and keeps ef = 1. */\n"
++    "  float ef = (u_edge != 0 && u_semipass != 2) ? clamp(cov, 0.0, 1.0) : 1.0;\n"
++    "  rgb *= ef; dst_factor = 1.0 - ef * (1.0 - dst_factor);\n"
+     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
+     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
+     "}\n";
+ 
++/* Texture-filter program variants. tex_fs_source(mode) assembles the
++ * fragment shader for one mode; tex_prog_select(mode) builds it on first use
++ * (a failed build falls back to nearest, never to no renderer), makes it
++ * current and re-reads its uniform locations. Persistent uniforms (sample
++ * shift, native-wide projection defaults) are re-applied by
++ * tex_prog_bind_uniforms(), which the pipeline init also calls. */
++#define TEX_FILTER_MODES 11
++static GLuint build_program_ex(const char *vs, const char *fs, int dual_source);
++static GLuint s_tex_progs[TEX_FILTER_MODES];
++static int    s_tex_prog_failed[TEX_FILTER_MODES];   /* build failed once: stay on nearest */
++static int    s_tex_prog_mode = -1;
++static const char *tex_filter_block(int mode) {
++    switch (mode) {
++    case 5:  return TEXFILTER_XBR_SRC;
++    case 6:  return TEXFILTER_SCALE2X_SRC;
++    case 7:  return TEXFILTER_SCALE3X_SRC;
++    case 8:  return TEXFILTER_MMPX_SRC;
++    case 9:  return TEXFILTER_MMPX_ENHANCED_SRC;
++    case 10: return TEXFILTER_MMPX_ADVANCED_SRC;
++    default: return NULL;
++    }
++}
++static char *tex_fs_source(int mode) {
++    const char *blk = tex_filter_block(mode);
++    size_t n = 64 + strlen(TEX_FS_BODY) + strlen(TEX_FS_MAIN)
++             + (blk ? strlen(TEX_FS_COMPAT) + strlen(blk) : 0);
++    char *src = (char *)malloc(n);
++    if (!src) return NULL;
++    snprintf(src, n, "#version 330\n#define PSX_TEXFILTER %d\n%s%s%s%s", mode, TEX_FS_BODY,
++             blk ? TEX_FS_COMPAT : "", blk ? blk : "", TEX_FS_MAIN);
++    return src;
++}
++static GLint s_uEdge = -1;
++static void tex_prog_bind_uniforms(void) {
++    s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
++    s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
++    s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
++    s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
++    s_uRaw   = p_glGetUniformLocation(s_tex_prog, "u_raw");
++    s_uSemipass = p_glGetUniformLocation(s_tex_prog, "u_semipass");
++    s_uSemimode = p_glGetUniformLocation(s_tex_prog, "u_semimode");
++    s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
++    s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
++    s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
++    s_uEdge     = p_glGetUniformLocation(s_tex_prog, "u_edge");
++    s_uCpersp   = p_glGetUniformLocation(s_tex_prog, "u_cpersp");
++    s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
++    s_tex_uXoff    = p_glGetUniformLocation(s_tex_prog, "u_xoff");
++    s_tex_uXhalf   = p_glGetUniformLocation(s_tex_prog, "u_xhalf");
++    s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
++    s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
++    /* Persistent uniforms: the no-op backdrop scale, the native-wide
++     * projection defaults and the sample-grid shift (see the pipeline init
++     * for why the shift is (0.5 - 1/64) / S). */
++    p_glUseProgram(s_tex_prog);
++    p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
++    p_glUniform1f(s_tex_uXoff, 0.0f);
++    p_glUniform1f(s_tex_uXhalf, 512.0f);
++    p_glUniform1f(p_glGetUniformLocation(s_tex_prog, "u_shift"),
++                  (0.5f - 1.0f / 64.0f) / (float)(s_scale > 0 ? s_scale : 1));
++    p_glUniform1i(s_uEdge, 0);
++}
++static int tex_prog_select(int mode) {
++    if (mode < 0 || mode >= TEX_FILTER_MODES) mode = 0;
++    if (s_tex_prog_failed[mode]) mode = 0;
++    if (s_tex_prog_mode == mode && s_tex_prog) return 1;
++    if (!s_tex_progs[mode]) {
++        char *src = tex_fs_source(mode);
++        if (src) { s_tex_progs[mode] = build_program_ex(TEX_VS, src, 1); free(src); }
++        /* A big variant (MMPX Advanced is ~1000 lines) can take the driver
++         * seconds to compile, on this thread; refresh the starvation
++         * watchdog so a slow compiler is not mistaken for a hung guest. */
++        starvation_watchdog_heartbeat();
++        if (!s_tex_progs[mode]) {
++            fprintf(stdout, "psxrecomp: texture filter mode %d shader failed to build; using nearest\n", mode);
++            s_tex_prog_failed[mode] = 1;
++            if (mode == 0) return 0;
++            return tex_prog_select(0);
++        }
++    }
++    s_tex_prog = s_tex_progs[mode];
++    s_tex_prog_mode = mode;
++    tex_prog_bind_uniforms();
++    return 1;
++}
++
+ /* Quad blit: used for CPU->VRAM upload flushes and VRAM->VRAM copies.
+  * Samples an RGBA8 source (alpha = bit15), splits by STP for the stencil
+  * write, optionally ORs set-mask into the output alpha. */
+@@ -2093,6 +2257,16 @@ void gl_renderer_batch_diag(uint64_t out[8]) {
+  * blended per the PSX mode. Cross-prim order is kept by isolating semi prims to
+  * one per batch (see gpu_textured_triangle), so this batch holds a single prim
+  * whose two passes do not self-overlap. */
++/* Opaque texel passes: no blending, unless this batch edge-blends, in which
++ * case the shader's dual-source factor (1 - coverage, 0 for full texels)
++ * carries the destination - identical output for every fully covered pixel. */
++static int s_tb_edge = 0;
++static void edge_or_no_blend(void) {
++    if (!s_tb_edge) { glDisable(GL_BLEND); return; }
++    glEnable(GL_BLEND);
++    p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
++    p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
++}
+ static void tex_batch_draw_passes(int nverts, int semi) {
+     /* PGXP depth batch: LEQUAL test against the SZ-derived z. Opaque batches
+      * also WRITE depth; blended ones only test (a semi surface must not
+@@ -2107,7 +2281,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+     }
+     p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
+     if (semi < 0) {
+-        glDisable(GL_BLEND);
++        edge_or_no_blend();
+         mask_stencil(s_tb_mask);
+         p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+@@ -2136,7 +2310,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+         if (!s_tb_mask) s_stencil_valid = 0;
+     } else {
+-        glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
++        edge_or_no_blend();                            /* Pass 1: STP=0 texels (opaque) */
+         mask_stencil(s_tb_mask);
+         p_glUniform1i(s_uSemipass, 1);
+         glDrawArrays(GL_TRIANGLES, 0, nverts);
+@@ -2176,6 +2350,7 @@ static void flush_tex_batch(void) {
+     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
+ 
+     hr_begin(1);
++    tex_prog_select(s_tex_filter);          /* the configured mode's program variant */
+     p_glUseProgram(s_tex_prog);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+@@ -2183,6 +2358,8 @@ static void flush_tex_batch(void) {
+     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
+     p_glUniform1i(s_uMaskset, s_tb_mask);
+     p_glUniform1i(s_uFilter, s_tb_filter);
++    s_tb_edge = (s_tex_edge_blend && s_tb_filter != 0) ? 1 : 0;
++    p_glUniform1i(s_uEdge, s_tb_edge);
+     p_glUniform1i(s_uCpersp, gpu_pgxp_color_correction());
+     p_glBindVertexArray(s_tex_vao);
+     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+@@ -2916,10 +3093,11 @@ static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (w
+                                                       need the true scale — the FBO-direct present is
+                                                       unaffected since it never reads gr_scale()) */
+ static void glb_set_texture_filter(int b) {
+-    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear 4=JINC2; the software
++    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear 4=JINC2 5=xBR 6=Scale2x
++     * 7=Scale3x 8=MMPX 9=MMPX Enhanced 10=MMPX Advanced; the software
+      * rasterizer only knows nearest/bilinear — any filtered mode maps to
+      * its bilinear. */
+-    s_tex_filter = (b >= 0 && b <= 4) ? b : (b ? 1 : 0);
++    s_tex_filter = (b >= 0 && b < TEX_FILTER_MODES) ? b : (b ? 1 : 0);
+     sw_set_texture_filter(b != 0);
+ }
+ static int  glb_texture_filter(void) { return s_tex_filter; }
+@@ -3405,7 +3583,9 @@ static int init_gpu_raster(void) {
+     }
+ 
+     s_geo_prog  = build_program(GEO_VS, GEO_FS);
+-    s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
++    s_tex_prog_mode = -1;
++    for (int i = 0; i < TEX_FILTER_MODES; i++) { s_tex_progs[i] = 0; s_tex_prog_failed[i] = 0; }   /* fresh context */
++    if (!tex_prog_select(s_tex_filter)) s_tex_prog = 0;
+     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
+     s_pack_prog = build_program(PACK_VS, PACK_FS);
+     s_stencil_prog = build_program(PACK_VS, STENCIL_FS);
+@@ -3479,18 +3659,7 @@ static int init_gpu_raster(void) {
+         }
+     }
+ 
+-    s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
+-    s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
+-    s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
+-    s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
+-    s_uRaw   = p_glGetUniformLocation(s_tex_prog, "u_raw");
+-    s_uSemipass = p_glGetUniformLocation(s_tex_prog, "u_semipass");
+-    s_uSemimode = p_glGetUniformLocation(s_tex_prog, "u_semimode");
+-    s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
+-    s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
+-    s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
+-    s_uCpersp   = p_glGetUniformLocation(s_tex_prog, "u_cpersp");
+-    s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
++    tex_prog_bind_uniforms();   /* the tex program's locations + persistent uniforms */
+     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
+     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
+     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
+@@ -3501,18 +3670,12 @@ static int init_gpu_raster(void) {
+     s_uStencilSrc = p_glGetUniformLocation(s_stencil_prog, "u_src");
+     s_geo_uXoff  = p_glGetUniformLocation(s_geo_prog, "u_xoff");
+     s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
+-    s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
+-    s_tex_uXhalf = p_glGetUniformLocation(s_tex_prog, "u_xhalf");
+     s_geo_uXscale  = p_glGetUniformLocation(s_geo_prog, "u_xscale");
+     s_geo_uXcenter = p_glGetUniformLocation(s_geo_prog, "u_xcenter");
+-    s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
+-    s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
+     /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
+-     * otherwise zero them, collapsing all x to 0. */
++     * otherwise zero them, collapsing all x to 0. (TEX: tex_prog_bind_uniforms.) */
+     p_glUseProgram(s_geo_prog);
+     p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
+-    p_glUseProgram(s_tex_prog);
+-    p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
+ 
+     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
+      * for the lifetime of the pipeline). Backed off by 1/64 of an HR pixel so
+@@ -3544,10 +3707,7 @@ static int init_gpu_raster(void) {
+          * restore these defaults. */
+         p_glUniform1f(s_geo_uXoff, 0.0f);
+         p_glUniform1f(s_geo_uXhalf, 512.0f);
+-        p_glUseProgram(s_tex_prog);
+-        p_glUniform1f(p_glGetUniformLocation(s_tex_prog, "u_shift"), shift);
+-        p_glUniform1f(s_tex_uXoff, 0.0f);
+-        p_glUniform1f(s_tex_uXhalf, 512.0f);
++        /* TEX: same shift and defaults, applied by tex_prog_bind_uniforms(). */
+         p_glUseProgram(s_blit_prog);
+         p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);
+         if (s_cov_prog) {
+@@ -3802,6 +3962,82 @@ int  gl_renderer_get_fmv_crop(void)            { return s_fmv_crop; }
+ static int s_present_is_fmv = 0;
+ void gl_renderer_set_present_fmv(int is_fmv) { s_present_is_fmv = is_fmv ? 1 : 0; }
+ 
++/* [video] fmv_chroma_smoothing - DuckStation's "Chroma Smoothing for 24-Bit
++ * Display" (video_shadergen.cpp GenerateChromaSmoothingFragmentShader), on
++ * the CPU frame before upload. The MDEC decodes 4:2:0: one Cb/Cr pair per
++ * 2x2 luma block, repeated over the block, which is the colour blockiness
++ * FMVs show at any upscale. Per pixel: keep its own luma, take chroma from
++ * the four 2x2-block averages around it, bilinearly weighted by where the
++ * pixel sits in its block (coeff = 0.25 / 0.75) - a bilinear upsample of the
++ * chroma planes, luma untouched. Same YUV matrices, same clamping, same
++ * even-aligned block grid as DuckStation; only applied to frames the present
++ * marked as FMV. */
++static int s_fmv_chroma = 0;
++void gl_renderer_set_fmv_chroma_smoothing(int on) { s_fmv_chroma = on ? 1 : 0; }
++int  gl_renderer_get_fmv_chroma_smoothing(void)   { return s_fmv_chroma; }
++static uint32_t *s_chroma_buf = NULL;
++static size_t    s_chroma_cap = 0;
++static inline void argb_to_f(uint32_t p, float *r, float *g, float *b) {
++    *r = (float)((p >> 16) & 0xFF) / 255.f;
++    *g = (float)((p >> 8) & 0xFF) / 255.f;
++    *b = (float)(p & 0xFF) / 255.f;
++}
++static inline void chroma_avg2x2(const uint32_t *px, int w, int h, int x, int y,
++                                 float *r, float *g, float *b) {
++    int x1 = x + 1 < w ? x + 1 : w - 1, y1 = y + 1 < h ? y + 1 : h - 1;
++    float ar = 0, ag = 0, ab = 0, tr, tg, tb;
++    argb_to_f(px[y * w + x],   &tr, &tg, &tb); ar += tr; ag += tg; ab += tb;
++    argb_to_f(px[y1 * w + x],  &tr, &tg, &tb); ar += tr; ag += tg; ab += tb;
++    argb_to_f(px[y * w + x1],  &tr, &tg, &tb); ar += tr; ag += tg; ab += tb;
++    argb_to_f(px[y1 * w + x1], &tr, &tg, &tb); ar += tr; ag += tg; ab += tb;
++    *r = ar * 0.25f; *g = ag * 0.25f; *b = ab * 0.25f;
++}
++static const uint32_t *fmv_chroma_smooth(const uint32_t *px, int w, int h) {
++    if (!px || w < 2 || h < 2) return px;
++    size_t need = (size_t)w * (size_t)h;
++    if (need > s_chroma_cap) {
++        uint32_t *nb = (uint32_t *)realloc(s_chroma_buf, need * sizeof(uint32_t));
++        if (!nb) return px;
++        s_chroma_buf = nb; s_chroma_cap = need;
++    }
++    for (int y = 0; y < h; y++) {
++        int by = y - 1;
++        int ly = (by & ~1) > 0 ? (by & ~1) : 0;
++        int hy = ly + 2 < h - 1 ? ly + 2 : h - 1;
++        float cy = (float)(by & 1) * 0.5f + 0.25f;
++        for (int x = 0; x < w; x++) {
++            int bx = x - 1;
++            int lx = (bx & ~1) > 0 ? (bx & ~1) : 0;
++            int hx = lx + 2 < w - 1 ? lx + 2 : w - 1;
++            float cx = (float)(bx & 1) * 0.5f + 0.25f;
++            uint32_t p = px[y * w + x];
++            float pr, pg, pb; argb_to_f(p, &pr, &pg, &pb);
++            float r00, g00, b00, r01, g01, b01, r10, g10, b10, r11, g11, b11;
++            chroma_avg2x2(px, w, h, lx, ly, &r00, &g00, &b00);
++            chroma_avg2x2(px, w, h, lx, hy, &r01, &g01, &b01);
++            chroma_avg2x2(px, w, h, hx, ly, &r10, &g10, &b10);
++            chroma_avg2x2(px, w, h, hx, hy, &r11, &g11, &b11);
++            float sr = (r00 + (r10 - r00) * cx) + ((r01 + (r11 - r01) * cx) - (r00 + (r10 - r00) * cx)) * cy;
++            float sg = (g00 + (g10 - g00) * cx) + ((g01 + (g11 - g01) * cx) - (g00 + (g10 - g00) * cx)) * cy;
++            float sb = (b00 + (b10 - b00) * cx) + ((b01 + (b11 - b01) * cx) - (b00 + (b10 - b00) * cx)) * cy;
++            /* RGBToYUV: luma of the pixel, chroma of the smoothed sample. */
++            float Y = 0.299f * pr + 0.587f * pg + 0.114f * pb;
++            float U = -0.14713f * sr - 0.28886f * sg + 0.436f * sb;
++            float V = 0.615f * sr - 0.51499f * sg - 0.10001f * sb;
++            /* YUVToRGB */
++            float orr = Y + 1.13983f * V;
++            float og  = Y - 0.39465f * U - 0.58060f * V;
++            float ob  = Y + 2.03211f * U;
++            int ir = (int)(orr * 255.f + 0.5f), ig = (int)(og * 255.f + 0.5f), ib = (int)(ob * 255.f + 0.5f);
++            ir = ir < 0 ? 0 : ir > 255 ? 255 : ir;
++            ig = ig < 0 ? 0 : ig > 255 ? 255 : ig;
++            ib = ib < 0 ? 0 : ib > 255 ? 255 : ib;
++            s_chroma_buf[y * w + x] = (p & 0xFF000000u) | ((uint32_t)ir << 16) | ((uint32_t)ig << 8) | (uint32_t)ib;
++        }
++    }
++    return s_chroma_buf;
++}
++
+ /* Letterbox-band removal (part of fmv_crop). Many PS1 movies are authored
+  * wider than 4:3 and padded to the 240-line frame with pure-black rows (GT2:
+  * the Polyphony logo and the intro both have 24 black rows top and bottom). Those
+@@ -3963,7 +4199,8 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+                            : -1;          /* AA off: nearest, no shader work */
+     glViewport(lx, ly, lw, lh);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+-    upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
++    upload_present_tex((is_fmv && s_fmv_chroma) ? fmv_chroma_smooth(pixels, src_w, src_h) : pixels,
++                       src_w, src_h, filt_mode >= 0 ? 1 : 0);
+     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+     present_set_sharp(filt_mode, src_w, src_h, lw, lh);
+     if (fmv_region) {
+diff --git a/runtime/src/gpu_gl_texfilters.h b/runtime/src/gpu_gl_texfilters.h
+new file mode 100644
+index 00000000..76e3d9a8
+--- /dev/null
++++ b/runtime/src/gpu_gl_texfilters.h
+@@ -0,0 +1,1671 @@
++/* Texture-filter fragment-shader blocks ported from DuckStation
++ * (src/core/gpu_hw_shadergen.cpp, GPU_HW_ShaderGen::WriteBatchTextureFilter),
++ * verbatim apart from: (1) the xBR I.w coverage test reading texel I rather
++ * than H (an upstream typo); (2) MMPX's #define src rejoined onto one line;
++ * (3) uint samples compared with a bare 0 spelled 0u (GLSL 3.30).
++ * Each block defines FilteredSampleFromVRAM(texpage, coords, uv_limits,
++ * out texcol, out ialpha) against the HLSL-style names (float4, lerp, frac,
++ * VECTOR_EQ, SampleFromVRAM, packUnorm4x8 ...) that gpu_gl_renderer.c's
++ * TEX_FS_COMPAT maps onto GLSL 3.30. Licences: xBR (C) Hyllian, MIT;
++ * MMPX (C) Morgan McGuire & Mara Gagiu, MIT; MMPX Enhanced/Advanced
++ * (C) crashGG, MIT; Scale2x/3x after scale2x.it. Generated by
++ * tools/port_duckstation_texfilters.py - edit that, not this. */
++#ifndef GPU_GL_TEXFILTERS_H
++#define GPU_GL_TEXFILTERS_H
++/* mode 5: DuckStation xBR */
++static const char *TEXFILTER_XBR_SRC =
++    "CONSTANT int BLEND_NONE = 0;\n"
++    "CONSTANT int BLEND_NORMAL = 1;\n"
++    "CONSTANT int BLEND_DOMINANT = 2;\n"
++    "CONSTANT float LUMINANCE_WEIGHT = 1.0;\n"
++    "CONSTANT float EQUAL_COLOR_TOLERANCE = 0.1176470588235294;\n"
++    "CONSTANT float STEEP_DIRECTION_THRESHOLD = 2.2;\n"
++    "CONSTANT float DOMINANT_DIRECTION_THRESHOLD = 3.6;\n"
++    "CONSTANT float4 w = float4(0.2627, 0.6780, 0.0593, 0.5);\n"
++    "\n"
++    "float DistYCbCr(float4 pixA, float4 pixB)\n"
++    "{\n"
++    "  const float scaleB = 0.5 / (1.0 - w.b);\n"
++    "  const float scaleR = 0.5 / (1.0 - w.r);\n"
++    "  float4 diff = pixA - pixB;\n"
++    "  float Y = dot(diff, w);\n"
++    "  float Cb = scaleB * (diff.b - Y);\n"
++    "  float Cr = scaleR * (diff.r - Y);\n"
++    "\n"
++    "  return sqrt(((LUMINANCE_WEIGHT * Y) * (LUMINANCE_WEIGHT * Y)) + (Cb * Cb) + (Cr * Cr));\n"
++    "}\n"
++    "\n"
++    "bool IsPixEqual(const float4 pixA, const float4 pixB)\n"
++    "{\n"
++    "  return (DistYCbCr(pixA, pixB) < EQUAL_COLOR_TOLERANCE);\n"
++    "}\n"
++    "\n"
++    "float get_left_ratio(float2 center, float2 origin, float2 direction, float2 scale)\n"
++    "{\n"
++    "  float2 P0 = center - origin;\n"
++    "  float2 proj = direction * (dot(P0, direction) / dot(direction, direction));\n"
++    "  float2 distv = P0 - proj;\n"
++    "  float2 orth = float2(-direction.y, direction.x);\n"
++    "  float side = sign(dot(P0, orth));\n"
++    "  float v = side * length(distv * scale);\n"
++    "\n"
++    "//  return step(0, v);\n"
++    "  return smoothstep(-sqrt(2.0)/2.0, sqrt(2.0)/2.0, v);\n"
++    "}\n"
++    "\n"
++    "#define P(coord, xoffs, yoffs) SampleFromVRAM(texpage, coords + float2((xoffs), (yoffs)), uv_limits)\n"
++    "\n"
++    "void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits,\n"
++    "                            out float4 texcol, out float ialpha)\n"
++    "{\n"
++    "  //---------------------------------------\n"
++    "  // Input Pixel Mapping:  -|x|x|x|-\n"
++    "  //                       x|A|B|C|x\n"
++    "  //                       x|D|E|F|x\n"
++    "  //                       x|G|H|I|x\n"
++    "  //                       -|x|x|x|-\n"
++    "\n"
++    "  float2 scale = float2(8.0, 8.0);\n"
++    "  float2 pos = frac(coords.xy) - float2(0.5, 0.5);\n"
++    "  float2 coord = coords.xy - pos;\n"
++    "\n"
++    "  float4 A = P(coord, -1,-1);\n"
++    "  float Aw = A.w;\n"
++    "  A.w = float(VECTOR_NEQ(A, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 B = P(coord,  0,-1);\n"
++    "  float Bw = B.w;\n"
++    "  B.w = float(VECTOR_NEQ(B, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 C = P(coord,  1,-1);\n"
++    "  float Cw = C.w;\n"
++    "  C.w = float(VECTOR_NEQ(C, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 D = P(coord, -1, 0);\n"
++    "  float Dw = D.w;\n"
++    "  D.w = float(VECTOR_NEQ(D, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 E = P(coord, 0, 0);\n"
++    "  float Ew = E.w;\n"
++    "  E.w = float(VECTOR_NEQ(E, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 F = P(coord,  1, 0);\n"
++    "  float Fw = F.w;\n"
++    "  F.w = float(VECTOR_NEQ(F, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 G = P(coord, -1, 1);\n"
++    "  float Gw = G.w;\n"
++    "  G.w = float(VECTOR_NEQ(G, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 H = P(coord,  0, 1);\n"
++    "  float Hw = H.w;\n"
++    "  H.w = float(VECTOR_NEQ(H, TRANSPARENT_PIXEL_COLOR));\n"
++    "  float4 I = P(coord,  1, 1);\n"
++    "  float Iw = I.w;\n"
++    "  I.w = float(VECTOR_NEQ(I, TRANSPARENT_PIXEL_COLOR));\n"
++    "\n"
++    "  // blendResult Mapping: x|y|\n"
++    "  //                      w|z|\n"
++    "  int4 blendResult = int4(BLEND_NONE,BLEND_NONE,BLEND_NONE,BLEND_NONE);\n"
++    "\n"
++    "  // Preprocess corners\n"
++    "  // Pixel Tap Mapping: -|-|-|-|-\n"
++    "  //                    -|-|B|C|-\n"
++    "  //                    -|D|E|F|x\n"
++    "  //                    -|G|H|I|x\n"
++    "  //                    -|-|x|x|-\n"
++    "  if (!((VECTOR_EQ(E,F) && VECTOR_EQ(H,I)) || (VECTOR_EQ(E,H) && VECTOR_EQ(F,I))))\n"
++    "  {\n"
++    "    float dist_H_F = DistYCbCr(G, E) + DistYCbCr(E, C) + DistYCbCr(P(coord, 0,2), I) + DistYCbCr(I, P(coord, 2,0)) + (4.0 * DistYCbCr(H, F));\n"
++    "    float dist_E_I = DistYCbCr(D, H) + DistYCbCr(H, P(coord, 1,2)) + DistYCbCr(B, F) + DistYCbCr(F, P(coord, 2,1)) + (4.0 * DistYCbCr(E, I));\n"
++    "    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_H_F) < dist_E_I;\n"
++    "    blendResult.z = ((dist_H_F < dist_E_I) && VECTOR_NEQ(E,F) && VECTOR_NEQ(E,H)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;\n"
++    "  }\n"
++    "\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|-|-|-|-\n"
++    "  //                    -|A|B|-|-\n"
++    "  //                    x|D|E|F|-\n"
++    "  //                    x|G|H|I|-\n"
++    "  //                    -|x|x|-|-\n"
++    "  if (!((VECTOR_EQ(D,E) && VECTOR_EQ(G,H)) || (VECTOR_EQ(D,G) && VECTOR_EQ(E,H))))\n"
++    "  {\n"
++    "    float dist_G_E = DistYCbCr(P(coord, -2,1)  , D) + DistYCbCr(D, B) + DistYCbCr(P(coord, -1,2), H) + DistYCbCr(H, F) + (4.0 * DistYCbCr(G, E));\n"
++    "    float dist_D_H = DistYCbCr(P(coord, -2,0)  , G) + DistYCbCr(G, P(coord, 0,2)) + DistYCbCr(A, E) + DistYCbCr(E, I) + (4.0 * DistYCbCr(D, H));\n"
++    "    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_D_H) < dist_G_E;\n"
++    "    blendResult.w = ((dist_G_E > dist_D_H) && VECTOR_NEQ(E,D) && VECTOR_NEQ(E,H)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;\n"
++    "  }\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|-|x|x|-\n"
++    "  //                    -|A|B|C|x\n"
++    "  //                    -|D|E|F|x\n"
++    "  //                    -|-|H|I|-\n"
++    "  //                    -|-|-|-|-\n"
++    "  if (!((VECTOR_EQ(B,C) && VECTOR_EQ(E,F)) || (VECTOR_EQ(B,E) && VECTOR_EQ(C,F))))\n"
++    "  {\n"
++    "    float dist_E_C = DistYCbCr(D, B) + DistYCbCr(B, P(coord, 1,-2)) + DistYCbCr(H, F) + DistYCbCr(F, P(coord, 2,-1)) + (4.0 * DistYCbCr(E, C));\n"
++    "    float dist_B_F = DistYCbCr(A, E) + DistYCbCr(E, I) + DistYCbCr(P(coord, 0,-2), C) + DistYCbCr(C, P(coord, 2,0)) + (4.0 * DistYCbCr(B, F));\n"
++    "    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_B_F) < dist_E_C;\n"
++    "    blendResult.y = ((dist_E_C > dist_B_F) && VECTOR_NEQ(E,B) && VECTOR_NEQ(E,F)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;\n"
++    "  }\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|x|x|-|-\n"
++    "  //                    x|A|B|C|-\n"
++    "  //                    x|D|E|F|-\n"
++    "  //                    -|G|H|-|-\n"
++    "  //                    -|-|-|-|-\n"
++    "  if (!((VECTOR_EQ(A,B) && VECTOR_EQ(D,E)) || (VECTOR_EQ(A,D) && VECTOR_EQ(B,E))))\n"
++    "  {\n"
++    "    float dist_D_B = DistYCbCr(P(coord, -2,0), A) + DistYCbCr(A, P(coord, 0,-2)) + DistYCbCr(G, E) + DistYCbCr(E, C) + (4.0 * DistYCbCr(D, B));\n"
++    "    float dist_A_E = DistYCbCr(P(coord, -2,-1), D) + DistYCbCr(D, H) + DistYCbCr(P(coord, -1,-2), B) + DistYCbCr(B, F) + (4.0 * DistYCbCr(A, E));\n"
++    "    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_D_B) < dist_A_E;\n"
++    "    blendResult.x = ((dist_D_B < dist_A_E) && VECTOR_NEQ(E,D) && VECTOR_NEQ(E,B)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;\n"
++    "  }\n"
++    "\n"
++    "  float4 res = E;\n"
++    "  float resW = Ew;\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|-|-|-|-\n"
++    "  //                    -|-|B|C|-\n"
++    "  //                    -|D|E|F|x\n"
++    "  //                    -|G|H|I|x\n"
++    "  //                    -|-|x|x|-\n"
++    "  if(blendResult.z != BLEND_NONE)\n"
++    "  {\n"
++    "    float dist_F_G = DistYCbCr(F, G);\n"
++    "    float dist_H_C = DistYCbCr(H, C);\n"
++    "    bool doLineBlend = (blendResult.z == BLEND_DOMINANT ||\n"
++    "                !((blendResult.y != BLEND_NONE && !IsPixEqual(E, G)) || (blendResult.w != BLEND_NONE && !IsPixEqual(E, C)) ||\n"
++    "                  (IsPixEqual(G, H) && IsPixEqual(H, I) && IsPixEqual(I, F) && IsPixEqual(F, C) && !IsPixEqual(E, I))));\n"
++    "\n"
++    "    float2 origin = float2(0.0, 1.0 / sqrt(2.0));\n"
++    "    float2 direction = float2(1.0, -1.0);\n"
++    "    if(doLineBlend)\n"
++    "    {\n"
++    "      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_F_G <= dist_H_C) && VECTOR_NEQ(E,G) && VECTOR_NEQ(D,G);\n"
++    "      bool haveSteepLine = (STEEP_DIRECTION_THRESHOLD * dist_H_C <= dist_F_G) && VECTOR_NEQ(E,C) && VECTOR_NEQ(B,C);\n"
++    "      origin = haveShallowLine? float2(0.0, 0.25) : float2(0.0, 0.5);\n"
++    "      direction.x += haveShallowLine? 1.0: 0.0;\n"
++    "      direction.y -= haveSteepLine? 1.0: 0.0;\n"
++    "    }\n"
++    "\n"
++    "    float4 blendPix = lerp(H,F, step(DistYCbCr(E, F), DistYCbCr(E, H)));\n"
++    "    float blendW = lerp(Hw,Fw, step(DistYCbCr(E, F), DistYCbCr(E, H)));\n"
++    "    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));\n"
++    "    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));\n"
++    "  }\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|-|-|-|-\n"
++    "  //                    -|A|B|-|-\n"
++    "  //                    x|D|E|F|-\n"
++    "  //                    x|G|H|I|-\n"
++    "  //                    -|x|x|-|-\n"
++    "  if(blendResult.w != BLEND_NONE)\n"
++    "  {\n"
++    "    float dist_H_A = DistYCbCr(H, A);\n"
++    "    float dist_D_I = DistYCbCr(D, I);\n"
++    "    bool doLineBlend = (blendResult.w == BLEND_DOMINANT ||\n"
++    "                !((blendResult.z != BLEND_NONE && !IsPixEqual(E, A)) || (blendResult.x != BLEND_NONE && !IsPixEqual(E, I)) ||\n"
++    "                  (IsPixEqual(A, D) && IsPixEqual(D, G) && IsPixEqual(G, H) && IsPixEqual(H, I) && !IsPixEqual(E, G))));\n"
++    "\n"
++    "    float2 origin = float2(-1.0 / sqrt(2.0), 0.0);\n"
++    "    float2 direction = float2(1.0, 1.0);\n"
++    "    if(doLineBlend)\n"
++    "    {\n"
++    "      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_H_A <= dist_D_I) && VECTOR_NEQ(E,A) && VECTOR_NEQ(B,A);\n"
++    "      bool haveSteepLine  = (STEEP_DIRECTION_THRESHOLD * dist_D_I <= dist_H_A) && VECTOR_NEQ(E,I) && VECTOR_NEQ(F,I);\n"
++    "      origin = haveShallowLine? float2(-0.25, 0.0) : float2(-0.5, 0.0);\n"
++    "      direction.y += haveShallowLine? 1.0: 0.0;\n"
++    "      direction.x += haveSteepLine? 1.0: 0.0;\n"
++    "    }\n"
++    "    origin = origin;\n"
++    "    direction = direction;\n"
++    "\n"
++    "    float4 blendPix = lerp(H,D, step(DistYCbCr(E, D), DistYCbCr(E, H)));\n"
++    "    float blendW = lerp(Hw,Dw, step(DistYCbCr(E, D), DistYCbCr(E, H)));\n"
++    "    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));\n"
++    "    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));\n"
++    "  }\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|-|x|x|-\n"
++    "  //                    -|A|B|C|x\n"
++    "  //                    -|D|E|F|x\n"
++    "  //                    -|-|H|I|-\n"
++    "  //                    -|-|-|-|-\n"
++    "  if(blendResult.y != BLEND_NONE)\n"
++    "  {\n"
++    "    float dist_B_I = DistYCbCr(B, I);\n"
++    "    float dist_F_A = DistYCbCr(F, A);\n"
++    "    bool doLineBlend = (blendResult.y == BLEND_DOMINANT ||\n"
++    "                !((blendResult.x != BLEND_NONE && !IsPixEqual(E, I)) || (blendResult.z != BLEND_NONE && !IsPixEqual(E, A)) ||\n"
++    "                  (IsPixEqual(I, F) && IsPixEqual(F, C) && IsPixEqual(C, B) && IsPixEqual(B, A) && !IsPixEqual(E, C))));\n"
++    "\n"
++    "    float2 origin = float2(1.0 / sqrt(2.0), 0.0);\n"
++    "    float2 direction = float2(-1.0, -1.0);\n"
++    "\n"
++    "    if(doLineBlend)\n"
++    "    {\n"
++    "      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_B_I <= dist_F_A) && VECTOR_NEQ(E,I) && VECTOR_NEQ(H,I);\n"
++    "      bool haveSteepLine  = (STEEP_DIRECTION_THRESHOLD * dist_F_A <= dist_B_I) && VECTOR_NEQ(E,A) && VECTOR_NEQ(D,A);\n"
++    "      origin = haveShallowLine? float2(0.25, 0.0) : float2(0.5, 0.0);\n"
++    "      direction.y -= haveShallowLine? 1.0: 0.0;\n"
++    "      direction.x -= haveSteepLine? 1.0: 0.0;\n"
++    "    }\n"
++    "\n"
++    "    float4 blendPix = lerp(F,B, step(DistYCbCr(E, B), DistYCbCr(E, F)));\n"
++    "    float blendW = lerp(Fw,Bw, step(DistYCbCr(E, B), DistYCbCr(E, F)));\n"
++    "    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));\n"
++    "    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));\n"
++    "  }\n"
++    "\n"
++    "  // Pixel Tap Mapping: -|x|x|-|-\n"
++    "  //                    x|A|B|C|-\n"
++    "  //                    x|D|E|F|-\n"
++    "  //                    -|G|H|-|-\n"
++    "  //                    -|-|-|-|-\n"
++    "  if(blendResult.x != BLEND_NONE)\n"
++    "  {\n"
++    "    float dist_D_C = DistYCbCr(D, C);\n"
++    "    float dist_B_G = DistYCbCr(B, G);\n"
++    "    bool doLineBlend = (blendResult.x == BLEND_DOMINANT ||\n"
++    "                !((blendResult.w != BLEND_NONE && !IsPixEqual(E, C)) || (blendResult.y != BLEND_NONE && !IsPixEqual(E, G)) ||\n"
++    "                  (IsPixEqual(C, B) && IsPixEqual(B, A) && IsPixEqual(A, D) && IsPixEqual(D, G) && !IsPixEqual(E, A))));\n"
++    "\n"
++    "    float2 origin = float2(0.0, -1.0 / sqrt(2.0));\n"
++    "    float2 direction = float2(-1.0, 1.0);\n"
++    "    if(doLineBlend)\n"
++    "    {\n"
++    "      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_D_C <= dist_B_G) && VECTOR_NEQ(E,C) && VECTOR_NEQ(F,C);\n"
++    "      bool haveSteepLine  = (STEEP_DIRECTION_THRESHOLD * dist_B_G <= dist_D_C) && VECTOR_NEQ(E,G) && VECTOR_NEQ(H,G);\n"
++    "      origin = haveShallowLine? float2(0.0, -0.25) : float2(0.0, -0.5);\n"
++    "      direction.x -= haveShallowLine? 1.0: 0.0;\n"
++    "      direction.y += haveSteepLine? 1.0: 0.0;\n"
++    "    }\n"
++    "\n"
++    "    float4 blendPix = lerp(D,B, step(DistYCbCr(E, B), DistYCbCr(E, D)));\n"
++    "    float blendW = lerp(Dw,Bw, step(DistYCbCr(E, B), DistYCbCr(E, D)));\n"
++    "    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));\n"
++    "    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));\n"
++    "  }\n"
++    "\n"
++    "  ialpha = res.w;\n"
++    "  texcol = float4(res.xyz, resW);\n"
++    "\n"
++    "  // Compensate for partially transparent sampling.\n"
++    "  if (ialpha > 0.0)\n"
++    "    texcol.rgb /= float3(ialpha, ialpha, ialpha);\n"
++    "\n"
++    "#if !TEXTURE_ALPHA_BLENDING\n"
++    "  ialpha = (ialpha >= 0.5) ? 1.0 : 0.0;\n"
++    "#endif\n"
++    "}\n"
++    "\n"
++    "#undef P\n"
++    ;
++
++/* mode 6: DuckStation Scale2x */
++static const char *TEXFILTER_SCALE2X_SRC =
++    "#define src(xoffs, yoffs) packUnorm4x8(SampleFromVRAM(texpage, bcoords + float2((xoffs), (yoffs)), uv_limits))\n"
++    "\n"
++    "void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)\n"
++    "{\n"
++    "    float2 bcoords = floor(coords);\n"
++    "\n"
++    "    uint E = src(+0, +0);\n"
++    "    uint B = src(+0, - 1);\n"
++    "    uint D = src(-1, +0);\n"
++    "    uint F = src(+1, +0);\n"
++    "    uint H = src(+0, +1);\n"
++    "\n"
++    "    uint J = (D == B && B != F && D != H) ? D : E;\n"
++    "    uint K = (B == F && D != F && H != F) ? F : E;\n"
++    "    uint L = (H == D && F != D && B != D) ? D : E;\n"
++    "    uint M = (H == F && D != H && B != F) ? F : E;\n"
++    "\n"
++    "    // select quadrant based on fractional part of texture coordinates\n"
++    "    float2 fpart = frac(coords);\n"
++    "    uint res = (fpart.x < 0.5f) ? ((fpart.y < 0.5f) ? J : L) : ((fpart.y < 0.5f) ? K : M);\n"
++    "\n"
++    "    ialpha = float(res != 0u);\n"
++    "    texcol = unpackUnorm4x8(res);\n"
++    "}\n"
++    "\n"
++    "#undef src\n"
++    ;
++
++/* mode 7: DuckStation Scale3x */
++static const char *TEXFILTER_SCALE3X_SRC =
++    "#define src(xoffs, yoffs) packUnorm4x8(SampleFromVRAM(texpage, bcoords + float2((xoffs), (yoffs)), uv_limits))\n"
++    "\n"
++    "void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)\n"
++    "{\n"
++    "    float2 bcoords = floor(coords);\n"
++    "\n"
++    "    uint E = src(+0, +0);\n"
++    "    uint B = src(+0, -1);\n"
++    "    uint D = src(-1, +0);\n"
++    "    uint F = src(+1, +0);\n"
++    "    uint H = src(+0, +1);\n"
++    "\n"
++    "    uint res = E;\n"
++    "    if (B != H && D != F) {\n"
++    "        uint A = src(-1, -1);\n"
++    "        uint C = src(+1, -1);\n"
++    "        uint G = src(-1, +1);\n"
++    "        uint I = src(+1, +1);\n"
++    "\n"
++    "        uint E0 = (D == B) ? D : E;\n"
++    "        uint E1 = (D == B && E != C) || (B == F && E != A) ? B : E;\n"
++    "        uint E2 = (B == F) ? F : E;\n"
++    "        uint E3 = (D == B && E != G) || (D == H && E != A) ? D : E;\n"
++    "        uint E4 = E;\n"
++    "        uint E5 = (B == F && E != I) || (H == F && E != C) ? F : E;\n"
++    "        uint E6 = (D == H) ? D : E;\n"
++    "        uint E7 = (D == H && E != I) || (H == F && E != G) ? H : E;\n"
++    "        uint E8 = (H == F) ? F : E;\n"
++    "\n"
++    "        // select quadrant based on fractional part of texture coordinates\n"
++    "        float2 fpart = frac(coords);\n"
++    "        uint R0, R1, R2;\n"
++    "        if (fpart.y < 0.34f) {\n"
++    "            R0 = E0;\n"
++    "            R1 = E1;\n"
++    "            R2 = E2;\n"
++    "        } else if (fpart.y < 0.67f) {\n"
++    "            R0 = E3;\n"
++    "            R1 = E4;\n"
++    "            R2 = E5;\n"
++    "        } else {\n"
++    "            R0 = E6;\n"
++    "            R1 = E7;\n"
++    "            R2 = E8;\n"
++    "        }\n"
++    "\n"
++    "        res = (fpart.x < 0.34f) ? R0 : ((fpart.x < 0.67f) ? R1 : R2);\n"
++    "    }\n"
++    "\n"
++    "    ialpha = float(res != 0u);\n"
++    "    texcol = unpackUnorm4x8(res);\n"
++    "}\n"
++    "\n"
++    "#undef src\n"
++    ;
++
++/* mode 8: DuckStation MMPX */
++static const char *TEXFILTER_MMPX_SRC =
++    "#define src(xoffs, yoffs) packUnorm4x8(SampleFromVRAM(texpage, bcoords + float2((xoffs), (yoffs)), uv_limits))\n"
++    "\n"
++    "uint luma(uint C) {\n"
++    "    uint alpha = (C & 0xFF000000u) >> 24;\n"
++    "    return (((C & 0x00FF0000u) >> 16) + ((C & 0x0000FF00u) >> 8) + (C & 0x000000FFu) + 1u) * (256u - alpha);\n"
++    "}\n"
++    "\n"
++    "bool all_eq2(uint B, uint A0, uint A1) {\n"
++    "    return ((B ^ A0) | (B ^ A1)) == 0u;\n"
++    "}\n"
++    "\n"
++    "bool all_eq3(uint B, uint A0, uint A1, uint A2) {\n"
++    "    return ((B ^ A0) | (B ^ A1) | (B ^ A2)) == 0u;\n"
++    "}\n"
++    "\n"
++    "bool all_eq4(uint B, uint A0, uint A1, uint A2, uint A3) {\n"
++    "    return ((B ^ A0) | (B ^ A1) | (B ^ A2) | (B ^ A3)) == 0u;\n"
++    "}\n"
++    "\n"
++    "bool any_eq3(uint B, uint A0, uint A1, uint A2) {\n"
++    "    return B == A0 || B == A1 || B == A2;\n"
++    "}\n"
++    "\n"
++    "bool none_eq2(uint B, uint A0, uint A1) {\n"
++    "    return (B != A0) && (B != A1);\n"
++    "}\n"
++    "\n"
++    "bool none_eq4(uint B, uint A0, uint A1, uint A2, uint A3) {\n"
++    "    return B != A0 && B != A1 && B != A2 && B != A3;\n"
++    "}\n"
++    "\n"
++    "void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)\n"
++    "{\n"
++    "  float2 bcoords = floor(coords);\n"
++    "\n"
++    "  uint A = src(-1, -1), B = src(+0, -1), C = src(+1, -1);\n"
++    "  uint D = src(-1, +0), E = src(+0, +0), F = src(+1, +0);\n"
++    "  uint G = src(-1, +1), H = src(+0, +1), I = src(+1, +1);\n"
++    "\n"
++    "  uint J = E, K = E, L = E, M = E;\n"
++    "\n"
++    "  if (((A ^ E) | (B ^ E) | (C ^ E) | (D ^ E) | (F ^ E) | (G ^ E) | (H ^ E) | (I ^ E)) != 0u) {\n"
++    "    uint P = src(+0, -2), S = src(+0, +2);\n"
++    "    uint Q = src(-2, +0), R = src(+2, +0);\n"
++    "    uint Bl = luma(B), Dl = luma(D), El = luma(E), Fl = luma(F), Hl = luma(H);\n"
++    "\n"
++    "    // 1:1 slope rules\n"
++    "    if ((D == B && D != H && D != F) && (El >= Dl || E == A) && any_eq3(E, A, C, G) && ((El < Dl) || A != D || E != P || E != Q)) J = D;\n"
++    "    if ((B == F && B != D && B != H) && (El >= Bl || E == C) && any_eq3(E, A, C, I) && ((El < Bl) || C != B || E != P || E != R)) K = B;\n"
++    "    if ((H == D && H != F && H != B) && (El >= Hl || E == G) && any_eq3(E, A, G, I) && ((El < Hl) || G != H || E != S || E != Q)) L = H;\n"
++    "    if ((F == H && F != B && F != D) && (El >= Fl || E == I) && any_eq3(E, C, G, I) && ((El < Fl) || I != H || E != R || E != S)) M = F;\n"
++    "\n"
++    "    // Intersection rules\n"
++    "    if ((E != F && all_eq4(E, C, I, D, Q) && all_eq2(F, B, H)) && (F != src(+3, +0))) K = M = F;\n"
++    "    if ((E != D && all_eq4(E, A, G, F, R) && all_eq2(D, B, H)) && (D != src(-3, +0))) J = L = D;\n"
++    "    if ((E != H && all_eq4(E, G, I, B, P) && all_eq2(H, D, F)) && (H != src(+0, +3))) L = M = H;\n"
++    "    if ((E != B && all_eq4(E, A, C, H, S) && all_eq2(B, D, F)) && (B != src(+0, -3))) J = K = B;\n"
++    "    if (Bl < El && all_eq4(E, G, H, I, S) && none_eq4(E, A, D, C, F)) J = K = B;\n"
++    "    if (Hl < El && all_eq4(E, A, B, C, P) && none_eq4(E, D, G, I, F)) L = M = H;\n"
++    "    if (Fl < El && all_eq4(E, A, D, G, Q) && none_eq4(E, B, C, I, H)) K = M = F;\n"
++    "    if (Dl < El && all_eq4(E, C, F, I, R) && none_eq4(E, B, A, G, H)) J = L = D;\n"
++    "\n"
++    "    // 2:1 slope rules\n"
++    "    if (H != B) {\n"
++    "      if (H != A && H != E && H != C) {\n"
++    "        if (all_eq3(H, G, F, R) && none_eq2(H, D, src(+2, -1))) L = M;\n"
++    "        if (all_eq3(H, I, D, Q) && none_eq2(H, F, src(-2, -1))) M = L;\n"
++    "      }\n"
++    "\n"
++    "      if (B != I && B != G && B != E) {\n"
++    "        if (all_eq3(B, A, F, R) && none_eq2(B, D, src(+2, +1))) J = K;\n"
++    "        if (all_eq3(B, C, D, Q) && none_eq2(B, F, src(-2, +1))) K = J;\n"
++    "      }\n"
++    "    } // H !== B\n"
++    "\n"
++    "    if (F != D) {\n"
++    "      if (D != I && D != E && D != C) {\n"
++    "        if (all_eq3(D, A, H, S) && none_eq2(D, B, src(+1, +2))) J = L;\n"
++    "        if (all_eq3(D, G, B, P) && none_eq2(D, H, src(+1, -2))) L = J;\n"
++    "      }\n"
++    "\n"
++    "      if (F != E && F != A && F != G) {\n"
++    "        if (all_eq3(F, C, H, S) && none_eq2(F, B, src(-1, +2))) K = M;\n"
++    "        if (all_eq3(F, I, B, P) && none_eq2(F, H, src(-1, -2))) M = K;\n"
++    "      }\n"
++    "    } // F !== D\n"
++    "  } // not constant\n"
++    "\n"
++    "  // select quadrant based on fractional part of texture coordinates\n"
++    "  float2 fpart = frac(coords);\n"
++    "  uint res = (fpart.x < 0.5f) ? ((fpart.y < 0.5f) ? J : L) : ((fpart.y < 0.5f) ? K : M);\n"
++    "\n"
++    "  ialpha = float(res != 0u);\n"
++    "  texcol = unpackUnorm4x8(res);\n"
++    "}\n"
++    "\n"
++    "#undef src\n"
++    ;
++
++/* mode 9: DuckStation MMPXEnhanced */
++static const char *TEXFILTER_MMPX_ENHANCED_SRC =
++    "\n"
++    "    #define srcf(xoffs,yoffs) \\\n"
++    "      SampleFromVRAM(texpage, bcoords + float2(xoffs, yoffs), uv_limits) * \\\n"
++    "      step(abs(bcoords.x + (xoffs) - clamp(bcoords.x + (xoffs), uv_limits.x, uv_limits.z)), 0.001) * \\\n"
++    "      step(abs(bcoords.y + (yoffs) - clamp(bcoords.y + (yoffs), uv_limits.y, uv_limits.w)), 0.001)\n"
++    "\n"
++    "    #define src(xoffs,yoffs) packUnorm4x8(srcf(xoffs,yoffs))\n"
++    "\n"
++    "float luma(float4 col) {\n"
++    "\n"
++    "    //Use CRT-era BT.601 standard.\n"
++    "    return dot(col.rgb, float3(0.299, 0.587, 0.114));\n"
++    "}\n"
++    "\n"
++    "float mixGate(float4 col1, float4 col2) {\n"
++    "\n"
++    "    float4 diff = col1 - col2;\n"
++    "\n"
++    "    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));\n"
++    "\n"
++    "    float dot_diff = dot(diff, diff);\n"
++    "\n"
++    "    float factor = (delta_range * delta_range) * 2.618034;\n"
++    "\n"
++    "    return step(dot_diff, mix(0.75, 0.0, factor));\n"
++    "}\n"
++    "\n"
++    "#define all_eq2(a, b1, b2) (a == b1 && a == b2)\n"
++    "#define all_eq4(a, b1, b2, b3, b4) (a == b1 && a == b2 && a == b3 && a == b4)\n"
++    "#define any_eq2(a, b1, b2) (a == b1 || a == b2)\n"
++    "#define none_eq2(a, b1, b2) !any_eq2(a, b1, b2)\n"
++    "#define none_eq4(a, b1, b2, b3, b4) (a!=b1 && a!=b2 && a!=b3 && a!=b4)\n"
++    "\n"
++    "float4 admixC(float4 vX, float4 vE) {\n"
++    "\n"
++    "    float mixFactor = mixGate(vX, vE) * (-0.381966) + 1.0;\n"
++    "\n"
++    "    return mix(vX,vE,mixFactor);\n"
++    "}\n"
++    "\n"
++    "float4 admixK(float4 vX, float4 vE) {\n"
++    "\n"
++    "    float4 diff = vX - vE;\n"
++    "\n"
++    "    float mixFactor = dot(diff.rgb, diff.rgb) * 0.16666 + 0.5;\n"
++    "\n"
++    "    return mix(vX,vE,mixFactor);\n"
++    "}\n"
++    "\n"
++    "////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\n"
++    "\n"
++    "void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)\n"
++    "{\n"
++    "\n"
++    "    float2 bcoords = floor(coords);\n"
++    "\n"
++    "    float4 vE = SampleFromVRAM(texpage, bcoords, uv_limits);\n"
++    "\n"
++    "    float4 vB = srcf(0.0, -1.0);\n"
++    "    float4 vD = srcf(-1.0, 0.0);\n"
++    "    float4 vF = srcf(+1.0, 0.0);\n"
++    "    float4 vH = srcf(0.0, +1.0);\n"
++    "\n"
++    "    uint E = packUnorm4x8(vE);\n"
++    "    uint B = packUnorm4x8(vB);\n"
++    "    uint D = packUnorm4x8(vD);\n"
++    "    uint F = packUnorm4x8(vF);\n"
++    "    uint H = packUnorm4x8(vH);\n"
++    "\n"
++    "    // default pixel\n"
++    "    ialpha = float(E != 0u);\n"
++    "    texcol = vE;\n"
++    "\n"
++    "bool skiprest = (E == D && E == F) || (E == B && E == H) || (B == H && D == F);\n"
++    "if (!skiprest) {\n"
++    "\n"
++    "    // 5x5\n"
++    "    uint A = src(-1.0, -1.0);\n"
++    "    uint C = src(+1.0, -1.0);\n"
++    "    uint G = src(-1.0, +1.0);\n"
++    "    uint I = src(+1.0, +1.0);\n"
++    "\n"
++    "    uint P  = src( 0.0, -2.0);\n"
++    "    uint Q  = src(-2.0,  0.0);\n"
++    "    uint R  = src(+2.0,  0.0);\n"
++    "    uint S  = src( 0.0, +2.0);\n"
++    "\n"
++    "    uint PA = src(-1.0, -2.0);\n"
++    "    uint PC = src(+1.0, -2.0);\n"
++    "    uint QA = src(-2.0, -1.0);\n"
++    "    uint QG = src(-2.0, +1.0);\n"
++    "    uint RC = src(+2.0, -1.0);\n"
++    "    uint RI = src(+2.0, +1.0);\n"
++    "    uint SG = src(-1.0, +2.0);\n"
++    "    uint SI = src(+1.0, +2.0);\n"
++    "\n"
++    "\n"
++    "    float4 J = vE;    float4 K = vE;    float4 L = vE;    float4 M = vE;\n"
++    "\n"
++    "\n"
++    "    float Bl = luma(vB) + float(B==0u) *2.0;\n"
++    "    float Dl = luma(vD) + float(D==0u) *2.0;\n"
++    "    float El = luma(vE) + float(E==0u) *2.0;\n"
++    "    float Fl = luma(vF) + float(F==0u) *2.0;\n"
++    "    float Hl = luma(vH) + float(H==0u) *2.0;\n"
++    "\n"
++    "    bool slope1 = false;    bool slope2 = false;    bool slope3 = false;    bool slope4 = false;\n"
++    "\n"
++    "// B - D\n"
++    "    if ( E!=B && (D == B && D != H && D != F) && (El >= Dl || E == A && B !=PA && D !=QA) && any_eq2(E, C, G) && ((El < Dl) || A != D || E != P || E != Q)\n"
++    "        ) {\n"
++    "        J=vB;\n"
++    "        slope1 = true;\n"
++    "    }\n"
++    "\n"
++    "// B - F\n"
++    "    if ( E!=B && (B == F && B != D && B != H) && (El >= Bl || E == C && B !=PC && F !=RC) && any_eq2(E, A, I) && ((El < Bl) || C != B || E != P || E != R)\n"
++    "     ) {\n"
++    "        K=vB;\n"
++    "        slope2 = true;\n"
++    "    }\n"
++    "\n"
++    "// D - H\n"
++    "    if ( E!=H && (H == D && H != F && H != B) && (El >= Hl || E == G && D !=QG && H !=SG) && any_eq2(E, A, I) && ((El < Hl) || G != H || E != S || E != Q)\n"
++    "     ) {\n"
++    "        L=vH;\n"
++    "        slope3 = true;\n"
++    "    }\n"
++    "// F - H\n"
++    "    if ( E!=H && (F == H && F != B && F != D) && (El >= Fl || E == I && F !=RI && H !=SI) && any_eq2(E, C, G) && ((El < Fl) || I != H || E != R || E != S)\n"
++    "      ) {\n"
++    "        M=vH;\n"
++    "        slope4 = true;\n"
++    "    }\n"
++    "\n"
++    "//  long gentle 2:1 slope\n"
++    "\n"
++    "if (slope4) { //zone4 long slope\n"
++    "    if (all_eq2(R,F,G) && R != RC && Q != G) L=M;\n"
++    "    // vertical\n"
++    "    if (all_eq2(S,H,C) && S != SG && P != C) K=M;\n"
++    "}\n"
++    "\n"
++    "if (slope3) { //zone3 long slope\n"
++    "    // horizontal\n"
++    "    if (all_eq2(Q,D,I) && Q != QA && R != I) M=L;\n"
++    "    // vertical\n"
++    "    if (all_eq2(S,H,A) && S != SI && A != P) J=L;\n"
++    "}\n"
++    "\n"
++    "if (slope2) { //zone2 long slope\n"
++    "    // horizontal\n"
++    "    if (all_eq2(R,F,A) && R != RI && A != Q) J=K;\n"
++    "    // vertical\n"
++    "    if (all_eq2(P,B,I) && P != PA && I != S) M=K;\n"
++    "}\n"
++    "\n"
++    "if (slope1) { //zone1 long slope\n"
++    "    // horizontal\n"
++    "    if (all_eq2(Q,D,C) && Q != QG && C != R) K=J;\n"
++    "    // vertical\n"
++    "    if (all_eq2(P,B,G) && P != PC && G != S) L=J;\n"
++    "}\n"
++    "\n"
++    "skiprest = skiprest||slope1||slope2||slope3||slope4||E==0u||B==0u||D==0u||F==0u||H==0u;\n"
++    "\n"
++    "/* Concave + Cross type */\n"
++    "\n"
++    "    if (!skiprest && Bl < El && all_eq4(E, G, H, I, S) && none_eq4(E, A, D, C, F)) { J=admixC(vB,J);    K=J;    skiprest = true;}\n"
++    "    if (!skiprest && Hl < El && all_eq4(E, A, B, C, P) && none_eq4(E, D, G, I, F)) { L=admixC(vH,L);    M=L;    skiprest = true;}\n"
++    "    if (!skiprest && Fl < El && all_eq4(E, A, D, G, Q) && none_eq4(E, B, C, I, H)) { K=admixC(vF,K);    M=K;    skiprest = true;}\n"
++    "    if (!skiprest && Dl < El && all_eq4(E, C, F, I, R) && none_eq4(E, B, A, G, H)) { J=admixC(vD,J);    L=J;    skiprest = true;}\n"
++    "\n"
++    "/* K type */\n"
++    "\n"
++    "    if (!skiprest && (E != F && all_eq4(E, C, I, D, Q) && all_eq2(F, B, H)) && (F != src(+3.0, +0.0))) {K=admixK(vF,K); M=K;skiprest=true;}    // RIGHT\n"
++    "    if (!skiprest && (E != D && all_eq4(E, A, G, F, R) && all_eq2(D, B, H)) && (D != src(-3.0, +0.0))) {J=admixK(vD,J); L=J;skiprest=true;}    // LEFT\n"
++    "    if (!skiprest && (E != H && all_eq4(E, G, I, B, P) && all_eq2(H, D, F)) && (H != src(+0.0, +3.0))) {L=admixK(vH,L); M=L;skiprest=true;}    // BOTTOM\n"
++    "    if (!skiprest && (E != B && all_eq4(E, A, C, H, S) && all_eq2(B, D, F)) && (B != src(+0.0, -3.0))) {J=admixK(vB,J); K=J;}                // TOP\n"
++    "\n"
++    "    //final write\n"
++    "    float2 fpart = frac(coords);\n"
++    "\n"
++    "    float4 res = (fpart.x < 0.5) ? ((fpart.y < 0.5) ? J : L) : ((fpart.y < 0.5) ? K : M);\n"
++    "\n"
++    "    ialpha = step(0.002, res.r+res.g+res.b+res.a);\n"
++    "    texcol = res;\n"
++    "}\n"
++    "    \n"
++    "}\n"
++    "\n"
++    "#undef src\n"
++    "#undef srcf\n"
++    "#undef all_eq2\n"
++    "#undef all_eq4\n"
++    "#undef any_eq2\n"
++    "#undef none_eq2\n"
++    "#undef none_eq4\n"
++    ;
++
++/* mode 10: DuckStation MMPXAdvanced */
++static const char *TEXFILTER_MMPX_ADVANCED_SRC =
++    "\n"
++    "    #define srcf(xoffs,yoffs) \\\n"
++    "      SampleFromVRAM(texpage, bcoords + float2(xoffs, yoffs), uv_limits) * \\\n"
++    "      step(abs(bcoords.x + (xoffs) - clamp(bcoords.x + (xoffs), uv_limits.x, uv_limits.z)), 0.001) * \\\n"
++    "      step(abs(bcoords.y + (yoffs) - clamp(bcoords.y + (yoffs), uv_limits.y, uv_limits.w)), 0.001)\n"
++    "\n"
++    "    #define src(xoffs,yoffs) packUnorm4x8(srcf(xoffs,yoffs))\n"
++    "\n"
++    "//RGB visual weight + alpha bias\n"
++    "float luma(float4 col) {\n"
++    "\n"
++    "    //Use CRT-era BT.601 standard. Clamp range to [0.0 - 0.999]\n"
++    "    return min(dot(col.rgb, float3(0.299, 0.587, 0.114)), 0.999);\n"
++    "}\n"
++    "\n"
++    "/* Constant Descriptions:\n"
++    " * 0.145898    : (~0.382) ^2\n"
++    " * 0.8541      : 1.0 -(~0.382) ^2\n"
++    " * 0.0638587   : (RGB Euclidean distance scaled by ~0.382 twice) ^2\n"
++    " * 0.75        : (RGB Euclidean distance scaled by  0.500) ^2\n"
++    " */\n"
++    "\n"
++    "// duck calculation: dot(diff,diff) directly incorporates alpha channel  //duck.alpha\n"
++    "// Note: Transparent duck pixels are determined outside sim and mixFactor functions\n"
++    "\n"
++    "bool simb(float4 col1, float4 col2) {\n"
++    "\n"
++    "    float4 diff = col1 - col2;\n"
++    "\n"
++    "    // RGB color difference range (max_diff - min_diff)\n"
++    "    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));\n"
++    "\n"
++    "    float dot_diff = dot(diff, diff);\n"
++    "\n"
++    "    // Equivalent to (delta_range / 0.145898 )^2\n"
++    "    float factor = (delta_range * delta_range) * 46.9787;\n"
++    "\n"
++    "    return dot_diff < mix(0.0638587, 0.0, factor);\n"
++    "}\n"
++    "\n"
++    "bool sim(float4 col1, float4 col2) {\n"
++    "\n"
++    "    float4 diff = col1 - col2;\n"
++    "\n"
++    "    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));\n"
++    "\n"
++    "    float dot_diff = dot(diff, diff);\n"
++    "\n"
++    "    // Equivalent to (delta_range / 0.382 )^2\n"
++    "    float factor = (delta_range * delta_range) * 6.8541;\n"
++    "\n"
++    "    return dot_diff < mix(0.0638587, 0.0, factor);\n"
++    "}\n"
++    "\n"
++    "float mixGate(float4 col1, float4 col2) {\n"
++    "\n"
++    "    float4 diff = col1 - col2;\n"
++    "\n"
++    "    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));\n"
++    "\n"
++    "    float dot_diff = dot(diff, diff);\n"
++    "\n"
++    "    // Equivalent to (delta_range / 0.618 )^2\n"
++    "    float factor = (delta_range * delta_range) * 2.618034;\n"
++    "\n"
++    "    return step(dot_diff, mix(0.75, 0.0, factor));\n"
++    "}\n"
++    "\n"
++    "#define eq(a,b) (a==b)\n"
++    "\n"
++    "#define neq(a,b) (a!=b)\n"
++    "\n"
++    "#define all_eq2(a, b1, b2) \\\n"
++    "    ( eq(a,b1) && eq(a,b2))\n"
++    "\n"
++    "#define all_eq3(a, b1, b2, b3) \\\n"
++    "    ( eq(a,b1) && eq(a,b2) && eq(a,b3))\n"
++    "\n"
++    "#define all_eq4(a, b1, b2, b3, b4) \\\n"
++    "    ( eq(a,b1) && eq(a,b2) && eq(a,b3) && eq(a,b4))\n"
++    "\n"
++    "#define any_eq2(a, b1, b2) (eq(a,b1)||eq(a,b2))\n"
++    "#define any_eq3(a, b1, b2, b3) (eq(a,b1)||eq(a,b2)||eq(a,b3))\n"
++    "#define none_eq2(a, b1, b2) !any_eq2(a, b1, b2)\n"
++    "\n"
++    "\n"
++    "// Debug Hooks\n"
++    "//#define testcolor float4(1.0, 0.0, 1.0, 1.0)  // Magenta\n"
++    "//#define testcolor2 float4(0.0, 1.0, 1.0, 1.0)  // Cyan\n"
++    "//#define testcolor3 float4(1.0, 1.0, 0.0, 1.0)  // Yellow\n"
++    "//#define testcolor4 float4(1.0, 1.0, 1.0, 1.0)  // White\n"
++    "#define slopOFF float4(2.0, 2.0, 2.0, 2.0)\n"
++    "#define slopeBAD float4(4.0, 4.0, 4.0, 4.0)\n"
++    "#define theEXIT float4(8.0, 8.0, 8.0, 8.0)\n"
++    "\n"
++    "#define mixXE mix(vX,vE,mixFactor)\n"
++    "#define mixXEoff mixXE+slopOFF\n"
++    "#define Xoff vX+slopOFF\n"
++    "\n"
++    "#if GLSL\n"
++    "\n"
++    "    #define checkblack(col) all(lessThan((col).rgb, float3(0.1, 0.078, 0.1)))\n"
++    "    #define checkwhite(col) all(greaterThan((col).rgb, float3(0.92, 0.92, 0.92)))\n"
++    "\n"
++    "#else\n"
++    "\n"
++    "    #define checkblack(col) all((col).rgb < float3(0.1, 0.078, 0.1))\n"
++    "    #define checkwhite(col) all((col).rgb > float3(0.92, 0.92, 0.92))\n"
++    "\n"
++    "#endif\n"
++    "\n"
++    "float4 admixC(float4 vX, float4 vE) {\n"
++    "\n"
++    "    float mixFactor = mixGate(vX, vE) * (-0.381966) + 1.0;\n"
++    "\n"
++    "    return mixXE;\n"
++    "}\n"
++    "\n"
++    "float4 admixK(float4 vX, float4 vE) {\n"
++    "\n"
++    "    float4 diff = vX - vE;\n"
++    "\n"
++    "    float mixFactor = dot(diff.rgb, diff.rgb) * 0.16666 + 0.5;    // xxx.alpha\n"
++    "\n"
++    "    return mixXE;\n"
++    "}\n"
++    "\n"
++    "float4 admixL(float4 vE, float4 vX) {\n"
++    "\n"
++    "    float mixFactor = 0.381966 * mixGate(vX,vE) * step(0.002,vE.r+vE.g+vE.b+vE.a); // xxx.alpha.duck\n"
++    "\n"
++    "    return mixXE;\n"
++    "}\n"
++    "\n"
++    "//**************************************************************************************************************************************\n"
++    "//*                                                 main slope + X cross-processing mechanism                                        *\n"
++    "//******************************************************************************************************************************** zz  *\n"
++    "float4 admixX( uint A, uint B, uint C, uint D, uint E, uint F, uint G, uint H, uint I\n"
++    "          , uint P, uint PA, uint PC, uint Q, uint QA, uint QG, uint R, uint RC, uint RI, uint S, uint SG, uint SI, uint AA, uint CC, uint GG\n"
++    "          , float El, float Bl, float Dl, float Fl, float Hl\n"
++    "          , float4 vE, float4 vB, float4 vD, float4 vC, float4 vG\n"
++    "          ) {\n"
++    "\n"
++    "\n"
++    "    bool eq_B_C = eq(B,C);\n"
++    "    bool eq_D_G = eq(D,G);\n"
++    "\n"
++    "    if (eq_B_C && eq_D_G) return slopeBAD;\n"
++    "\n"
++    "\n"
++    "    //Pre-declare\n"
++    "    bool eq_B_P;        bool eq_B_PA;        bool eq_B_PC;\n"
++    "    bool eq_D_Q;        bool eq_D_QA;        bool eq_D_QG;\n"
++    "    bool eq_E_F;        bool eq_E_H;        bool eq_A_AA;\n"
++    "\n"
++    "    float4 vX;\n"
++    "    float mixFactor;\n"
++    "\n"
++    "    bool eq_E_C = eq(E,C);\n"
++    "    bool eq_E_G = eq(E,G);\n"
++    "    bool eq_A_P = eq(A,P);\n"
++    "    bool eq_A_Q = eq(A,Q);\n"
++    "    bool comboE3 = eq_E_C && eq_E_G;\n"
++    "    bool comboA3 = eq_A_P && eq_A_Q;\n"
++    "\n"
++    "    // remove the alpha weighting first ,to avoid jagged edges when E is fully transparent and interacts with black and gray.\n"
++    "    // xxx.alpha.duck\n"
++    "    Bl = fract(Bl);\n"
++    "    Dl = fract(Dl);\n"
++    "    El = fract(El);\n"
++    "    Fl = fract(Fl);\n"
++    "    Hl = fract(Hl);\n"
++    "\n"
++    "//* =========================================\n"
++    "//*                    B != D\n"
++    "//* ==================================== zz =\n"
++    "if (neq(B,D)){\n"
++    "\n"
++    "    if (eq(E,A)) return slopeBAD;\n"
++    "\n"
++    "    float diffBD = abs(Bl-Dl);\n"
++    "    if (diffBD > El-Bl || diffBD > El-Dl) return slopeBAD;\n"
++    "\n"
++    "\n"
++    "    vX = mix(vB, vD, 0.5);\n"
++    "\n"
++    "    mixFactor = 0.381966 * mixGate(vX,vE) * float(E!=0u);\n"
++    "\n"
++    "    eq_B_PC = eq(B,PC);\n"
++    "    eq_D_QG = eq(D,QG);\n"
++    " \n"
++    "    if (none_eq2(A,B,D)){\n"
++    "        if (comboA3) return mixXEoff;\n"
++    "        if ( eq_A_P && eq_B_PC && !eq_B_C ) return mixXEoff;\n"
++    "        if ( eq_A_Q && eq_D_QG && !eq_D_G ) return mixXEoff;\n"
++    "\n"
++    "        if ( eq_A_P && eq_E_G ) return mixXEoff;\n"
++    "        if ( eq_A_Q && eq_E_C ) return mixXEoff;\n"
++    "\n"
++    "        if ( eq_E_C && eq_D_G ) return mixXEoff;\n"
++    "        if ( eq_E_G && eq_B_C ) return mixXEoff;\n"
++    "\n"
++    "}\n"
++    "    if ( comboE3 ) return mixXEoff;\n"
++    "\n"
++    "    if ( eq_E_C && eq_B_PC && neq(B,P)) return mixXEoff;\n"
++    "    if ( eq_E_G && eq_D_QG && neq(D,Q)) return mixXEoff;\n"
++    "\n"
++    "    eq_E_F = eq(E,F);\n"
++    "\n"
++    "    if (eq(F,H)) {\n"
++    "\n"
++    "        if ( eq_E_C && !eq_D_G && (!eq_E_F||neq(E,P)) ) return mixXEoff;\n"
++    "        if ( eq_E_G && !eq_B_C && (!eq_E_F||neq(E,Q)) ) return mixXEoff;\n"
++    "\n"
++    "        if ( !eq_E_F && eq_B_PC && eq(F,RC) ) return mixXEoff;\n"
++    "        if ( !eq_E_F && eq_D_QG && eq(H,SG) ) return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "    return slopeBAD;\n"
++    "} //* B != D\n"
++    "\n"
++    "\n"
++    "                        //*********  B == D  *********\n"
++    "\n"
++    "    bool Xisblack = checkblack(vB);\n"
++    "    if ( Xisblack && El >0.5 && (Fl<0.078 || Hl<0.078) ) return theEXIT;\n"
++    "\n"
++    "    vX = vB;\n"
++    "\n"
++    "    mixFactor = 0.381966 * mixGate(vX,vE) * float(E!=0u);\n"
++    "\n"
++    "    bool B_slope;    bool B_tower;    bool B_wall;\n"
++    "    bool D_slope;    bool D_tower;    bool D_wall;\n"
++    "    bool En3;\n"
++    "    #define En4square En3&&eq(E,I)\n"
++    "\n"
++    "//* ===================================================\n"
++    "//*                   E - A  x cross\n"
++    "//* =========================================== zz ====\n"
++    "if (eq(E,A)) {\n"
++    "\n"
++    "\n"
++    "    eq_E_F = eq(E,F);\n"
++    "    eq_E_H = eq(E,H);\n"
++    "\n"
++    "    bool Eisblack = checkblack(vE);\n"
++    "\n"
++    "    if ( comboE3 && !eq_E_F && !eq_E_H && eq(E,I) ) {\n"
++    "\n"
++    "        if (Eisblack) return theEXIT;\n"
++    "        mixFactor = 0.618034 * (1.0 - mixFactor);\n"
++    "        return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "    eq_A_AA = eq(A,AA);\n"
++    "\n"
++    "    if ( comboA3 && eq_A_AA && none_eq2(A,PA,QA) )  {\n"
++    "        if (Eisblack) return theEXIT;\n"
++    "        mixFactor = 0.618034 * (1.0 - mixFactor);\n"
++    "        if ( neq(B,PA) && eq(PA,QA) ) return mixXEoff;\n"
++    "        mixFactor += 0.236068;\n"
++    "        return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "    eq_B_PC = eq(B,PC);\n"
++    "    eq_B_PA = eq(B,PA);\n"
++    "    eq_D_QG = eq(D,QG);\n"
++    "    eq_D_QA = eq(D,QA);\n"
++    "\n"
++    "\n"
++    "    if ( comboE3 && comboA3 &&\n"
++    "        (eq_B_PC || eq_D_QG) && eq_D_QA && eq_B_PA) {\n"
++    "        mixFactor = mixFactor * (-0.618034) + 0.8541;\n"
++    "        mixFactor = max(mixFactor, float(E==0u));    // xxx.alpha.duck\n"
++    "        return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "\n"
++    "    if ( comboE3 && eq_A_P\n"
++    "         && eq_B_PA && eq_D_QA && eq_D_QG\n"
++    "         && eq_E_H\n"
++    "        ) {\n"
++    "        mixFactor = mixFactor * (-0.618034) + 0.8541;\n"
++    "        mixFactor = max(mixFactor, float(E==0u));    // xxx.alpha.duck\n"
++    "        return mixXEoff;\n"
++    "        }\n"
++    "\n"
++    "    if ( comboE3 && eq_A_Q\n"
++    "         && eq_B_PA && eq_D_QA && eq_B_PC\n"
++    "         && eq_E_F\n"
++    "        ) {\n"
++    "        mixFactor = mixFactor * (-0.618034) + 0.8541;\n"
++    "        mixFactor = max(mixFactor, float(E==0u));    // xxx.alpha.duck\n"
++    "        return mixXEoff;\n"
++    "        }\n"
++    "\n"
++    "\n"
++    "    if (comboA3) return Xoff;\n"
++    "\n"
++    "    if (comboE3) return mixXEoff;\n"
++    "\n"
++    "    eq_B_P = eq(B, P);\n"
++    "    eq_D_Q = eq(D, Q);\n"
++    "\n"
++    "    B_slope = eq_B_PC && !eq_B_P && !eq_B_C && !eq_B_PA;\n"
++    "    D_slope = eq_D_QG && !eq_D_Q && !eq_D_G && !eq_D_QA;\n"
++    "\n"
++    "    B_wall = eq_B_C && !eq_B_PC && !eq_B_P;\n"
++    "    D_wall = eq_D_G && !eq_D_QG && !eq_D_Q;\n"
++    "    \n"
++    "    B_tower = eq_B_P && !eq_B_PC && !eq_B_C && !eq_B_PA;\n"
++    "    D_tower = eq_D_Q && !eq_D_QG && !eq_D_G && !eq_D_QA;\n"
++    "\n"
++    "    if ( B_slope && eq_E_G ) return mixXEoff;\n"
++    "    if ( D_slope && eq_E_C ) return mixXEoff;\n"
++    "\n"
++    "\n"
++    "//* E B D Region Checkerboard Scoring Rule\n"
++    "\n"
++    "    float scoreE = 0.0; float scoreB = 0.0; float scoreD = 0.0; float scoreZ = 0.0;\n"
++    "\n"
++    "//*    E Zone\n"
++    "    if (eq_E_C) {\n"
++    "        scoreE += 1.0 +float(eq(F,H)) +float(B_slope);\n"
++    "        scoreE -= float(all_eq2(E,P,PC)&&!D_wall);\n"
++    "    }\n"
++    "\n"
++    "    if (eq_E_G) {\n"
++    "        scoreE += 1.0 +float(eq(F,H)) +float(D_slope);\n"
++    "        scoreE -= float(all_eq2(E,Q,QG)&&!B_wall);\n"
++    "    }\n"
++    "\n"
++    "    scoreE += float(B_slope && eq_A_Q || D_slope && eq_A_P);\n"
++    "\n"
++    "    En3 = eq_E_F && eq_E_H;\n"
++    "\n"
++    "    if ( scoreE<0.01 && mixFactor<0.01 && En4square && eq(E,S)==eq(E,SI) && eq(E,R)==eq(E,RI) ) return theEXIT;\n"
++    "\n"
++    "\n"
++    "    if ( scoreE<0.01 && !En3 && neq(E,I) ) {\n"
++    "        if ( B_wall && eq_E_F ) return theEXIT;\n"
++    "        if ( D_wall && eq_E_H ) return theEXIT;\n"
++    "    }\n"
++    "\n"
++    "    if (E==0u && !Xisblack) return vX;    // xxx.alpha.duck\n"
++    "\n"
++    "    scoreE += float(B_slope && eq_A_P || D_slope && eq_A_Q);\n"
++    "\n"
++    "    if ( !En3 && eq(F,H) ) {\n"
++    "        if (Eisblack) return slopeBAD;\n"
++    "\n"
++    "        bool condZ1 = B_wall && (eq(F,R) || eq(F,RC) || eq(G,H) || eq(F,I));\n"
++    "        bool condZ2 = D_wall && (eq(C,F) || eq(H,SG) || eq(H,S) || eq(F,I));\n"
++    "        scoreZ = float(condZ1 || condZ2);\n"
++    "    }\n"
++    "\n"
++    "\n"
++    "//*    B Zone\n"
++    "\n"
++    "    if (eq_B_PA) {\n"
++    "        scoreB -= 1.0 +float(eq(P,C)) +float(eq_A_AA);\n"
++    "    }\n"
++    "\n"
++    "    if (eq(P,C)){\n"
++    "        scoreB -= float(eq_A_AA);\n"
++    "        scoreZ *= float(scoreE < 0.01);\n"
++    "    }\n"
++    "\n"
++    "//*  D Zone\n"
++    "\n"
++    "    if (eq_D_QA) {\n"
++    "        scoreD -= 1.0 +float(eq(G,Q)) +float(eq_A_AA);\n"
++    "    }\n"
++    "\n"
++    "    if (eq(G,Q)){\n"
++    "        scoreD -= float(eq_A_AA);\n"
++    "        scoreZ *= float(scoreE < 0.01);\n"
++    "    }\n"
++    "\n"
++    "    float scoreFinal = scoreE + scoreB + scoreD + scoreZ ;\n"
++    "\n"
++    "    scoreFinal += float(min(scoreB,scoreD) > -0.01 && (B_wall && D_tower || B_tower && D_wall)) *2.0;\n"
++    "\n"
++    "    mixFactor *= (1.0 - step(1.99, scoreFinal));\n"
++    "    return mixXE + slopeBAD*(1.0 - step(0.99, scoreFinal));\n"
++    "\n"
++    "}    //* E == A\n"
++    "\n"
++    "\n"
++    "//* ===============================================\n"
++    "//*                  E - C - G     main rules\n"
++    "//* ========================================= zz ==\n"
++    "\n"
++    "    if (eq_E_C ) {\n"
++    "        if (comboA3) return vX;\n"
++    "        if (comboE3) return mixXE;\n"
++    "        if (all_eq2(B,A,PA) && all_eq3(E,F,P,PC)) return theEXIT;\n"
++    "        return mixXE;\n"
++    "    }\n"
++    "\n"
++    "    if (eq_E_G) {\n"
++    "        if (comboA3) return vX;\n"
++    "        if (comboE3) return mixXE;\n"
++    "        if (all_eq2(D,A,QA) && all_eq3(E,H,Q,QG)) return theEXIT;\n"
++    "        return mixXE;\n"
++    "    }\n"
++    "\n"
++    "    if (E==0u) return theEXIT;        // xxx.alpha\n"
++    "\n"
++    "//* =======================================================\n"
++    "//*                  F - H / B+ D+ Extended Rules\n"
++    "//* ================================================= zz ==\n"
++    "\n"
++    "\n"
++    "    bool eq_A_B = eq(A,B);\n"
++    "    bool eq_F_H = eq(F,H);\n"
++    "\n"
++    "    eq_B_P  = eq(B,P);\n"
++    "    eq_B_PC = eq(B,PC);\n"
++    "    eq_B_PA = eq(B,PA);\n"
++    "    eq_D_Q  = eq(D,Q);\n"
++    "    eq_D_QG = eq(D,QG);\n"
++    "    eq_D_QA = eq(D,QA);\n"
++    "\n"
++    "    B_slope = eq_B_PC && !eq_B_P && !eq_B_C;\n"
++    "    D_slope = eq_D_QG && !eq_D_Q && !eq_D_G;\n"
++    "    B_tower = eq_B_P && !eq_B_PC && !eq_B_C && !eq_B_PA;\n"
++    "    D_tower = eq_D_Q && !eq_D_QG && !eq_D_G && !eq_D_QA;\n"
++    "    B_wall = eq_B_C && !eq_B_PC && !eq_B_P;\n"
++    "    D_wall = eq_D_G && !eq_D_QG && !eq_D_Q;\n"
++    "\n"
++    "\n"
++    "    if (!eq_A_B) {\n"
++    "\n"
++    "        if (comboA3) return Xoff;\n"
++    "\n"
++    "        if ( (B_slope||B_tower) && (D_slope||D_tower) ) return Xoff;\n"
++    "\n"
++    "        if ( B_slope && eq_A_P ) return mixXEoff;\n"
++    "        if ( D_slope && eq_A_Q ) return mixXEoff;\n"
++    "\n"
++    "        if ( (B_slope || D_slope) && eq_F_H ) return mixXEoff;\n"
++    "\n"
++    "        if ( B_slope && eq(H,SG) ) return mixXEoff;\n"
++    "        if ( D_slope && eq(F,RC) ) return mixXEoff;\n"
++    "\n"
++    "        if ( B_slope && eq_A_Q && eq(Q,QG) ) return mixXEoff;\n"
++    "        if ( D_slope && eq_A_P && eq(P,PC) ) return mixXEoff;\n"
++    "\n"
++    "    }\n"
++    "\n"
++    "    bool sim_EC = E!=0u && C!=0u && sim(vE, vC);    // xxx.alpha.duck\n"
++    "    bool sim_EG = E!=0u && G!=0u && sim(vE, vG);    // xxx.alpha.duck\n"
++    "\n"
++    "    float E_lumDiff = mix(0.381966, 0.145898, max((El - 0.8541),0.0) * 6.8541);\n"
++    "\n"
++    "    if ( mixFactor<0.01 && !sim_EC && !sim_EG && neq(E,I) && abs(El-Fl)>E_lumDiff && abs(El-Hl)>E_lumDiff ) return slopeBAD;\n"
++    "\n"
++    "\n"
++    "    eq_E_F = eq(E,F);\n"
++    "    eq_E_H = eq(E,H);\n"
++    "\n"
++    "    if ( eq_B_C && eq_D_Q ) {\n"
++    "        if ( eq(P,PC) && eq(A,QA) && !eq_D_QG && eq_E_F && !eq_E_H && eq(H,I)) return theEXIT;\n"
++    "        if ( eq_A_B ) return slopeBAD;\n"
++    "        if ( B_wall && D_tower && eq_E_F) return vX;\n"
++    "        return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "    if ( eq(D,G) && eq(B,P)) {\n"
++    "        if ( eq(Q,QG) && eq(A,PA) && !eq_B_PC && eq_E_H && !eq_E_F && eq(F,I)) return theEXIT;\n"
++    "        if ( eq_A_B ) return slopeBAD;\n"
++    "        if ( B_tower && D_wall && eq_E_H) return vX;\n"
++    "        return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "\n"
++    "    En3 = eq_E_F && eq_E_H;\n"
++    "\n"
++    "    if ( En4square ) {\n"
++    "        if ( ( eq_B_C || eq_D_G) && eq_A_B) return theEXIT;\n"
++    "        if ( ( eq_B_C || eq_D_G || mixFactor<0.01) && (eq(E,S) == eq(E, SI) && eq(E,R) == eq(E, RI)) ) return theEXIT;\n"
++    "        return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "    if (!eq_B_C && !eq_D_G ) {\n"
++    "        if ( comboA3 && eq_F_H ) return Xoff;\n"
++    "\n"
++    "        if ( comboA3&&eq_B_PC&&eq(C,CC) ) return Xoff;\n"
++    "        if ( comboA3&&eq_D_QG&&eq(G,GG) ) return Xoff;\n"
++    "\n"
++    "        if ( !eq_B_P && !eq_B_PC && !eq_D_Q && !eq_D_QG && !En3 ) return slopeBAD;\n"
++    "\n"
++    "        if (eq_A_Q&&sim_EC) return mixXEoff;\n"
++    "        if (eq_A_P&&sim_EG) return mixXEoff;\n"
++    "        if (sim_EC&&sim_EG ) return mixXEoff;\n"
++    "    }\n"
++    "\n"
++    "     if ( En3 && eq_A_B) return theEXIT;\n"
++    "\n"
++    "    if (eq_F_H) {\n"
++    "\n"
++    "        if ( eq_B_PC&&eq(F,RC) || eq_D_QG&&eq(H,SG) ) return mixXEoff;\n"
++    "\n"
++    "        if (eq_A_B) return slopeBAD;\n"
++    "\n"
++    "        if ( eq_B_C || eq_D_G) return mixXEoff;\n"
++    "        if ( eq_B_PC || eq_D_QG) return mixXEoff;\n"
++    "\n"
++    "    }\n"
++    "\n"
++    "    return slopeBAD;\n"
++    "\n"
++    "}    //* admixX\n"
++    "\n"
++    "\n"
++    "float4 admixS( uint A, uint B, uint C, uint D, uint E, uint F, uint G, uint H, uint I\n"
++    "           , uint R, uint RC, uint RI, uint S, uint SG, uint SI, uint II, uint CC\n"
++    "           , float4 vE, float4 vF, float4 vC\n"
++    "           ) {\n"
++    "\n"
++    "\n"
++    "\n"
++    "    if (any_eq2(F,C,I)) return vE;\n"
++    "\n"
++    "    if ( (eq(F,RI) || eq(G,S) || eq(R, RI)) && neq(R,I) ) return vE;\n"
++    "\n"
++    "    if (eq(H, S) && none_eq2(H,I,SG)) return vE;\n"
++    "\n"
++    "    if ( eq(R, RC) || eq(G,SG) ) return vE;\n"
++    "\n"
++    "    if ( checkwhite(vE) && all_eq2(E,C,D) && none_eq2(E,RC,CC)) return vE;\n"
++    "\n"
++    "\n"
++    "    #define vX vF\n"
++    "    float mixFactor = 0.381966 * mixGate(vX,vE) * float(E!=0u);    // xxx.alpha.duck\n"
++    "\n"
++    "    if ( eq(E,C) && (eq(E,D)||eq(B,D)) ) return mixXE;\n"
++    "\n"
++    "    bool sim_E_C = E!=0u && E!=0u && sim(vE,vC);    // xxx.alpha.duck\n"
++    "\n"
++    "    if ( sim_E_C && eq(E,D) && eq(B,C) ) return mixXE;\n"
++    "\n"
++    "    if ( (sim_E_C || mixFactor>0.01) && all_eq2(B,C,D) ) return mixXE;\n"
++    "\n"
++    "    return vE;\n"
++    "}\n"
++    "void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)\n"
++    "{\n"
++    "\n"
++    "  float2 bcoords = floor(coords);\n"
++    "\n"
++    "    float4 vE = SampleFromVRAM(texpage, bcoords, uv_limits);\n"
++    "\n"
++    "    float4 vB = srcf(0.0, -1.0);\n"
++    "    float4 vD = srcf(-1.0, 0.0);\n"
++    "    float4 vF = srcf(+1.0, 0.0);\n"
++    "    float4 vH = srcf(0.0, +1.0);\n"
++    "\n"
++    "    uint E = packUnorm4x8(vE);\n"
++    "    uint B = packUnorm4x8(vB);\n"
++    "    uint D = packUnorm4x8(vD);\n"
++    "    uint F = packUnorm4x8(vF);\n"
++    "    uint H = packUnorm4x8(vH);\n"
++    "\n"
++    "    // default pixel\n"
++    "    ialpha = float(E != 0u);\n"
++    "    texcol = vE;\n"
++    "\n"
++    "    bool eq_E_D = eq(E,D);\n"
++    "    bool eq_E_F = eq(E,F);\n"
++    "    bool eq_E_B = eq(E,B);\n"
++    "    bool eq_E_H = eq(E,H);\n"
++    "    bool eq_B_H = eq(B,H);\n"
++    "    bool eq_D_F = eq(D,F);\n"
++    "\n"
++    "//* Skip processing for horizontal/vertical 3-pixel identical & mirror symmetric patterns\n"
++    "bool skiprest = (eq_E_D && eq_E_F) || (eq_E_B && eq_E_H) || (eq_B_H && eq_D_F);\n"
++    "if (!skiprest) {\n"
++    "\n"
++    "\n"
++    "\n"
++    "    // 5x5\n"
++    "    float4 vA = srcf(-1.0, -1.0);\n"
++    "    float4 vC = srcf(+1.0, -1.0);\n"
++    "    float4 vG = srcf(-1.0, +1.0);\n"
++    "    float4 vI = srcf(+1.0, +1.0);\n"
++    "\n"
++    "    uint A = packUnorm4x8(vA);\n"
++    "    uint C = packUnorm4x8(vC);\n"
++    "    uint G = packUnorm4x8(vG);\n"
++    "    uint I = packUnorm4x8(vI);\n"
++    "\n"
++    "    uint P  = src( 0.0, -2.0);\n"
++    "    uint Q  = src(-2.0,  0.0);\n"
++    "    uint R  = src(+2.0,  0.0);\n"
++    "    uint S  = src( 0.0, +2.0);\n"
++    "\n"
++    "    uint PA = src(-1.0, -2.0);\n"
++    "    uint PC = src(+1.0, -2.0);\n"
++    "    uint QA = src(-2.0, -1.0);\n"
++    "    uint QG = src(-2.0, +1.0); //*             AA   PA   [P]  PC   CC\n"
++    "    uint RC = src(+2.0, -1.0); //*               -|----|----|----|-\n"
++    "    uint RI = src(+2.0, +1.0); //*             QA |  A |  B | C  | RC\n"
++    "    uint SG = src(-1.0, +2.0); //*               -|----|----|----|-\n"
++    "    uint SI = src(+1.0, +2.0); //*            [Q] |  D |  E | F  | [R]\n"
++    "    uint AA = src(-2.0, -2.0); //*               -|----|----|----|-\n"
++    "    uint CC = src(+2.0, -2.0); //*             QG |  G |  H | I  | RI\n"
++    "    uint GG = src(-2.0, +2.0); //*               -|----|----|----|-\n"
++    "    uint II = src(+2.0, +2.0); //*             GG   SG   [S]  SI   II\n"
++    "\n"
++    "\n"
++    "    float4 J = vE;    float4 K = vE;    float4 L = vE;    float4 M = vE;\n"
++    "\n"
++    "\n"
++    "    //*    pre-cal\n"
++    "    float Bl = luma(vB) + float(B==0u);\n"
++    "    float Dl = luma(vD) + float(D==0u);\n"
++    "    float El = luma(vE) + float(E==0u);\n"
++    "    float Fl = luma(vF) + float(F==0u);\n"
++    "    float Hl = luma(vH) + float(H==0u);\n"
++    "\n"
++    "    bool eq_B_D = eq(B,D);\n"
++    "    bool eq_B_F = eq(B,F);\n"
++    "    bool eq_D_H = eq(D,H);\n"
++    "    bool eq_F_H = eq(F,H);\n"
++    "\n"
++    "\n"
++    "    bool oppoPix =  eq_B_H || eq_D_F;\n"
++    "\n"
++    "    bool slope1 = false;    bool slope2 = false;    bool slope3 = false;    bool slope4 = false;\n"
++    "\n"
++    "    bool slope1ok = false;  bool slope2ok = false;  bool slope3ok = false;  bool slope4ok = false;\n"
++    "    bool slope1end = false;  bool slope2end = false;  bool slope3end = false;  bool slope4end = false;\n"
++    "\n"
++    "\n"
++    "// B - D\n"
++    "    if ( (B!=0u && D!=0u) && // xxx.alpha\n"
++    "        (!eq_E_B && !eq_E_D && !oppoPix) && (!eq_D_H && !eq_B_F)\n"
++    "     && (eq(E,A) || El>=Dl&&El>=Bl) && ( (El<Dl&&El<Bl) || none_eq2(A,B,D) || neq(E,P) || neq(E,Q) )\n"
++    "     && ( eq_B_D &&(eq(E,A)||eq(B,PC)||eq(D,QG)||sim(vE,vC)||sim(vE,vG)) || simb(vB,vD)&&(eq_F_H||eq(E,C)||eq(E,G)) )\n"
++    "        ) {\n"
++    "        J=admixX(A,B,C,D,E,F,G,H,I\n"
++    "                ,P,PA,PC,Q,QA,QG,R,RC,RI,S,SG,SI,AA,CC,GG\n"
++    "                ,El, Bl, Dl, Fl, Hl\n"
++    "                ,vE, vB, vD, vC, vG\n"
++    "                );\n"
++    "        slope1 = true;\n"
++    "        slope1ok = (J.b < 1.1);\n"
++    "        slope1end = (J.b < 3.1);\n"
++    "        skiprest = (J.b > 7.1);\n"
++    "        J = (J.b > 3.1) ? vE :\n"
++    "            (J.b > 1.1) ? (J - 2.0) :\n"
++    "            J;\n"
++    "    }\n"
++    "// B - F\n"
++    "    if ( !slope1 && (B!=0u && F!=0u)\n"
++    "     && (!eq_E_B && !eq_E_F && !oppoPix) && (!eq_B_D && !eq_F_H)\n"
++    "     && (eq(E,C) || El>=Bl&&El>=Fl) && ( (El<Bl&&El<Fl) || none_eq2(C,B,F) || neq(E,P) || neq(E,R) )\n"
++    "     && ( eq_B_F &&(eq(E,C)||eq(B,PA)||eq(F,RI)||sim(vE,vA)||sim(vE,vI)) || simb(vB,vF)&&(eq_D_H||eq(E,A)||eq(E,I)) )\n"
++    "     ) {\n"
++    "        K=admixX(C,F,I,B,E,H,A,D,G\n"
++    "                ,R,RC,RI,P,PC,PA,S,SI,SG,Q,QA,QG,CC,II,AA\n"
++    "                ,El,Fl,Bl,Hl,Dl\n"
++    "                ,vE,vF,vB,vI,vA\n"
++    "                );\n"
++    "        slope2 = true;\n"
++    "        slope2ok = (K.b < 1.1);\n"
++    "        slope2end = (K.b < 3.1);\n"
++    "        skiprest = (K.b > 7.1);\n"
++    "        K = (K.b > 3.1) ? vE :\n"
++    "            (K.b > 1.1) ? (K - 2.0) :\n"
++    "            K;\n"
++    "    }\n"
++    "// D - H\n"
++    "    if ( !slope1 && !skiprest && (D!=0u && H!=0u)\n"
++    "     && (!eq_E_D && !eq_E_H && !oppoPix) && (!eq_F_H && !eq_B_D)\n"
++    "     && (eq(E,G) || El>=Hl&&El>=Dl)  &&  ((El<Hl&&El<Dl) || none_eq2(G,D,H) || neq(E,S) || neq(E,Q))\n"
++    "     &&    ( eq_D_H &&(eq(E,G)||eq(D,QA)||eq(H,SI)||sim(vE,vA)||sim(vE,vI)) || simb(vD,vH)&&(eq_B_F||eq(E,A)||eq(E,I)) )\n"
++    "     ) {\n"
++    "        L=admixX(G,D,A,H,E,B,I,F,C\n"
++    "                ,Q,QG,QA,S,SG,SI,P,PA,PC,R,RI,RC,GG,AA,II\n"
++    "                ,El,Dl,Hl,Bl,Fl\n"
++    "                ,vE,vD,vH,vA,vI\n"
++    "                );\n"
++    "        slope3 = true;\n"
++    "        slope3ok = (L.b < 1.1);\n"
++    "        slope3end = (L.b < 3.1);\n"
++    "        skiprest = (L.b > 7.1);\n"
++    "        L = (L.b > 3.1) ? vE :\n"
++    "            (L.b > 1.1) ? (L - 2.0) :\n"
++    "            L;\n"
++    "    }\n"
++    "// F - H\n"
++    "    if ( !slope2 && !slope3 && !skiprest && (F!=0u && H!=0u)\n"
++    "     && (!eq_E_F && !eq_E_H && !oppoPix) && (!eq_B_F && !eq_D_H)\n"
++    "     && (eq(E,I) || El>=Fl&&El>=Hl)  &&  ((El<Fl&&El<Hl) || none_eq2(I,F,H) || neq(E,R) || neq(E,S))\n"
++    "     && ( eq_F_H &&(eq(E,I)||eq(F,RC)||eq(H,SG)||sim(vE,vC)||sim(vE,vG)) || simb(vF,vH)&&(eq_B_D||eq(E,C)||eq(E,G)) )\n"
++    "      ) {\n"
++    "        M=admixX(I,H,G,F,E,D,C,B,A\n"
++    "                ,S,SI,SG,R,RI,RC,Q,QG,QA,P,PC,PA,II,GG,CC\n"
++    "                ,El,Hl,Fl,Dl,Bl\n"
++    "                ,vE,vH,vF,vG,vC\n"
++    "                );\n"
++    "        slope4 = true;\n"
++    "        slope4ok = (M.b < 1.1);\n"
++    "        slope4end = (M.b < 3.1);\n"
++    "        skiprest = (M.b > 7.1);\n"
++    "        M = (M.b > 3.1) ? vE :\n"
++    "            (M.b > 1.1) ? (M - 2.0) :\n"
++    "            M;\n"
++    "    }\n"
++    "\n"
++    "//* =========================  2:1 long stepped slope  =========================\n"
++    "\n"
++    "    if (slope4ok) {\n"
++    "        if (all_eq2(R,F,G) && neq(R, RC) && (neq(Q,G)||eq(Q, QA))) {L=admixL(vE,vH); skiprest = true;}\n"
++    "        if (all_eq2(S,H,C) && neq(S, SG) && (neq(P,C)||eq(P, PA))) {K=admixL(vE,vF); skiprest = true;}\n"
++    "    }\n"
++    "\n"
++    "    if (slope3ok) {\n"
++    "        if (all_eq2(Q,D,I) && neq(Q, QA) && (neq(R,I)||eq(R, RC))) {M=admixL(vE,vH); skiprest = true;}\n"
++    "        if (all_eq2(S,H,A) && neq(S, SI) && (neq(A,P)||eq(P, PC))) {J=admixL(vE,vD); skiprest = true;}\n"
++    "    }\n"
++    "\n"
++    "    if (slope2ok) {\n"
++    "        if (all_eq2(R,F,A) && neq(R, RI) && (neq(A,Q)||eq(Q, QG))) {J=admixL(vE,vB); skiprest = true;}\n"
++    "        if (all_eq2(P,B,I) && neq(P, PA) && (neq(I,S)||eq(S, SG))) {M=admixL(vE,vF); skiprest = true;}\n"
++    "    }\n"
++    "\n"
++    "    if (slope1ok) {\n"
++    "        if (all_eq2(Q,D,C) && neq(Q, QG) && (neq(C,R)||eq(R, RI))) {K=admixL(vE,vB); skiprest = true;}\n"
++    "        if (all_eq2(P,B,G) && neq(P, PC) && (neq(G,S)||eq(S, SI))) {L=admixL(vE,vD); skiprest = true;}\n"
++    "    }\n"
++    "\n"
++    "\n"
++    "\n"
++    "//* =========================  2:1 staggered slope  (new rule)  ===========================\n"
++    "\n"
++    "if (!skiprest && !oppoPix) {\n"
++    "\n"
++    "\n"
++    "    if (!eq_E_H && none_eq2(H,A,C)) {\n"
++    "\n"
++    "        if ( (!slope2 && !eq_B_F) && (!slope3 && !eq_D_H) && (!slope4end && !eq_F_H) && F!=0u &&\n"
++    "            !eq_E_F && eq(R,H) && eq(F,G) ) {\n"
++    "            M = admixS( A, B, C, D, E, F, G, H, I\n"
++    "                      , R, RC, RI, S, SG, SI, II, CC\n"
++    "                      , vE, vF, vC\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "        if ( !skiprest && (!slope1 && !eq_B_D) && (!slope4 && !eq_F_H) && (!slope3end && !eq_D_H) && D!=0u &&\n"
++    "             !eq_E_D && eq(Q,H) && eq(D,I) ) {\n"
++    "            L = admixS( C, B, A, F, E, D, I, H, G\n"
++    "                      , Q, QA, QG, S, SI, SG, GG, AA\n"
++    "                      , vE, vD, vA\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "    }\n"
++    "\n"
++    "    if ( !skiprest && !eq_E_B && none_eq2(B,G,I)) {\n"
++    "\n"
++    "        if ( (!slope1 && !eq_B_D)  && (!slope4 && !eq_F_H) && (!slope2end && !eq_B_F) && F!=0u &&\n"
++    "              !eq_E_F && eq(B,R) && eq(A,F) ) {\n"
++    "            K = admixS( G, H, I, D, E, F, A, B, C\n"
++    "                      , R, RI, RC, P, PA, PC, CC, II\n"
++    "                      , vE, vF, vI\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "        if ( !skiprest && (!slope2 && !eq_B_F) && (!slope3 && !eq_D_H) && (!slope1end && !eq_B_D) && D!=0u &&\n"
++    "             !eq_E_D && eq(B,Q) && eq(C,D) ) {\n"
++    "            J = admixS( I, H, G, F, E, D, C, B, A\n"
++    "                      , Q, QG, QA, P, PC, PA, AA, GG\n"
++    "                      , vE, vD, vG\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "    }\n"
++    "\n"
++    "\n"
++    "    if ( !skiprest && !eq_E_D && none_eq2(D,C,I) ) {\n"
++    "\n"
++    "        if ( (!slope1 && !eq_B_D) && (!slope4 && !eq_F_H) && (!slope3end && !eq_D_H) && H!=0u &&\n"
++    "              !eq_E_H && eq(D,S) && eq(A,H) ) {\n"
++    "            L = admixS( C, F, I, B, E, H, A, D, G\n"
++    "                      , S, SI, SG, Q, QA, QG, GG, II\n"
++    "                      , vE, vH, vI\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "        if ( !skiprest && (!slope3 && !eq_D_H) && (!slope2 && !eq_B_F) && (!slope1end && !eq_B_D) && B!=0u &&\n"
++    "              !eq_E_B && eq(P,D) && eq(B,G) ) {\n"
++    "            J = admixS( I, F, C, H, E, B, G, D, A\n"
++    "                      , P, PC, PA, Q, QG, QA, AA, CC\n"
++    "                      , vE, vB, vC\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "    }\n"
++    "\n"
++    "    if ( !skiprest && !eq_E_F && none_eq2(F,A,G) ) {\n"
++    "\n"
++    "        if ( (!slope2 && !eq_B_F) && (!slope3 && !eq_D_H) && (!slope4end && !eq_F_H) && H!=0u &&\n"
++    "              !eq_E_H && eq(S,F) && eq(H,C) ) {\n"
++    "            M = admixS( A, D, G, B, E, H, C, F, I\n"
++    "                      , S, SG, SI, R, RC, RI, II, GG\n"
++    "                      , vE, vH, vG\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "        if ( !skiprest && (!slope1 && !eq_B_D) && (!slope4 && !eq_F_H) && (!slope2end && !eq_B_F) && B!=0u &&\n"
++    "             !eq_E_B && eq(P,F) && eq(B,I) ) {\n"
++    "            K = admixS( G, D, A, H, E, B, I, F, C\n"
++    "                      , P, PA, PC, R, RI, RC, CC, AA\n"
++    "                      , vE, vB, vA\n"
++    "                      );\n"
++    "            skiprest = true;}\n"
++    "\n"
++    "    }\n"
++    "}\n"
++    "\n"
++    "skiprest = skiprest||slope1||slope2||slope3||slope4||E==0u||B==0u||D==0u||F==0u||H==0u;\n"
++    "\n"
++    "//* =================== Concave+Cross pattern (P100) =================\n"
++    "\n"
++    "float4 vT;        float maxl;\n"
++    " //* top [B]\n"
++    "if (!skiprest &&\n"
++    "    Bl<El && !eq_E_D && !eq_E_F && eq_E_H && none_eq2(E,A,C) && all_eq3(E,G,I,S) ) {\n"
++    "\n"
++    "    float B1 = float(eq(B, A));\n"
++    "    float B2 = float(eq(B, C));\n"
++    "    float DD = float(eq(A, D));\n"
++    "    float FF = float(eq(C, F));\n"
++    "\n"
++    "    float sideFactor = eq_D_F && DD!=FF ? 1.0 : -0.145898;\n"
++    "    Bl = Bl - (B1 +B2 +B1*B2) *0.381966;\n"
++    "    Dl = Dl - step(El, Dl) + DD*sideFactor;\n"
++    "    Fl = Fl - step(El, Fl) + FF*sideFactor;\n"
++    "\n"
++    "    maxl = max(Bl, max(Dl, Fl));\n"
++    "\n"
++    "    vT = eq_B_D || eq_B_F ? vB :\n"
++    "         maxl <= Dl      ? vD :\n"
++    "         maxl <= Fl      ? vF :\n"
++    "                           vB ;\n"
++    "    vT = admixC(vT,vE);\n"
++    "\n"
++    "    bool nolink = !eq_D_F && (DD==0.0) && (FF==0.0);\n"
++    "    J = Dl<0.0&&nolink ? vE : vT;\n"
++    "    K = Fl<0.0&&nolink ? vE : vT;\n"
++    "    L = mix(vE, J, 0.381966*float(eq_D_F));\n"
++    "    M = L;\n"
++    "\n"
++    "   skiprest = true;\n"
++    "}\n"
++    " //* bottom (H)\n"
++    "if (!skiprest &&\n"
++    "    Hl<El && !eq_E_D && !eq_E_F && eq_E_B && none_eq2(E,G,I) && all_eq3(E,A,C,P) ) {\n"
++    "\n"
++    "    float H1 = float(eq(H, G));\n"
++    "    float H2 = float(eq(H, I));\n"
++    "    float DD = float(eq(D, G));\n"
++    "    float FF = float(eq(F, I));\n"
++    "\n"
++    "    float sideFactor = eq_D_F && DD!=FF ? 1.0 : -0.145898;\n"
++    "\n"
++    "    Hl = Hl - (H1+H2+H1*H2) *0.381966;\n"
++    "    Dl = Dl - step(El, Dl) + DD*sideFactor;\n"
++    "    Fl = Fl - step(El, Fl) + FF*sideFactor;\n"
++    "\n"
++    "    maxl = max(Hl, max(Dl, Fl));\n"
++    "\n"
++    "    vT = eq_D_H || eq_F_H ? vH :\n"
++    "         maxl <= Dl      ? vD :\n"
++    "         maxl <= Fl      ? vF :\n"
++    "                           vH ;\n"
++    "    vT=admixC(vT,vE);\n"
++    "\n"
++    "    bool nolink = !eq_D_F && (DD==0.0) && (FF==0.0);\n"
++    "\n"
++    "    L = Dl<0.0&&nolink ? vE : vT;\n"
++    "    M = Fl<0.0&&nolink ? vE : vT;\n"
++    "    J = mix(vE, L, 0.381966*float(eq_D_F));\n"
++    "    K = J;\n"
++    "\n"
++    "   skiprest = true;\n"
++    "}\n"
++    " //* right [F]\n"
++    "if (!skiprest &&\n"
++    "    Fl<El && !eq_E_B && !eq_E_H && eq_E_D && none_eq2(E,C,I) && all_eq3(E,A,G,Q) ) {\n"
++    "\n"
++    "    float F1 = float(eq(F, C));\n"
++    "    float F2 = float(eq(F, I));\n"
++    "    float BB = float(eq(B, C));\n"
++    "    float HH = float(eq(H, I));\n"
++    "\n"
++    "    float sideFactor = eq_B_H && BB!=HH ? 1.0 : -0.145898;\n"
++    "\n"
++    "    Fl = Fl - (F1+F2+F1*F2) *0.381966;\n"
++    "    Bl = Bl - step(El, Bl) + BB*sideFactor;\n"
++    "    Hl = Hl - step(El, Hl) + HH*sideFactor;\n"
++    "\n"
++    "    maxl = max(Fl, max(Bl, Hl));\n"
++    "\n"
++    "    vT = eq_B_F || eq_F_H ? vF :\n"
++    "         maxl <= Bl      ? vB :\n"
++    "         maxl <= Hl      ? vH :\n"
++    "                           vF ;\n"
++    "    vT=admixC(vT,vE);\n"
++    "\n"
++    "    bool nolink =  !eq_B_H && (BB==0.0) && (HH==0.0);\n"
++    "\n"
++    "    K = Bl<0.0&&nolink ? vE : vT;\n"
++    "    M = Hl<0.0&&nolink ? vE : vT;\n"
++    "    J = mix(vE, K, 0.381966*float(eq_B_H));\n"
++    "    L = J;\n"
++    "\n"
++    "   skiprest = true;\n"
++    "}\n"
++    " //* left [D]\n"
++    "if (!skiprest &&\n"
++    "    Dl<El && !eq_E_B && !eq_E_H && eq_E_F && none_eq2(E,A,G) && all_eq3(E,C,I,R) ) {\n"
++    "\n"
++    "    float D1 = float(eq(D, A));\n"
++    "    float D2 = float(eq(D, G));\n"
++    "    float BB = float(eq(B, A));\n"
++    "    float HH = float(eq(H, G));\n"
++    "\n"
++    "    float sideFactor = eq_B_H && BB!=HH ? 1.0 : -0.145898;\n"
++    "\n"
++    "    Dl = Dl - (D1+D2+D1*D2) *0.381966;\n"
++    "    Bl = Bl - step(El, Bl) + BB*sideFactor;\n"
++    "    Hl = Hl - step(El, Hl) + HH*sideFactor;\n"
++    "\n"
++    "    maxl = max(Dl, max(Bl, Hl));\n"
++    "\n"
++    "    vT = eq_B_D || eq_D_H ? vD :\n"
++    "         maxl <= Bl      ? vB :\n"
++    "         maxl <= Hl      ? vH :\n"
++    "                           vD ;\n"
++    "    vT=admixC(vT,vE);\n"
++    "\n"
++    "    bool nolink =  !eq_B_H && (BB==0.0) && (HH==0.0);\n"
++    "\n"
++    "    J = Bl<0.0&&nolink ? vE : vT;\n"
++    "    L = Hl<0.0&&nolink ? vE : vT;\n"
++    "    K = mix(vE, J, 0.381966*float(eq_B_H));\n"
++    "    M = K;\n"
++    "\n"
++    "   skiprest = true;\n"
++    "}\n"
++    "\n"
++    "//* ===================  SKorpion pattern (P99) ==================\n"
++    "\n"
++    "\n"
++    "if (!skiprest && !eq_E_F&&eq_E_D&&eq_B_F&&eq_F_H && all_eq2(E,C,I) && (eq(E,Q)||El>Fl) && neq(F,src(+3.0, 0.0)) ) {K=admixK(vF,vE); M=K; skiprest=true;}    //* RIGHT\n"
++    "if (!skiprest && !eq_E_D&&eq_E_F&&eq_B_D&&eq_D_H && all_eq2(E,A,G) && (eq(E,R)||El>Dl) && neq(D,src(-3.0, 0.0)) ) {J=admixK(vD,vE); L=J; skiprest=true;}    //* LEFT\n"
++    "if (!skiprest && !eq_E_H&&eq_E_B&&eq_D_H&&eq_F_H && all_eq2(E,G,I) && (eq(E,P)||El>Hl) && neq(H,src(0.0, +3.0)) ) {L=admixK(vH,vE); M=L; skiprest=true;}    //* BOTTOM\n"
++    "if (!skiprest && !eq_E_B&&eq_E_H&&eq_B_D&&eq_B_F && all_eq2(E,A,C) && (eq(E,S)||El>Bl) && neq(B,src(0.0, -3.0)) ) {J=admixK(vB,vE); K=J;}                    //* TOP\n"
++    "\n"
++    "\n"
++    "    //final write\n"
++    "    float2 fpart = frac(coords);\n"
++    "\n"
++    "    float4 res = (fpart.x < 0.5) ? ((fpart.y < 0.5) ? J : L) : ((fpart.y < 0.5) ? K : M);\n"
++    "\n"
++    "    ialpha = step(0.002, res.r+res.g+res.b+res.a);\n"
++    "    texcol = res;\n"
++    "}\n"
++    "    \n"
++    "}\n"
++    "\n"
++    "#undef src\n"
++    ;
++
++#endif /* GPU_GL_TEXFILTERS_H */
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 47aaf127..0ce99241 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1225,6 +1225,20 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+ }
+ static int           g_video_texfilter = 0;
+ static int           g_video_texfilter_2d = 1;  /* filter 2D sprites/UI too (legacy on) */
++static int           g_video_texfilter_edge = 0;  /* [video] texture_edge_blending */
++static int           g_video_fmv_chroma = 0;      /* [video] fmv_chroma_smoothing */
++/* F1 "Texture filtering" choice index <-> renderer mode. The choice list is
++ * the launcher's order (Nearest, Bilinear, 3-Point, JINC2, xBR, Scale2x,
++ * Scale3x, MMPX, MMPX Enhanced, MMPX Advanced); renderer mode 3 (trilinear)
++ * is not offered and shows as Bilinear. */
++static inline int texfilter_mode_to_choice(int m) {
++    if (m >= 4 && m <= 10) return m - 1;
++    return (m >= 0 && m <= 2) ? m : 1;
++}
++static inline int texfilter_choice_to_mode(int c) {
++    if (c >= 3 && c <= 9) return c + 1;
++    return (c >= 0 && c <= 2) ? c : 1;
++}
+ static int           g_video_postfx = 0;        /* present post-processing: 0 off, 1 FXAA */ /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */
+ /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
+  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
+@@ -6667,7 +6681,7 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER) == 0)
+         /* F1 choice index 0..3 = Nearest / Bilinear / 3-Point / JINC2; the
+          * renderer's mode 3 (trilinear) is not offered and shows as Bilinear. */
+-        *value_out = g_video_texfilter == 4 ? 3 : (g_video_texfilter >= 0 && g_video_texfilter <= 2) ? g_video_texfilter : 1;
++        *value_out = texfilter_mode_to_choice(g_video_texfilter);
+     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0)
+         *value_out = host_volume_get();
+     else if (std::strcmp(item->key, kRuntimeControllerRoute) == 0)
+@@ -6720,7 +6734,7 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+                 g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+     } else if (std::strcmp(item->key,
+                            RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER) == 0) {
+-        g_video_texfilter = value == 3 ? 4 : (value >= 0 && value <= 2) ? value : 1;
++        g_video_texfilter = texfilter_choice_to_mode(value);
+         gr_set_texture_filter(g_video_texfilter);
+     } else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) {
+         host_volume_set(value);
+@@ -12926,6 +12940,8 @@ int main(int argc, char** argv) {
+             }
+             g_video_aa         = gc.runtime.video_antialiasing;
+             g_video_texfilter  = gc.runtime.video_texture_filter;
++            g_video_texfilter_edge = gc.runtime.video_texture_edge_blending ? 1 : 0;
++            g_video_fmv_chroma = gc.runtime.video_fmv_chroma_smoothing ? 1 : 0;
+             g_video_fmv_filter = gc.runtime.video_fmv_filter;
+             g_video_fmv_letterbox_rows = gc.runtime.video_fmv_letterbox_rows;
+             g_video_geometry_correction   =
+@@ -13348,6 +13364,8 @@ int main(int argc, char** argv) {
+         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+         if (us.has_texture_filter_2d) g_video_texfilter_2d = us.texture_filter_2d ? 1 : 0;
++        if (us.has_texture_edge_blending) g_video_texfilter_edge = us.texture_edge_blending ? 1 : 0;
++        if (us.has_fmv_chroma_smoothing)  g_video_fmv_chroma = us.fmv_chroma_smoothing ? 1 : 0;
+         if (us.has_post_processing) g_video_postfx = us.post_processing;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+         if (us.has_display_scaling) g_video_display_scaling = us.display_scaling;
+@@ -13869,6 +13887,8 @@ int main(int argc, char** argv) {
+             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
+             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
+             seed.texture_filter_2d = (g_video_texfilter_2d != 0); seed.has_texture_filter_2d = true;
++            seed.texture_edge_blending = (g_video_texfilter_edge != 0); seed.has_texture_edge_blending = true;
++            seed.fmv_chroma_smoothing  = (g_video_fmv_chroma != 0);     seed.has_fmv_chroma_smoothing = true;
+             seed.post_processing = g_video_postfx;        seed.has_post_processing = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
+             if (g_video_display_scaling >= 0) { seed.display_scaling = g_video_display_scaling; seed.has_display_scaling = true; }
+@@ -14069,6 +14089,8 @@ int main(int argc, char** argv) {
+             ls.antialiasing       = seed.antialiasing ? 1 : 0;
+             ls.texture_filter     = seed.texture_filter;
+             ls.texture_filter_2d  = seed.texture_filter_2d ? 1 : 0;
++            ls.texture_edge_blend = seed.texture_edge_blending ? 1 : 0;
++            ls.fmv_chroma         = seed.fmv_chroma_smoothing ? 1 : 0;
+             ls.post_processing    = seed.post_processing;
+             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+@@ -14330,11 +14352,15 @@ int main(int argc, char** argv) {
+                  * 3=trilinear 4=JINC2); ls.linear_filter is the legacy fallback
+                  * field for consoles without the cap and is left unused here. */
+                 seed.texture_filter =
+-                    (ls.texture_filter >= 0 && ls.texture_filter <= 4)
++                    (ls.texture_filter >= 0 && ls.texture_filter <= 10)
+                         ? ls.texture_filter : (ls.texture_filter ? 1 : 0);
+                 seed.has_texture_filter = true;
+                 seed.texture_filter_2d = ls.texture_filter_2d != 0;
+                 seed.has_texture_filter_2d = true;
++                seed.texture_edge_blending = ls.texture_edge_blend != 0;
++                seed.has_texture_edge_blending = true;
++                seed.fmv_chroma_smoothing = ls.fmv_chroma != 0;
++                seed.has_fmv_chroma_smoothing = true;
+                 seed.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                 seed.has_post_processing = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -14558,6 +14584,10 @@ int main(int argc, char** argv) {
+                         qs.texture_filter = ls.texture_filter; qs.has_texture_filter = true;
+                         qs.texture_filter_2d = ls.texture_filter_2d != 0;
+                         qs.has_texture_filter_2d = true;
++                        qs.texture_edge_blending = ls.texture_edge_blend != 0;
++                        qs.has_texture_edge_blending = true;
++                        qs.fmv_chroma_smoothing = ls.fmv_chroma != 0;
++                        qs.has_fmv_chroma_smoothing = true;
+                         qs.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                         qs.has_post_processing = true;
+                         qs.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -14655,6 +14685,8 @@ int main(int argc, char** argv) {
+                 g_video_aa        = seed.antialiasing;
+                 g_video_texfilter = seed.texture_filter;
+                 g_video_texfilter_2d = seed.texture_filter_2d ? 1 : 0;
++                if (seed.has_texture_edge_blending) g_video_texfilter_edge = seed.texture_edge_blending ? 1 : 0;
++                if (seed.has_fmv_chroma_smoothing)  g_video_fmv_chroma = seed.fmv_chroma_smoothing ? 1 : 0;
+                 g_video_postfx = seed.post_processing;
+                 g_video_fmv_filter = seed.fmv_filter;
+                 if (seed.has_display_scaling) g_video_display_scaling = seed.display_scaling;
+@@ -15027,6 +15059,8 @@ session_reboot:
+     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+     gr_set_texture_filter(g_video_texfilter);
+     gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
++    gl_renderer_set_texture_edge_blend(g_video_texfilter_edge);
++    gl_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+     gl_renderer_set_post_processing(g_video_postfx);
+     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
+      * with both off every setter below leaves the tracking caches disabled and
+@@ -16182,6 +16216,8 @@ soft_return_lobby:
+         ls.supersampling = g_video_scale;
+         ls.antialiasing = g_video_aa ? 1 : 0;
+         ls.texture_filter = g_video_texfilter;
++        ls.texture_edge_blend = g_video_texfilter_edge;
++        ls.fmv_chroma = g_video_fmv_chroma;
+         ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+         ls.display_scaling = g_video_display_scaling >= 0 ? cfg_display_scaling_to_launcher(g_video_display_scaling) : 0;
+@@ -16473,6 +16509,10 @@ soft_return_lobby:
+                 us.has_texture_filter = true;
+                 us.texture_filter_2d = ls.texture_filter_2d != 0;
+                 us.has_texture_filter_2d = true;
++                us.texture_edge_blending = ls.texture_edge_blend != 0;
++                us.has_texture_edge_blending = true;
++                us.fmv_chroma_smoothing = ls.fmv_chroma != 0;
++                us.has_fmv_chroma_smoothing = true;
+                 us.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                 us.has_post_processing = true;
+                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -16541,6 +16581,8 @@ soft_return_lobby:
+             g_video_aa = ls.antialiasing;
+             g_video_texfilter = ls.texture_filter;
+             g_video_texfilter_2d = ls.texture_filter_2d ? 1 : 0;
++            g_video_texfilter_edge = ls.texture_edge_blend ? 1 : 0;
++            g_video_fmv_chroma = ls.fmv_chroma ? 1 : 0;
+             g_video_postfx = (ls.post_processing == 1) ? 1 : 0;
+             /* Re-apply live: the boot-time renderer apply already ran, so an
+              * in-game Apply must push the filter family down itself or the
+@@ -16549,6 +16591,8 @@ soft_return_lobby:
+              * batch/present. */
+             gr_set_texture_filter(g_video_texfilter);
+             gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
++    gl_renderer_set_texture_edge_blend(g_video_texfilter_edge);
++    gl_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+             gl_renderer_set_post_processing(g_video_postfx);
+             g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+diff --git a/tools/port_duckstation_texfilters.py b/tools/port_duckstation_texfilters.py
+new file mode 100644
+index 00000000..ac129bb4
+--- /dev/null
++++ b/tools/port_duckstation_texfilters.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""port_duckstation_texfilters.py - regenerate runtime/src/gpu_gl_texfilters.h
++
++    port_duckstation_texfilters.py <path to duckstation src/core/gpu_hw_shadergen.cpp> [out.h]
++
++Lifts the xBR, Scale2x, Scale3x, MMPX, MMPX Enhanced and MMPX Advanced
++blocks out of GPU_HW_ShaderGen::WriteBatchTextureFilter (the raw-string
++bodies plus the plain-string #define lines in front of them) and writes each
++as a C string constant. Two edits are applied on the way: the xBR block's
++I.w coverage test reads texel I (upstream reads H - a typo), and MMPX's
++#define src, which upstream splits across two C string pieces, is rejoined
++onto one line so the GLSL preprocessor accepts it, and a uint sample
++compared with a bare 0 gets the 0u GLSL 3.30 needs (4.00 converts
++implicitly, which is why upstream compiles). Everything else is verbatim; the HLSL-style names the blocks use (float4, lerp, frac,
++VECTOR_EQ, SampleFromVRAM, packUnorm4x8 ...) are supplied by TEX_FS_COMPAT
++in gpu_gl_renderer.c.
++"""
++import re, sys
++
++ORDER = [('xBR', 5, 'XBR'), ('Scale2x', 6, 'SCALE2X'), ('Scale3x', 7, 'SCALE3X'),
++         ('MMPX', 8, 'MMPX'), ('MMPXEnhanced', 9, 'MMPX_ENHANCED'),
++         ('MMPXAdvanced', 10, 'MMPX_ADVANCED')]
++
++def extract(lines):
++    idx = []
++    for i, l in enumerate(lines):
++        m = re.search(r'texture_filter == GPUTextureFilter::(\w+)', l)
++        if m and ('else if' in l or (('if (' in l) and not idx)):
++            idx.append((m.group(1), i))
++    end = [i for i, l in enumerate(lines)
++           if 'GPU_HW_ShaderGen::GenerateBatchFragmentShader' in l][0]
++    bounds = {}
++    for k, (name, i) in enumerate(idx):
++        bounds[name] = (i, idx[k + 1][1] if k + 1 < len(idx) else end)
++    out = {}
++    for name, _, _ in ORDER:
++        i, j = bounds[name]; seg = lines[i:j]; text = []; k = 0
++        while k < len(seg):
++            l = seg[k]
++            if 'R"(' in l:
++                after = l.split('R"(', 1)[1]; buf = [after] if after.strip() else []; k += 1
++                while k < len(seg) and ')"' not in seg[k]:
++                    buf.append(seg[k]); k += 1
++                if k < len(seg):
++                    last = seg[k].split(')"')[0]
++                    if last.strip(): buf.append(last)
++                text.extend(buf)
++            elif l.strip().startswith('ss << "') or (l.strip().startswith('"') and 'uv_limits' in l):
++                for piece in re.findall(r'"((?:[^"\\]|\\.)*)"', l):
++                    text.append(piece.encode().decode('unicode_escape'))
++            k += 1
++        out[name] = '\n'.join(text)
++    return out
++
++def main():
++    if len(sys.argv) < 2:
++        print(__doc__.strip(), file=sys.stderr); return 2
++    src = open(sys.argv[1], encoding='utf-8').read().split('\n')
++    dst = sys.argv[2] if len(sys.argv) > 2 else 'runtime/src/gpu_gl_texfilters.h'
++    d = extract(src)
++    out = ['/* Texture-filter fragment-shader blocks ported from DuckStation\n'
++           ' * (src/core/gpu_hw_shadergen.cpp, GPU_HW_ShaderGen::WriteBatchTextureFilter),\n'
++           ' * verbatim apart from: (1) the xBR I.w coverage test reading texel I rather\n'
++           ' * than H (an upstream typo); (2) MMPX\'s #define src rejoined onto one line;\n'
++           ' * (3) uint samples compared with a bare 0 spelled 0u (GLSL 3.30).\n'
++           ' * Each block defines FilteredSampleFromVRAM(texpage, coords, uv_limits,\n'
++           ' * out texcol, out ialpha) against the HLSL-style names (float4, lerp, frac,\n'
++           ' * VECTOR_EQ, SampleFromVRAM, packUnorm4x8 ...) that gpu_gl_renderer.c\'s\n'
++           ' * TEX_FS_COMPAT maps onto GLSL 3.30. Licences: xBR (C) Hyllian, MIT;\n'
++           ' * MMPX (C) Morgan McGuire & Mara Gagiu, MIT; MMPX Enhanced/Advanced\n'
++           ' * (C) crashGG, MIT; Scale2x/3x after scale2x.it. Generated by\n'
++           ' * tools/port_duckstation_texfilters.py - edit that, not this. */\n'
++           '#ifndef GPU_GL_TEXFILTERS_H\n#define GPU_GL_TEXFILTERS_H\n']
++    for name, mode, cname in ORDER:
++        t = d[name]
++        if name == 'xBR':
++            bad = 'I.w = float(VECTOR_NEQ(H, TRANSPARENT_PIXEL_COLOR));'
++            assert t.count(bad) == 1, 'xBR I.w line moved upstream - re-check the typo fix'
++            t = t.replace(bad, 'I.w = float(VECTOR_NEQ(I, TRANSPARENT_PIXEL_COLOR));')
++        t = t.replace(', \nuv_limits))', ', uv_limits))')
++        # GLSL 3.30 has no implicit int->uint conversion (4.00 does, which is
++        # why upstream compiles): a uint sample compared against a bare 0.
++        t = re.sub(r'\b([A-Z][A-Za-z0-9]*)(\s*(?:==|!=)\s*)0(?![u.\d])', r'\1\g<2>0u', t)
++        lines = t.split('\n')
++        while lines and not lines[-1].strip(): lines.pop()
++        out.append(f'/* mode {mode}: DuckStation {name} */\nstatic const char *TEXFILTER_{cname}_SRC =\n')
++        for l in lines:
++            l = l.replace('\t', '    ')
++            out.append('    "' + l.replace('\\', '\\\\').replace('"', '\\"') + '\\n"\n')
++        out.append('    ;\n\n')
++    out.append('#endif /* GPU_GL_TEXFILTERS_H */\n')
++    open(dst, 'w', encoding='utf-8').write(''.join(out))
++    print(f'{dst}: {sum(len(d[n].splitlines()) for n, _, _ in ORDER)} shader lines')
++    return 0
++
++if __name__ == '__main__':
++    sys.exit(main())
+-- 
+2.43.0
+

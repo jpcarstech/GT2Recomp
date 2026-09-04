@@ -1,0 +1,62 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 1c20b04..df233ea 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -2540,8 +2540,8 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         if (ImGui::Button(ui_text("Enhanced"), ImVec2(px(110), px(30))))
+             launcher_model_apply_display_preset(m, 1);
+         if (ImGui::IsItemHovered())
+-            ImGui::SetTooltip("%s", ui_text("A modern setup: 4x supersampling, JINC2 texture filtering "
+-                                            "with edge blending, FXAA, bilinear scaling, cropped and "
++            ImGui::SetTooltip("%s", ui_text("A modern setup: 4x supersampling, bilinear texture "
++                                            "filtering, FXAA, bilinear scaling, cropped and "
+                                             "bicubic-scaled movies with chroma smoothing."));
+         ImGui::PopID();
+         ImGui::Dummy(ImVec2(0, px(4)));
+@@ -4420,11 +4420,10 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
+         } end_panel();
+     }
+ 
+-    if (m->settings_bindings) {
+-        if (begin_panel("cfg_assist_binds", 0)) {
+-            draw_controller_assist_shortcuts(m, th);
+-        } end_panel();
+-    }
++    /* Controller hotkeys (rewind / save states / switch disc ... on
++     * Select+button or a chord) are no longer edited here; the runtime keeps
++     * reading them from settings.toml [hotkeys] with the shipped defaults. */
++    (void)draw_controller_assist_shortcuts;
+ }
+ 
+ void panel_controller_config_draw(LauncherModel* m, const LauncherTheme* th) {
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 5dcf0d8..cf8eeb3 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -1653,9 +1653,9 @@ void launcher_model_apply_display_preset(LauncherModel* m, int enhanced) {
+     if (m->has_supersampling)   m->s.supersampling   = enhanced ? 4 : 1;
+     if (m->has_antialiasing)    m->s.antialiasing    = enhanced ? 1 : 0;
+     if (m->has_texture_filter) {
+-        m->s.texture_filter     = enhanced ? 4 : 0;          /* JINC2 / nearest */
++        m->s.texture_filter     = enhanced ? 1 : 0;          /* bilinear / nearest */
+         m->s.texture_filter_2d  = 0;
+-        m->s.texture_edge_blend = enhanced ? 1 : 0;
++        m->s.texture_edge_blend = 0;
+         m->s.post_processing    = enhanced ? 1 : 0;          /* FXAA */
+     }
+     if (m->has_display_scaling)
+diff --git a/src/consoles/psx/psx_profile.h b/src/consoles/psx/psx_profile.h
+index fd96d06..b65b884 100644
+--- a/src/consoles/psx/psx_profile.h
++++ b/src/consoles/psx/psx_profile.h
+@@ -156,7 +156,9 @@ static inline void launcher_profile_apply_psx(RecompLauncherCGameInfo* gi) {
+     gi->aspect_mask           = 0;
+     // Full PS1 settings surface.
+     gi->has_window_size = 1; gi->has_renderer = 1; gi->has_supersampling = 1;
+-    gi->has_antialiasing = 1; gi->has_texture_filter = 1; gi->has_screen_kind = 1;
++    /* No Screen model row: the CRT/composite/Trinitron present LUT is not
++     * something PSX titles ship, so the row did nothing visible. */
++    gi->has_antialiasing = 1; gi->has_texture_filter = 1; gi->has_screen_kind = 0;
+     gi->has_fmv_filter = 1;    /* MDEC decodes video at native res; how it is
+                                 * scaled to the window is a player choice. */
+     gi->has_display_scaling = 1;

@@ -1,0 +1,71 @@
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 6ab2a1f..6c13f85 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -621,7 +621,7 @@ void launcher_model_init(LauncherModel* m,
+                      ? sk_prof->screen_kind_count : 4;
+         m->s.screen_kind = clampi(m->s.screen_kind, 0, sk_n - 1);
+     }
+-    if (m->has_texture_filter) m->s.texture_filter = clampi(m->s.texture_filter, 0, 2);
++    if (m->has_texture_filter) m->s.texture_filter = clampi(m->s.texture_filter, 0, 4);
+     if (m->has_texture_filter) m->s.texture_filter_2d = m->s.texture_filter_2d ? 1 : 0;
+     if (m->has_antialiasing) m->s.post_processing = (m->s.post_processing == 1) ? 1 : 0;
+     /* 0 = unset (a host predating the field): seed the default rather than
+@@ -1616,12 +1616,14 @@ const char* launcher_model_aa_label(const LauncherModel* m) {
+ }
+ 
+ void launcher_model_toggle_texture_filter(LauncherModel* m) {
+-    /* 0=nearest 1=bilinear 2=3-point(N64). (The renderer also implements an
+-     * approximate trilinear as mode 3, dropped from the cycle by user choice
+-     * — on PS1 content it read as a blurrier bilinear.) */
++    /* 0=nearest 1=bilinear 2=3-point(N64) 4=JINC2. (The renderer also
++     * implements an approximate trilinear as mode 3, dropped from the cycle
++     * by user choice — on PS1 content it read as a blurrier bilinear; a
++     * settings file that carries it shows and cycles as Bilinear.) */
+     int v = m->s.texture_filter;
+-    if (v < 0 || v > 2) v = v ? 1 : 0;
+-    m->s.texture_filter = (v + 1) % 3;
++    if (v == 4) v = 3; else if (v < 0 || v > 2) v = v ? 1 : 0;
++    v = (v + 1) % 4;
++    m->s.texture_filter = (v == 3) ? 4 : v;
+ }
+ 
+ void launcher_model_cycle_post_processing(LauncherModel* m) {
+@@ -1642,10 +1644,10 @@ void launcher_model_toggle_texture_filter_2d(LauncherModel* m) {
+ }
+ 
+ const char* launcher_model_texture_filter_label(const LauncherModel* m) {
+-    static const char* k_names[3] =
+-        { "Nearest", "Bilinear", "3-Point (N64)" };
++    static const char* k_names[4] =
++        { "Nearest", "Bilinear", "3-Point (N64)", "JINC2" };
+     int v = m->s.texture_filter;
+-    if (v < 0 || v > 2) v = v ? 1 : 0;
++    if (v == 4) v = 3; else if (v < 0 || v > 2) v = v ? 1 : 0;
+     return k_names[v];
+ }
+ 
+diff --git a/src/common/recomp_runtime_settings.c b/src/common/recomp_runtime_settings.c
+index a22b7e8..075dc83 100644
+--- a/src/common/recomp_runtime_settings.c
++++ b/src/common/recomp_runtime_settings.c
+@@ -6,7 +6,7 @@
+ static const char *const kFullscreenChoices[] = {
+     "Windowed", "Borderless", "Exclusive"
+ };
+-static const char *const kTextureFilterChoices[] = { "Nearest", "Linear" };
++static const char *const kTextureFilterChoices[] = { "Nearest", "Bilinear", "3-Point (N64)", "JINC2" };
+ /* Order matches RECOMP_LAUNCHER_FMV_FILTER_* minus one (choice indices are
+  * 0-based), least -> most smoothing. */
+ static const char *const kFmvFilterChoices[] = {
+@@ -112,8 +112,8 @@ RecompRuntimeUi *recomp_runtime_ui_create_standard(
+                  RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_TEXTURE_FILTER))
+         add_item(items, &count, RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER, "Graphics",
+-                 "Texture filtering", "Choose nearest or linear sampling.",
+-                 RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, kTextureFilterChoices, 2, NULL);
++                 "Texture filtering", "How 3D textures are sampled when magnified.",
++                 RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, kTextureFilterChoices, 4, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_FMV_FILTER))
+         add_item(items, &count, RECOMP_RUNTIME_UI_KEY_FMV_FILTER, "Graphics",
+                  "FMV filtering", "Choose how full-motion video is scaled up.",

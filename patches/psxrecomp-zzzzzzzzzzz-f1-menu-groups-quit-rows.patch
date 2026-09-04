@@ -1,0 +1,274 @@
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 770c6e55..88b60db2 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -2489,28 +2489,13 @@ static void apply_sibling_titles_to_game_info(RecompLauncherCGameInfo* gi) {
+  * process. Returns only on failure (caller then exits like QUIT). Handle
+  * inheritance stays OFF — an inherited listening socket is exactly the
+  * quit-hang bug the exit finisher had. */
+-static void switch_sibling_title_or_return(const char* argv0) {
++/* Start `exe` in launcher mode and leave. Shared by the sibling-title switch
++ * and the F1 menu's "Quit to launcher": both mean "come back to the launcher",
++ * the only difference being which title's exe is started. */
++static void spawn_into_launcher(const char* exe) {
+     namespace fs = std::filesystem;
+-    char exe[512] = {0};
+-    if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
+-        std::fprintf(stderr,
+-                     "psxrecomp: title switch requested but no exe path\n");
+-        return;
+-    }
+-    /* Persist [launcher] active_title = <folder name> in shared settings. */
+-    for (const auto& t : g_sibling_titles) {
+-        if (t.exe != exe) continue;
+-        auto us = PSXRecompV4::load_user_settings(settings_file_path(argv0));
+-        if (!us.parse_error) {
+-            us.active_title = t.dir_name;
+-            us.has_active_title = true;
+-            (void)PSXRecompV4::save_user_settings(settings_file_path(argv0),
+-                                                  us);
+-        }
+-        break;
+-    }
+     const fs::path exe_dir = fs::path(exe).parent_path();
+-    std::fprintf(stdout, "psxrecomp: switching title -> %s\n", exe);
++    std::fprintf(stdout, "psxrecomp: starting launcher -> %s\n", exe);
+ #ifdef _WIN32
+     {
+         STARTUPINFOA si;
+@@ -2545,6 +2530,66 @@ static void switch_sibling_title_or_return(const char* argv0) {
+     }
+ #endif
+ }
++
++/* F1 "Quit to launcher": restart this title's own exe into the launcher. */
++static void shutdown_runtime(void);
++static void quit_to_launcher(void) {
++    namespace fs = std::filesystem;
++    char exe[512] = {0};
++    /* recomp_launcher_relaunch_exe only knows a path when the launcher picked
++     * a sibling title this session, so fall back to this process's own image -
++     * quitting to the launcher restarts THIS title in every case. */
++    if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
++        std::error_code ec;
++        fs::path self;
++#ifdef _WIN32
++        wchar_t buf[MAX_PATH * 4];
++        DWORD n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
++        if (n > 0 && n < (DWORD)(sizeof(buf) / sizeof(buf[0])))
++            self = fs::path(std::wstring(buf, buf + n));
++#else
++        self = fs::read_symlink("/proc/self/exe", ec);
++        if (ec || self.empty()) {
++            if (const char* appimg = std::getenv("APPIMAGE"); appimg && appimg[0])
++                self = fs::absolute(appimg, ec);
++            else if (!g_sibling_argv0.empty())
++                self = fs::absolute(g_sibling_argv0, ec);
++        }
++#endif
++        if (self.empty()) {
++            std::fprintf(stderr, "psxrecomp: quit to launcher: no exe path\n");
++            return;
++        }
++        std::snprintf(exe, sizeof(exe), "%s", self.string().c_str());
++    }
++    psx_crash_trace_set_exit_origin("f1_quit_to_launcher");
++    shutdown_runtime();
++    spawn_into_launcher(exe);
++}
++
++static void switch_sibling_title_or_return(const char* argv0) {
++    namespace fs = std::filesystem;
++    char exe[512] = {0};
++    if (!recomp_launcher_relaunch_exe(exe, sizeof(exe)) || !exe[0]) {
++        std::fprintf(stderr,
++                     "psxrecomp: title switch requested but no exe path\n");
++        return;
++    }
++    /* Persist [launcher] active_title = <folder name> in shared settings. */
++    for (const auto& t : g_sibling_titles) {
++        if (t.exe != exe) continue;
++        auto us = PSXRecompV4::load_user_settings(settings_file_path(argv0));
++        if (!us.parse_error) {
++            us.active_title = t.dir_name;
++            us.has_active_title = true;
++            (void)PSXRecompV4::save_user_settings(settings_file_path(argv0),
++                                                  us);
++        }
++        break;
++    }
++    spawn_into_launcher(exe);
++}
++
+ #endif /* RECOMP_LAUNCHER */
+ 
+ static std::filesystem::path resolve_existing_runtime_path(const char* requested,
+@@ -6572,6 +6617,9 @@ extern "C" {
+ }
+ static const char kDisplayScaling[]  = "graphics.display_scaling";
+ static const char kFmvCrop[]         = "graphics.fmv_crop";
++/* F1 top-level quit rows. */
++static const char kRuntimeQuit[]         = "system.quit";
++static const char kRuntimeQuitLauncher[] = "system.quit_to_launcher";
+ /* F1 sibling-title switch rows (multi-title installs; see f1_titles_build). */
+ static const char kRuntimeDiscTitle[]       = "system.disc_title";
+ static const char kRuntimeDiscTitleSwitch[] = "system.disc_title_switch";
+@@ -7082,6 +7130,17 @@ static int runtime_ui_run_action(void *opaque,
+         if (context && context->ui) recomp_runtime_ui_close(context->ui);
+         return 1;
+     }
++    if (std::strcmp(item->key, kRuntimeQuit) == 0) {
++        /* The same clean path as closing the window: memory cards are
++         * flushed by shutdown_runtime. */
++        psx_crash_trace_set_exit_origin("f1_quit");
++        shutdown_runtime();
++        std::exit(0);
++    }
++    if (std::strcmp(item->key, kRuntimeQuitLauncher) == 0) {
++        quit_to_launcher();
++        return 1;   /* only reached if the relaunch could not start */
++    }
+     if (std::strcmp(item->key, kPgxpReset) == 0) {
+         pgxp_ui_reset_to_gt2_defaults();
+         runtime_ui_save(nullptr);   /* actions do not auto-save; drop [pgxp] now */
+@@ -7186,7 +7245,7 @@ static void runtime_settings_ui_ensure_created(void) {
+     if (g_runtime_settings_ui) return;
+ 
+     static const RecompRuntimeUiItem extras[] = {
+-        { kRuntimeControllerRoute, "Input", "Controller 1 route",
++        { kRuntimeControllerRoute, "Settings/Input", "Controller 1 route",
+           "Move host controller 1 between console ports without restarting.",
+           RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, kControllerRouteChoices, 2,
+           nullptr },
+@@ -7196,10 +7255,10 @@ static void runtime_settings_ui_ensure_created(void) {
+         { kRuntimeDiscReinsert, "Disc", "Reinsert current disc",
+           "Signal a tray-open/close cycle without changing the mounted image.",
+           RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
+-        { kDisplayScaling, "Graphics", "Display scaling",
++        { kDisplayScaling, "Settings/Graphics", "Display scaling",
+           "How the frame is fitted to the window (DS: Nearest / Bilinear Smooth / Sharp)",
+           RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, kDisplayScalingChoices, 3, nullptr },
+-        { kFmvCrop, "Graphics", "Crop FMVs",
++        { kFmvCrop, "Settings/Graphics", "Crop FMVs",
+           "Drop the black bars inside movie frames + CRT overscan; pixel aspect kept",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+         /* "Advanced": PGXP tuning - live, not persisted. The DuckStation knob
+@@ -7208,45 +7267,53 @@ static void runtime_settings_ui_ensure_created(void) {
+          * mod_builtin_pgxp.c) so nobody needs this page; it exists for
+          * people who want to see what each knob does, and the reset row
+          * below puts everything back. */
+-        { kPgxpGeometry, "Advanced", "PGXP: geometry correction",
++        { kPgxpGeometry, "Settings/Graphics/Advanced/PGXP", "Geometry correction",
+           "Sub-pixel vertices from the GTE shadow. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpTexture, "Advanced", "PGXP: perspective-correct textures",
++        { kPgxpTexture, "Settings/Graphics/Advanced/PGXP", "Perspective-correct textures",
+           "Per-vertex W from GTE depth. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpCulling, "Advanced", "PGXP: culling correction",
++        { kPgxpCulling, "Settings/Graphics/Advanced/PGXP", "Culling correction",
+           "NCLIP on full-precision projections. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpPreserve, "Advanced", "PGXP: preserve projection precision",
++        { kPgxpPreserve, "Settings/Graphics/Advanced/PGXP", "Preserve projection precision",
+           "Keep the unrounded GTE projection. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpColor, "Advanced", "PGXP: color correction",
++        { kPgxpColor, "Settings/Graphics/Advanced/PGXP", "Color correction",
+           "Perspective-correct Gouraud colours. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpTolerance, "Advanced", "PGXP: geometry tolerance",
++        { kPgxpTolerance, "Settings/Graphics/Advanced/PGXP", "Geometry tolerance",
+           "Max precise-vs-native distance. GT2 default: Unlimited",
+           RECOMP_RUNTIME_UI_CHOICE, 0, 5, 1, kPgxpToleranceChoices, 6, nullptr },
+-        { kPgxpDisable2d, "Advanced", "PGXP: disable on 2D polygons",
++        { kPgxpDisable2d, "Settings/Graphics/Advanced/PGXP", "Disable on 2D polygons",
+           "Any untracked corner -> whole poly native. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpVertexCache, "Advanced", "PGXP: vertex cache",
++        { kPgxpVertexCache, "Settings/Graphics/Advanced/PGXP", "Vertex cache",
+           "Screen-position fallback (breaks 2D backdrops). GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpCpuMode, "Advanced", "PGXP: CPU mode",
++        { kPgxpCpuMode, "Settings/Graphics/Advanced/PGXP", "CPU mode",
+           "Track precision through CPU arithmetic. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpDepth, "Advanced", "PGXP: depth buffer",
++        { kPgxpDepth, "Settings/Graphics/Advanced/PGXP", "Depth buffer",
+           "Z-test proven-depth triangles (seam pinholes). GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+-        { kPgxpTransDepth, "Advanced", "PGXP: depth buffer, transparent",
++        { kPgxpTransDepth, "Settings/Graphics/Advanced/PGXP", "Depth buffer, transparent",
+           "Also Z-test semi-transparent polys. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+         /* Last on purpose: the rows above persist across launches
+          * (settings.toml [pgxp]); this one puts them back and stops
+          * persisting them. */
+-        { kPgxpReset, "Advanced", "Reset PGXP to GT2 defaults",
++        { kPgxpReset, "Settings/Graphics/Advanced/PGXP", "Reset PGXP to GT2 defaults",
+           "Back to the shipped, lab-verified configuration (and forget these edits)",
+           RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
++        /* The two bottom rows. Each is a group of its own with a single
++         * action, which the menu shows as a plain top-level entry. */
++        { kRuntimeQuit, "Quit", "Quit",
++          "Close the game. Memory cards are flushed first.",
++          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
++        { kRuntimeQuitLauncher, "Quit to launcher", "Quit to launcher",
++          "Close the game and come back to the launcher.",
++          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
+     };
+ 
+     /* Multi-title installs: append the disc-switch rows after the static
+@@ -7309,7 +7376,7 @@ static void runtime_settings_ui_ensure_created(void) {
+         fr_apply_label = "Apply " + r.label + " (restarts game)";
+         RecompRuntimeUiItem pick{};
+         pick.key = kRuntimeFrameRate;
+-        pick.section = "Display";
++        pick.section = "Settings/Display";
+         pick.label = fr_label.c_str();
+         pick.description = fr_help.c_str();
+         pick.type = RECOMP_RUNTIME_UI_CHOICE;
+@@ -7321,7 +7388,7 @@ static void runtime_settings_ui_ensure_created(void) {
+         all_items.push_back(pick);
+         RecompRuntimeUiItem apply{};
+         apply.key = kRuntimeFrameRateApply;
+-        apply.section = "Display";
++        apply.section = "Settings/Display";
+         apply.label = fr_apply_label.c_str();
+         apply.description =
+             "The change takes effect at launch, so this quits cleanly and "
+@@ -7331,7 +7398,20 @@ static void runtime_settings_ui_ensure_created(void) {
+     }
+ 
+     RecompRuntimeUiStandardConfig config{};
+-    config.menu.title = "Runtime settings";
++    /* Header: which disc this is. On a multi-disc install that is the title's
++     * own [runtime] title_label ("Arcade", "Simulation"); otherwise the game
++     * name from its config. It goes in the TITLE rather than the subtitle so
++     * it stays on screen at every level of the menu - the subtitle is the
++     * breadcrumb once you are inside one. The menu's own identity is covered
++     * by the subtitle at the top level. */
++    static std::string f1_header;
++    f1_header.clear();
++    if (g_sibling_active >= 0 && (size_t)g_sibling_active < g_sibling_titles.size() &&
++        !g_sibling_titles[g_sibling_active].label.empty())
++        f1_header = g_sibling_titles[g_sibling_active].label + " disc";
++    if (f1_header.empty()) f1_header = s_picker_game_name;
++    if (f1_header.empty()) f1_header = "Runtime settings";
++    config.menu.title = f1_header.c_str();
+     config.menu.subtitle = "Paused - live settings + PGXP tuning";
+     config.menu.theme = "psx";
+     config.menu.accept_label = "Enter / Cross";
+@@ -7345,7 +7425,11 @@ static void runtime_settings_ui_ensure_created(void) {
+     config.menu.callbacks.visibility_changed = runtime_ui_visibility_changed;
+     /* A multi-disc install opens F1 to change discs far more often than to
+      * tune anything, so that section leads. Single-title: standard order. */
+-    config.menu.first_section = (g_f1_title_map.size() > 1) ? "Disc" : nullptr;
++    /* Group order follows first appearance, which would put Settings second;
++     * Disc is what a paused player reaches for, so hoist it to just under
++     * "Resume game". (The hoist skips the leading group, so Resume stays on
++     * top.) */
++    config.menu.first_section = "Disc";
+     config.features =
+         RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
+         RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE |

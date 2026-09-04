@@ -4,7 +4,7 @@
 [static recompilation](https://github.com/mstan/psxrecomp) built on your own
 machine from your own discs. Both game discs, switchable in seconds, up to 4K
 and beyond, widescreen, 60 FPS, save states and rewind, DuckStation-grade
-PGXP geometry correction. **No game data lives in this repository or its
+PGXP geometry correction, OpenGL or Vulkan. **No game data lives in this repository or its
 downloads.**
 
 ## Install
@@ -38,7 +38,7 @@ row switches discs, and so does **F1 → Disc → Switch disc** while playing.
 The first start opens the settings window — plug in your controller, pick
 your resolution, then open **Mods** and press **Enhanced** (widescreen,
 geometry correction, longer draw distance, full-detail AI cars, CPU overclock
-— the setup that runs best) or **Authentic 1999** (everything off), then hit
+— the setup that runs best) or **Original** (everything off), then hit
 Play. Every enhancement stays individually switchable underneath. Out of the
 box everything is off: you get the 1999 game, and each enhancement is yours
 to turn on. The **Cheats** page lists the codes verified for the disc you
@@ -48,6 +48,11 @@ race completion on the Simulation disc.
 Your garage follows you across discs: memory cards are shared, so Arcade's
 "Load Guest Garage" reads your Simulation garage exactly like on the real
 console.
+
+Settings > Display opens on the few rows most people want — the two picture
+presets, window size, fullscreen, supersampling and texture filtering. The
+rest of the renderer's controls, *Renderer* among them, are behind **Show
+advanced settings** at the bottom of that panel.
 
 In game: **F1** settings + disc switch · **F7** save states · **F8** rewind ·
 **Tab** turbo · **Alt+Enter** fullscreen · **Esc Esc** quit.
@@ -61,7 +66,7 @@ image from the fan project? Drop it in the folder too — it builds as a third
 switchable disc with its own extras. It's optional; the two plain discs
 cover everything else.
 
-## Known issues (0.3.0)
+## Known issues (0.4.0)
 
 - **60 FPS is CPU-heavy.** At 60 the emulated PlayStation does a frame's
   work every VBlank at up to 3.25× its real clock, and on many PCs that is
@@ -90,6 +95,14 @@ cover everything else.
   itself to native code), and the boot "Loading Save Data" screen takes a
   while.
 - Old 30 FPS replays and Rally ghosts don't play back correctly at 60 FPS.
+- **Vulkan has not been tried on a real Steam Deck.** The new renderer was
+  verified against OpenGL frame for frame on a Linux lab machine with a
+  software Vulkan driver, which is not the same as RADV under Proton. If it
+  misbehaves there, switch *Renderer* back to OpenGL (it is under *Show
+  advanced settings* in Display); a PC with no Vulkan driver falls back on
+  its own. See [`docs/STEAM_DECK.md`](docs/STEAM_DECK.md).
+- **Edge blending is softer on OpenGL than on Vulkan.** Vulkan does the
+  cut-out half but not the blend half yet. Both presets leave it off.
 
 ## Help
 
@@ -119,6 +132,8 @@ than the source it came with.
   [psxrecomp](https://github.com/mstan/psxrecomp) /
   [recomp-ui](https://github.com/mstan/recomp-ui) commits, each entry
   explaining the bug. CI re-applies the whole stack on every push.
+- [`docs/STEAM_DECK.md`](docs/STEAM_DECK.md) — running the Windows build on a
+  Steam Deck under Proton, and which launcher settings to pick there.
 - [`docs/PGXP_LESSONS.md`](docs/PGXP_LESSONS.md) — how the geometry-correction
   wobble was hunted down and fixed, written for other recompilation and
   emulator projects. [`docs/BRINGUP.md`](docs/BRINGUP.md) is the bring-up log.

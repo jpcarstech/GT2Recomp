@@ -1,0 +1,329 @@
+From 00c6a9895c5e1afe351ac10ec62bde9c50945169 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:46:34 +0000
+Subject: [PATCH] Texture filtering: RDP-exact 3-point, JINC2 mode
+ (DuckStation's), live texfilter A/B field
+
+3-point is now the N64 RDP datapath as angrylion-rdp-plus tex.c has it:
+10.5 coordinates with 5-bit fractions, upper = (sfrac + tfrac) & 0x20,
+the integer lerps with +0x10 >> 5 rounding on 5->8 bit-replicated
+channels. s = u - 0.5 maps the N64's centre-at-integer texel to the
+PS1's point-sampled cell. Coverage and STP are filtered as channels and
+the colour renormalised (DuckStation's premultiplied rule); cutout
+authority stays with the containing texel as in the bilinear path.
+
+texture_filtering = "jinc2" (mode 4): Hyllian's windowed-jinc 2-lobe
+sharper with anti-ringing, as DuckStation ships it (4x4 taps, wa/wb
+constants, AR 0.8), same coverage/STP handling. game.toml [video] accepts
+every mode; the F1 Texture filtering choice maps to Nearest / Bilinear /
+3-Point / JINC2 instead of collapsing the mode to a nearest/linear bool.
+{"cmd":"pgxp","texfilter":N} switches the mode live and the reply
+reports it.
+---
+ recompiler/src/config_loader.cpp |  17 +++--
+ recompiler/src/config_loader.h   |   5 +-
+ runtime/src/debug_server.c       |  10 ++-
+ runtime/src/gpu_gl_renderer.c    | 121 ++++++++++++++++++++++---------
+ runtime/src/main.cpp             |  12 +--
+ 5 files changed, 117 insertions(+), 48 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index d9fe3b3c..99f057f4 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -714,10 +714,14 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         }
+         if (video.contains("texture_filtering")) {
+             const auto mode = toml::find<std::string>(video, "texture_filtering");
+-            if (mode == "nearest")       rt.video_texture_filter = 0;
+-            else if (mode == "bilinear") rt.video_texture_filter = 1;
++            if (mode == "nearest")        rt.video_texture_filter = 0;
++            else if (mode == "bilinear")  rt.video_texture_filter = 1;
++            else if (mode == "3point")    rt.video_texture_filter = 2;
++            else if (mode == "trilinear") rt.video_texture_filter = 3;
++            else if (mode == "jinc2")     rt.video_texture_filter = 4;
+             else throw std::runtime_error(fmt::format(
+-                "[video] texture_filtering must be \"nearest\" or \"bilinear\": {}", mode));
++                "[video] texture_filtering must be \"nearest\", \"bilinear\", "
++                "\"3point\", \"trilinear\" or \"jinc2\": {}", mode));
+         }
+         if (video.contains("fmv_filter")) {
+             const auto mode = toml::find<std::string>(video, "fmv_filter");
+@@ -2431,6 +2435,7 @@ UserSettings load_user_settings(const fs::path& path) {
+             else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
+             else if (m == "3point") { s.texture_filter = 2; s.has_texture_filter = true; }
+             else if (m == "trilinear") { s.texture_filter = 3; s.has_texture_filter = true; }
++            else if (m == "jinc2") { s.texture_filter = 4; s.has_texture_filter = true; }
+         });
+         if (v.contains("texture_filtering_2d")) try_get([&]{
+             s.texture_filter_2d = toml::find<bool>(v, "texture_filtering_2d");
+@@ -2792,9 +2797,9 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+     if (s.has_texture_filter) {
+         /* Persist every mode: the earlier bool-shaped serializer silently
+          * downgraded 3-Point (N64) to "bilinear" across restarts. */
+-        static const char* k_tf_names[4] =
+-            { "nearest", "bilinear", "3point", "trilinear" };
+-        const int tf = (s.texture_filter >= 0 && s.texture_filter <= 3)
++        static const char* k_tf_names[5] =
++            { "nearest", "bilinear", "3point", "trilinear", "jinc2" };
++        const int tf = (s.texture_filter >= 0 && s.texture_filter <= 4)
+                            ? s.texture_filter : (s.texture_filter ? 1 : 0);
+         f << "texture_filtering = \"" << k_tf_names[tf] << "\"\n";
+     }
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 46528285..00880c84 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -478,7 +478,8 @@ struct RuntimeConfig {
+     bool                  video_antialiasing = true;
+ 
+     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
+-    // (smooths textures and 2D backgrounds). Stored as 0/1.
++    // | "3point" (N64 RDP three-point) | "trilinear" | "jinc2" (Hyllian's
++    // windowed jinc, the DuckStation option). Stored as 0..4.
+     int                   video_texture_filter = 0;
+ 
+     // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
+@@ -1296,7 +1297,7 @@ struct UserSettings {
+     // both the launcher and the emulator window so they boot at the same size.
+     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
+     bool has_antialiasing   = false; bool antialiasing   = true;
+-    bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear
++    bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear,4=jinc2
+     bool has_texture_filter_2d = false; bool texture_filter_2d = true; // filter 2D sprites/UI too
+     bool has_post_processing = false; int post_processing = 0; // 0=off,1=fxaa
+     // display_scaling: how the finished frame is scaled to the window.
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 7141e8da..c021c799 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -5345,6 +5345,11 @@ static void handle_pgxp(int id, const char *json)
+     int tex = json_get_int(json, "texture", -1);
+     if (tex >= 0)
+         gpu_texture_correction_set(tex != 0);
++    /* Texture sampling mode (0 nearest 1 bilinear 2 3-point 3 trilinear
++     * 4 JINC2), live, for filter A/Bs on one frame. Not persisted. */
++    int tf = json_get_int(json, "texfilter", -1);
++    if (tf >= 0 && tf <= 4)
++        gr_set_texture_filter(tf);
+     if (geom >= 0 && tex < 0) {
+         /* keep the engine armed consistently with both flags */
+         gpu_texture_correction_set(gpu_texture_correction_enabled());
+@@ -5471,7 +5476,7 @@ static void handle_pgxp(int id, const char *json)
+              "\"scale\":%d,\"gf_why\":%d,\"gf_active\":%d,\"gfthr\":%.3f,\"gfsim\":%.2f,\"gfrad\":%d,"
+              "\"framewipe\":%d,\"invalidations\":%u,"
+              "\"nclip_precise\":%llu,\"nclip_gated\":%llu,"
+-             "\"nclip_gate_why\":[%llu,%llu,%llu,%llu]}",
++             "\"nclip_gate_why\":[%llu,%llu,%llu,%llu],\"texfilter\":%d}",
+              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+              (unsigned)pgxp_test_suppress_depth(), pgxp_test_active(),
+              gpu_pgxp_depth_enabled(),
+@@ -5516,7 +5521,8 @@ static void handle_pgxp(int id, const char *json)
+              ({ extern uint64_t g_nclip_gate_why[4];
+                 (unsigned long long)g_nclip_gate_why[2]; }),
+              ({ extern uint64_t g_nclip_gate_why[4];
+-                (unsigned long long)g_nclip_gate_why[3]; }));
++                (unsigned long long)g_nclip_gate_why[3]; }),
++             gr_texture_filter());
+ }
+ 
+ /* pgxp_tri — vertex-coverage census: triangles by number of precise corners
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index b3a82a80..1f17579a 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -1259,7 +1259,7 @@ static const char *TEX_FS =
+     "uniform int u_semimode;  /* PS1 blend mode; drives dual-source factors */\n"
+     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
+     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
+-    "uniform int u_filter;    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear */\n"
++    "uniform int u_filter;    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear 4=JINC2 */\n"
+     "uniform float u_shift;\n"
+     "int vram_at(int x, int y){\n"
+     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
+@@ -1289,6 +1289,32 @@ static const char *TEX_FS =
+     "vec3 col5(int raw){\n"
+     "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
+     "}\n"
++    "/* N64 RDP texel: 16-bit RGBA5551 channels expand 5->8 by bit replication\n"
++    " * (c<<3 | c>>2). The PS1 has no alpha channel - a 0000h texel is the\n"
++    " * cutout - so coverage rides the alpha slot (255 opaque / 0 cutout) and\n"
++    " * the STP bit (0/255) is filtered beside it. */\n"
++    "ivec4 rdp_texel(int raw){\n"
++    "  if (raw == 0) return ivec4(0);\n"
++    "  int r = raw & 31, g = (raw >> 5) & 31, b = (raw >> 10) & 31;\n"
++    "  return ivec4((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), 255);\n"
++    "}\n"
++    "/* angrylion-rdp-plus tex.c texture_pipeline_cycle(), TF_BILERP, convert off:\n"
++    " *   upper = (sfrac + tfrac) & 0x20\n"
++    " *   lower: t0 + ((sfrac*(t1-t0) + tfrac*(t2-t0) + 0x10) >> 5)\n"
++    " *   upper: t3 + (((0x20-sfrac)*(t2-t3) + (0x20-tfrac)*(t1-t3) + 0x10) >> 5)\n"
++    " * t0=(s,t) t1=(s+1,t) t2=(s,t+1) t3=(s+1,t+1); 5-bit fractions of a 10.5\n"
++    " * coordinate; arithmetic shift on the signed products, as the RDP. */\n"
++    "ivec4 rdp_bilerp(ivec4 t0, ivec4 t1, ivec4 t2, ivec4 t3, int sfrac, int tfrac){\n"
++    "  if (((sfrac + tfrac) & 0x20) == 0)\n"
++    "    return t0 + ((sfrac * (t1 - t0) + tfrac * (t2 - t0) + ivec4(0x10)) >> 5);\n"
++    "  return t3 + (((0x20 - sfrac) * (t2 - t3) + (0x20 - tfrac) * (t1 - t3) + ivec4(0x10)) >> 5);\n"
++    "}\n"
++    "/* Hyllian's windowed-jinc 2-lobe sharper kernel (wa = pi*0.44, wb = pi*0.82,\n"
++    " * the constants DuckStation ships): sin(x*wa)*sin(x*wb)/x^2, wa*wb at 0. */\n"
++    "float jinc2_w(float x){\n"
++    "  const float wa = 1.382300768, wb = 2.576105976;\n"
++    "  return (x == 0.0) ? wa * wb : sin(x * wa) * sin(x * wb) / (x * x);\n"
++    "}\n"
+     "void main(){\n"
+     "  int stp; vec3 rgb;\n"
+     "  /* v_persp is 0 for every prim unless [video] perspective_texturing is on\n"
+@@ -1301,39 +1327,68 @@ static const char *TEX_FS =
+     "    rgb = col5(raw);\n"
+     "    stp = (raw >> 15) & 1;\n"
+     "  } else if (u_filter == 2) {\n"
+-    "    /* N64 three-point (the RDP TF_BILERP triangle filter, per the\n"
+-    "     * GlideN64/angrylion formulation): the texel-center lattice cell\n"
+-    "     * containing the sample splits along its diagonal; the sample blends\n"
+-    "     * the cell's shared right/upper corners with the lower-left corner\n"
+-    "     * below the diagonal (s+t < 1) or the upper-right corner above it,\n"
+-    "     * with barycentric weights. Cutout/STP authority stays with the\n"
+-    "     * CONTAINING texel (always one of the three), and transparent-texel\n"
+-    "     * weights are gated + renormalised like the bilinear path. */\n"
++    "    /* N64 three-point, the RDP datapath (see rdp_bilerp): the texel\n"
++    "     * cell splits on its diagonal and the sample blends the three corners\n"
++    "     * of the triangle it falls in, with 5-bit fractions and the RDP's\n"
++    "     * integer rounding. N64 coordinates put a texel's centre AT the\n"
++    "     * integer; a PS1 texel is point-sampled over [u,u+1), so s = u - 0.5\n"
++    "     * keeps the filter centred on the same texels nearest would show.\n"
++    "     * The RDP filters alpha as a channel and has no cutouts; here the\n"
++    "     * coverage channel (rdp_texel) is filtered the same way and the colour\n"
++    "     * renormalised by it - cutout texels are 0000h, black, so this is the\n"
++    "     * premultiplied division DuckStation applies to every filter and\n"
++    "     * keeps cutout borders from darkening. Cutout authority stays with the\n"
++    "     * CONTAINING texel, one of the four, as in the bilinear path. The\n"
++    "     * RDP's opt-in mid_texel mode (exact-centre 4-tap average) is off:\n"
++    "     * nothing on a PS1 asks for it. */\n"
+     "    uv += vec2(u_shift);\n"
+-    "    int nu = int(floor(uv.x)), nv = int(floor(uv.y));\n"
+-    "    int cA = fetch_texel(nu, nv);\n"
++    "    int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+     "    if (cA == 0) discard;\n"
+-    "    vec2 tc = uv - vec2(0.5);\n"
+-    "    int bu = int(floor(tc.x)), bv = int(floor(tc.y));\n"
+-    "    float fs = tc.x - float(bu), ft = tc.y - float(bv);\n"
+-    "    int up = (fs + ft >= 1.0) ? 1 : 0;\n"
+-    "    int cB = fetch_texel(bu + up, bv + up);\n"
+-    "    int cR = fetch_texel(bu + 1, bv);\n"
+-    "    int cU = fetch_texel(bu, bv + 1);\n"
+-    "    float wB = (up == 0) ? (1.0 - fs - ft) : (fs + ft - 1.0);\n"
+-    "    float wR = (up == 0) ? fs : (1.0 - ft);\n"
+-    "    float wU = (up == 0) ? ft : (1.0 - fs);\n"
+-    "    wB *= (cB == 0 ? 0.0 : 1.0);\n"
+-    "    wR *= (cR == 0 ? 0.0 : 1.0);\n"
+-    "    wU *= (cU == 0 ? 0.0 : 1.0);\n"
+-    "    float opac = wB + wR + wU;\n"
+-    "    if (opac <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
+-    "    else {\n"
+-    "      rgb = (col5(cB)*wB + col5(cR)*wR + col5(cU)*wU) / opac;\n"
+-    "      float stpf = (float((cB >> 15) & 1)*wB + float((cR >> 15) & 1)*wR\n"
+-    "                  + float((cU >> 15) & 1)*wU) / opac;\n"
+-    "      stp = stpf >= 0.5 ? 1 : 0;\n"
++    "    vec2 st = (uv - vec2(0.5)) * 32.0;              /* 10.5 fixed point */\n"
++    "    int si = int(floor(st.x)), ti = int(floor(st.y));\n"
++    "    int sfrac = si & 31, tfrac = ti & 31;\n"
++    "    int s0 = si >> 5, t0 = ti >> 5;\n"
++    "    int r0 = fetch_texel(s0, t0),     r1 = fetch_texel(s0 + 1, t0);\n"
++    "    int r2 = fetch_texel(s0, t0 + 1), r3 = fetch_texel(s0 + 1, t0 + 1);\n"
++    "    ivec4 c = rdp_bilerp(rdp_texel(r0), rdp_texel(r1), rdp_texel(r2), rdp_texel(r3), sfrac, tfrac);\n"
++    "    ivec4 sv = rdp_bilerp(ivec4(((r0 >> 15) & 1) * 255), ivec4(((r1 >> 15) & 1) * 255),\n"
++    "                          ivec4(((r2 >> 15) & 1) * 255), ivec4(((r3 >> 15) & 1) * 255), sfrac, tfrac);\n"
++    "    if (c.a <= 0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
++    "    else { rgb = clamp(vec3(c.rgb) / float(c.a), 0.0, 1.0); stp = (sv.x * 2 >= c.a) ? 1 : 0; }\n"
++    "  } else if (u_filter == 4) {\n"
++    "    /* JINC2 - Hyllian's windowed-jinc 2-lobe sharper with anti-ringing,\n"
++    "     * the port DuckStation carries (gpu_hw_shadergen.cpp, from Beetle\n"
++    "     * PSX): a 4x4 texel neighbourhood weighted by jinc2_w of the distance\n"
++    "     * to each texel centre, normalised, then clamped towards the min/max\n"
++    "     * of the inner 2x2 at AR strength 0.8. Coverage (1 opaque / 0 cutout)\n"
++    "     * and STP are filtered as channels and the colour is renormalised by\n"
++    "     * coverage, exactly as DuckStation does; cutout authority stays with\n"
++    "     * the containing texel like every other mode here. */\n"
++    "    uv += vec2(u_shift);\n"
++    "    int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
++    "    if (cA == 0) discard;\n"
++    "    vec2 pc = uv;\n"
++    "    ivec2 bi = ivec2(floor(pc - vec2(0.5)));       /* texel c11 of the 4x4 */\n"
++    "    vec2 tc = vec2(bi) + vec2(0.5);\n"
++    "    vec4 acc = vec4(0.0); float accs = 0.0, wsum = 0.0;\n"
++    "    vec4 mn = vec4(1.0), mx = vec4(0.0); float mns = 1.0, mxs = 0.0;\n"
++    "    for (int j = -1; j <= 2; j++) {\n"
++    "      for (int i = -1; i <= 2; i++) {\n"
++    "        int raw = fetch_texel(bi.x + i, bi.y + j);\n"
++    "        vec4 cs = (raw == 0) ? vec4(0.0) : vec4(col5(raw), 1.0);\n"
++    "        float ss = (raw == 0) ? 0.0 : float((raw >> 15) & 1);\n"
++    "        float w = jinc2_w(distance(pc, tc + vec2(float(i), float(j))));\n"
++    "        acc += w * cs; accs += w * ss; wsum += w;\n"
++    "        if (i >= 0 && i <= 1 && j >= 0 && j <= 1) {\n"
++    "          mn = min(mn, cs); mx = max(mx, cs); mns = min(mns, ss); mxs = max(mxs, ss);\n"
++    "        }\n"
++    "      }\n"
+     "    }\n"
++    "    acc /= wsum; accs /= wsum;\n"
++    "    acc  = mix(acc,  clamp(acc,  mn,  mx),  0.8);   /* anti-ringing */\n"
++    "    accs = mix(accs, clamp(accs, mns, mxs), 0.8);\n"
++    "    if (acc.a <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
++    "    else { rgb = clamp(acc.rgb / acc.a, 0.0, 1.0); stp = (accs >= 0.5 * acc.a) ? 1 : 0; }\n"
+     "  } else {\n"
+     "    /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base\n"
+     "     * (cutout + STP authority), the neighbours lie toward the sub-texel\n"
+@@ -2861,10 +2916,10 @@ static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (w
+                                                       need the true scale — the FBO-direct present is
+                                                       unaffected since it never reads gr_scale()) */
+ static void glb_set_texture_filter(int b) {
+-    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear; the software
++    /* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear 4=JINC2; the software
+      * rasterizer only knows nearest/bilinear — any filtered mode maps to
+      * its bilinear. */
+-    s_tex_filter = (b >= 0 && b <= 3) ? b : (b ? 1 : 0);
++    s_tex_filter = (b >= 0 && b <= 4) ? b : (b ? 1 : 0);
+     sw_set_texture_filter(b != 0);
+ }
+ static int  glb_texture_filter(void) { return s_tex_filter; }
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 82d899e7..47aaf127 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6665,7 +6665,9 @@ static int runtime_ui_get_value(void*, const RecompRuntimeUiItem *item,
+     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0)
+         *value_out = g_video_aa ? 1 : 0;
+     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER) == 0)
+-        *value_out = g_video_texfilter ? 1 : 0;
++        /* F1 choice index 0..3 = Nearest / Bilinear / 3-Point / JINC2; the
++         * renderer's mode 3 (trilinear) is not offered and shows as Bilinear. */
++        *value_out = g_video_texfilter == 4 ? 3 : (g_video_texfilter >= 0 && g_video_texfilter <= 2) ? g_video_texfilter : 1;
+     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0)
+         *value_out = host_volume_get();
+     else if (std::strcmp(item->key, kRuntimeControllerRoute) == 0)
+@@ -6718,7 +6720,7 @@ static int runtime_ui_set_value(void*, const RecompRuntimeUiItem *item,
+                 g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+     } else if (std::strcmp(item->key,
+                            RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER) == 0) {
+-        g_video_texfilter = value ? 1 : 0;
++        g_video_texfilter = value == 3 ? 4 : (value >= 0 && value <= 2) ? value : 1;
+         gr_set_texture_filter(g_video_texfilter);
+     } else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) {
+         host_volume_set(value);
+@@ -14325,10 +14327,10 @@ int main(int argc, char** argv) {
+                 seed.has_aspect_ratio = true;
+                 /* has_texture_filter is on (PSX profile) so the launcher edits
+                  * ls.texture_filter directly (0=nearest 1=bilinear 2=3-point(N64)
+-                 * 3=trilinear); ls.linear_filter is the legacy fallback field for
+-                 * consoles without the cap and is left unused here. */
++                 * 3=trilinear 4=JINC2); ls.linear_filter is the legacy fallback
++                 * field for consoles without the cap and is left unused here. */
+                 seed.texture_filter =
+-                    (ls.texture_filter >= 0 && ls.texture_filter <= 3)
++                    (ls.texture_filter >= 0 && ls.texture_filter <= 4)
+                         ? ls.texture_filter : (ls.texture_filter ? 1 : 0);
+                 seed.has_texture_filter = true;
+                 seed.texture_filter_2d = ls.texture_filter_2d != 0;
+-- 
+2.43.0
+

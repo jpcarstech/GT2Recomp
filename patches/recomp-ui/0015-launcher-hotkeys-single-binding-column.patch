@@ -1,0 +1,81 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 6d59f37..41b21d5 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -3442,43 +3442,44 @@ void draw_hotkeys_controls(LauncherModel* m, const LauncherTheme& th) {
+     if (m->has_solar_sensor) mask |= LNG_HOTKEYS_SOLAR;
+     // Switch disc only means something on a multi-disc install.
+     if (m->num_titles > 1) mask |= LNG_HOTKEYS_SWITCH_DISC;
+-    // One row per hotkey, two bind columns: [KeyMap] values are a comma
+-    // list the runtime matches any of, shown here as Primary / Secondary.
+-    // A capture ends with the key pressed; Backspace or Delete while
+-    // capturing clears that slot.
+-    const float btn_w = px(130);
+-    if (ImGui::BeginTable("hk", 3, ImGuiTableFlags_SizingFixedFit)) {
+-        ImGui::TableSetupColumn("Hotkey", ImGuiTableColumnFlags_WidthStretch);
+-        ImGui::TableSetupColumn("Primary", ImGuiTableColumnFlags_WidthFixed, btn_w);
+-        ImGui::TableSetupColumn("Secondary", ImGuiTableColumnFlags_WidthFixed, btn_w);
+-        ImGui::TableNextRow();
+-        ImGui::TableNextColumn(); ImGui::TextColored(col(th.text_muted), "%s", ui_text("Hotkey"));
+-        ImGui::TableNextColumn(); ImGui::TextColored(col(th.text_muted), "%s", ui_text("Primary"));
+-        ImGui::TableNextColumn(); ImGui::TextColored(col(th.text_muted), "%s", ui_text("Secondary"));
++    // One binding per hotkey, laid out as a responsive grid (upstream's
++    // treatment). A second "secondary" slot was tried here and taken back
++    // out: [KeyMap] still accepts a comma list, so a player who wants two
++    // keys can put both in the file, but the launcher asks for one.
++    const float cell_w = px(280.0f);
++    int cols = (int)(ImGui::GetContentRegionAvail().x / cell_w);
++    cols = cols < 1 ? 1 : (cols > 3 ? 3 : cols);
++    // Uniform label column: measure the widest bound hotkey name up front so
++    // every bind button in the grid starts at the same x within its cell.
++    float label_w = 0.0f;
++    for (int h = 0; h < LNG_HK_COUNT; ++h) {
++        if (!(mask & (1u << h))) continue;
++        float w = ImGui::CalcTextSize(ui_text(launcher_hotkey_name((LngHotkey)h))).x;
++        if (w > label_w) label_w = w;
++    }
++    label_w += px(16.0f);   // gap between label and its bind button
++    if (ImGui::BeginTable("hk", cols)) {
+         for (int h = 0; h < LNG_HK_COUNT; ++h) {
+             if (!(mask & (1u << h))) continue;
+-            ImGui::TableNextRow();
+             ImGui::TableNextColumn();
+             ImGui::PushID(h);
++            const char* hkname = ui_text(launcher_hotkey_name((LngHotkey)h));
+             ImGui::AlignTextToFramePadding();
+-            ImGui::TextUnformatted(ui_text(launcher_hotkey_name((LngHotkey)h)));
+-            for (int slot = 0; slot < 2; ++slot) {
+-                ImGui::TableNextColumn();
+-                ImGui::PushID(slot);
+-                char lbl[64];
+-                launcher_binds_hotkey_slot_label(m, (LngHotkey)h, slot, lbl, sizeof(lbl));
+-                const bool cap = m->hk_capturing && m->capture_hk == (LngHotkey)h &&
+-                                 m->capture_hk_slot == slot;
+-                const char* text = cap ? ui_text("[ press... ]")
+-                                 : lbl[0] ? lbl : ui_text("(unbound)");
+-                if (cap) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
+-                if (ImGui::Button(text, ImVec2(btn_w, 0)))
+-                    launcher_model_begin_hk_capture_slot(m, (LngHotkey)h, slot);
+-                if (cap) ImGui::PopStyleColor();
+-                if (ImGui::IsItemHovered())
+-                    ImGui::SetTooltip("%s", ui_text("Click, then press the key. Backspace clears it."));
+-                ImGui::PopID();
+-            }
++            ImGui::TextColored(col(th.text_muted), "%s", hkname);
++            // Pad with RELATIVE spacing (not absolute x) so the bind button
++            // starts at a uniform offset within every table cell.
++            ImGui::SameLine(0.0f, label_w - ImGui::CalcTextSize(hkname).x);
++            const bool cap = m->hk_capturing && m->capture_hk == (LngHotkey)h;
++            char slot_lbl[64];
++            launcher_binds_hotkey_slot_label(m, (LngHotkey)h, 0, slot_lbl, sizeof(slot_lbl));
++            const char* lbl = cap ? ui_text("[ press... ]")
++                            : slot_lbl[0] ? slot_lbl : ui_text("(unbound)");
++            if (cap) ImGui::PushStyleColor(ImGuiCol_Button, col(th.accent));
++            if (ImGui::Button(lbl, ImVec2(px(130), 0)))
++                launcher_model_begin_hk_capture_slot(m, (LngHotkey)h, 0);
++            if (cap) ImGui::PopStyleColor();
++            if (ImGui::IsItemHovered())
++                ImGui::SetTooltip("%s", ui_text("Click, then press the key. Backspace clears it."));
+             ImGui::PopID();
+         }
+         ImGui::EndTable();

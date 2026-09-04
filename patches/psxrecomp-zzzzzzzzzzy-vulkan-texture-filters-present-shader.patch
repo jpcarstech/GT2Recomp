@@ -1,0 +1,2881 @@
+diff --git a/runtime/include/gpu_vk_renderer.h b/runtime/include/gpu_vk_renderer.h
+index 8f710773..e7b4695a 100644
+--- a/runtime/include/gpu_vk_renderer.h
++++ b/runtime/include/gpu_vk_renderer.h
+@@ -45,6 +45,13 @@ void vk_renderer_set_fmv_crop(int native_rows);
+ void vk_renderer_set_fmv_letterbox(int native_rows);
+ void vk_renderer_set_fmv_filter(int cfg_value);
+ void vk_renderer_set_fmv_chroma_smoothing(int on);
++/*   texture_filter_2d  - filter screen-aligned 2D prims (HUD, menus) too.
++ *   texture_edge_blend - drop fragments whose filtered coverage is under a
++ *                        half (the cutout half of DuckStation's rule). */
++void vk_renderer_set_texture_filter_2d(int on);
++void vk_renderer_set_texture_edge_blend(int on);
++/*   post_processing     - 1 = FXAA over the presented frame (shader pass). */
++void vk_renderer_set_post_processing(int mode);
+ 
+ /* Tear down all Vulkan objects (idempotent). */
+ void vk_renderer_shutdown(void);
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index f73084f7..6deaf2e2 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -1739,8 +1739,12 @@ function(psxrecomp_add_runtime_target target)
+                     "${PSXRECOMP_ROOT}/tools/embed_spirv.py"
+                     --glslc "${GLSLC_EXE}"
+                     --out   "${_vk_spv_hdr}"
++                    # One SPIR-V per texture-filter mode, the way the OpenGL
++                    # backend builds one program per mode (see geo_tex.frag).
++                    --variants geo_tex.frag:PSX_TEXFILTER:0-10
+                     ${_vk_shaders}
+             DEPENDS ${_vk_shaders}
++                    "${_vk_shader_dir}/texfilters.glsl"
+                     "${PSXRECOMP_ROOT}/tools/embed_spirv.py"
+             COMMENT "Compiling + embedding Vulkan SPIR-V shaders"
+             VERBATIM)
+diff --git a/runtime/shaders/geo_tex.frag b/runtime/shaders/geo_tex.frag
+index 02f961c6..b475dc0f 100644
+--- a/runtime/shaders/geo_tex.frag
++++ b/runtime/shaders/geo_tex.frag
+@@ -1,9 +1,23 @@
+ #version 450
++#extension GL_GOOGLE_include_directive : require
+ /* Textured fragment: sample raw 1555 VRAM (integer), CLUT-decode per depth,
+- * texture window, optional bilinear, texel-0 cutout discard, STP-split discard,
+- * PS1 *2-around-0x80 colour modulation. Output alpha = bit15 of the written
+- * pixel. Ported verbatim from the GL backend's TEX_FS (usampler2D u_vram = the
+- * native R16_UINT raw VRAM mirror). */
++ * texture window, texture filtering, texel-0 cutout discard, STP-split
++ * discard, PS1 *2-around-0x80 colour modulation. Output alpha = bit15 of the
++ * written pixel.
++ *
++ * PSX_TEXFILTER selects ONE filter mode at compile time, exactly as the
++ * OpenGL backend's program variants do (0 nearest, 1 bilinear, 2 three-point,
++ * 3 trilinear, 4 JINC2, 5 xBR, 6 Scale2x, 7 Scale3x, 8/9/10 the MMPX family).
++ * embed_spirv.py compiles this file once per mode; the renderer swaps the
++ * module when the setting changes. The nearest path is always present because
++ * pc.u_filter turns filtering off per batch (2D prims with "Filter 2D
++ * elements" off), so the bilinear variant never pays for MMPX Advanced's
++ * register footprint. Every line below the compat layer is the OpenGL
++ * backend's TEX_FS text (gpu_gl_renderer.c) - keep them in step. */
++#ifndef PSX_TEXFILTER
++#define PSX_TEXFILTER 1
++#endif
++
+ layout(location = 0) noperspective in vec2  v_uv;
+ layout(location = 1) noperspective in vec4  v_col;
+ layout(location = 2) flat in ivec2 v_tpage;   /* texture page base, VRAM px */
+@@ -22,7 +36,9 @@ layout(push_constant) uniform PC {
+     float u_xhalf;
+     int   u_semipass;   /* 0=all texels, 1=STP=0 only, 2=STP=1 only */
+     int   u_maskset;    /* GP0(E6h) set-mask: OR bit15 into output */
+-    int   u_filter;     /* 1 = bilinear */
++    int   u_filter;     /* 0 = nearest for this batch, else PSX_TEXFILTER */
++    int   u_edge;       /* edge blending: drop fragments below half coverage */
++    int   u_pad;
+     ivec4 u_twin;       /* texture window: mask_x, mask_y, off_x, off_y */
+ } pc;
+ 
+@@ -33,12 +49,14 @@ int vram_at(int x, int y) {
+ }
+ int fetch_texel(int u, int v) {
+     u &= 255; v &= 255;
++    /* DuckStation order: clamp to the prim's sampled bounds FIRST, then apply
++     * the texture window (window-replacing-clamp let upscaled edge pixels
++     * wrap to a tile's opposite edge - dark lines on the GT2 road). */
++    u = clamp(u, v_limits.x, v_limits.z);
++    v = clamp(v, v_limits.y, v_limits.w);
+     if ((pc.u_twin.x | pc.u_twin.y) != 0) {
+         u = (u & ~(pc.u_twin.x * 8)) | ((pc.u_twin.z & pc.u_twin.x) * 8);
+         v = (v & ~(pc.u_twin.y * 8)) | ((pc.u_twin.w & pc.u_twin.y) * 8);
+-    } else {
+-        u = clamp(u, v_limits.x, v_limits.z);
+-        v = clamp(v, v_limits.y, v_limits.w);
+     }
+     if (v_depth == 0) {
+         int px = vram_at(v_tpage.x + (u >> 2), v_tpage.y + v);
+@@ -52,8 +70,43 @@ int fetch_texel(int u, int v) {
+ vec3 col5(int raw) {
+     return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;
+ }
++/* Hyllian's windowed-jinc 2-lobe sharper kernel (wa = pi*0.44, wb = pi*0.82,
++ * the constants DuckStation ships): sin(x*wa)*sin(x*wb)/x^2, wa*wb at 0. */
++float jinc2_w(float x) {
++    const float wa = 1.382300768, wb = 2.576105976;
++    return (x == 0.0) ? wa * wb : sin(x * wa) * sin(x * wb) / (x * x);
++}
++
++#if PSX_TEXFILTER >= 5
++/* HLSL-style names the DuckStation-ported blocks are written against, plus the
++ * VRAM accessor they call. Identical to the OpenGL backend's TEX_FS_COMPAT,
++ * minus the packUnorm4x8/unpackUnorm4x8 shims: those exist there only because
++ * that shader is #version 330, and GLSL 450 has them built in. */
++#define float4 vec4
++#define float3 vec3
++#define float2 vec2
++#define int4 ivec4
++#define int2 ivec2
++#define bool4 bvec4
++#define lerp mix
++#define frac fract
++#define saturate(x) clamp((x), 0.0, 1.0)
++#define CONSTANT const
++#define GLSL 1
++#define VECTOR_EQ(a, b) all(equal((a), (b)))
++#define VECTOR_NEQ(a, b) any(notEqual((a), (b)))
++#define VECTOR_COMP_EQ(a, b) equal((a), (b))
++#define TEXPAGE_VALUE int
++#define TRANSPARENT_PIXEL_COLOR vec4(0.0, 0.0, 0.0, 0.0)
++vec4 SampleFromVRAM(int texpage, vec2 coords, vec4 uv_limits) {
++    int raw = fetch_texel(int(floor(coords.x)), int(floor(coords.y)));
++    return (raw == 0) ? vec4(0.0) : vec4(col5(raw), float((raw >> 15) & 1));
++}
++#include "texfilters.glsl"
++#endif
++
+ void main() {
+-    int stp; vec3 rgb;
++    int stp; vec3 rgb; float cov = 1.0;
+     /* v_persp is 0 for every prim unless [video] perspective_texturing is on
+      * AND this prim's packet carried full GTE projection provenance, so the
+      * default is the PS1's affine (noperspective) mapping. */
+@@ -64,19 +117,92 @@ void main() {
+         rgb = col5(raw);
+         stp = (raw >> 15) & 1;
+     } else {
++#if PSX_TEXFILTER >= 5
++        /* DuckStation-ported filter (texfilters.glsl): its own cutout rule -
++         * the filtered coverage decides, below one half the fragment is gone. */
++        uv += vec2(pc.u_shift);
++        vec4 tcol; float ia;
++        FilteredSampleFromVRAM(0, uv, vec4(v_limits), tcol, ia);
++        if (ia < 0.5) discard;
++        cov = ia; rgb = clamp(tcol.rgb, 0.0, 1.0); stp = tcol.a >= 0.5 ? 1 : 0;
++#elif PSX_TEXFILTER == 2
++        /* N64 three-point as mupen64plus / GLideN64 render it: the texel cell
++         * splits on its diagonal,
++         *   c0 = c00 + s*(c10-c00) + t*(c01-c00)            (lower-left)
++         *   c1 = c11 + (1-s)*(c01-c11) + (1-t)*(c10-c11)    (upper-right)
++         *   result = c0 + step(1, s+t)*(c1-c0)
++         * on texels premultiplied by coverage, so a cutout neighbour never
++         * darkens the edge. Cutout authority stays with the containing texel. */
++        uv += vec2(pc.u_shift);
++        int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));
++        if (pc.u_edge == 0 && cA == 0) discard;
++        vec2 tile = uv - vec2(0.5);
++        ivec2 ip = ivec2(floor(tile));
++        vec2 fr = tile - vec2(ip);
++        int r00 = fetch_texel(ip.x, ip.y),     r10 = fetch_texel(ip.x + 1, ip.y);
++        int r01 = fetch_texel(ip.x, ip.y + 1), r11 = fetch_texel(ip.x + 1, ip.y + 1);
++        vec4 c00 = (r00 == 0) ? vec4(0.0) : vec4(col5(r00), 1.0);
++        vec4 c10 = (r10 == 0) ? vec4(0.0) : vec4(col5(r10), 1.0);
++        vec4 c01 = (r01 == 0) ? vec4(0.0) : vec4(col5(r01), 1.0);
++        vec4 c11 = (r11 == 0) ? vec4(0.0) : vec4(col5(r11), 1.0);
++        float s00 = float((r00 >> 15) & 1) * c00.a, s10 = float((r10 >> 15) & 1) * c10.a;
++        float s01 = float((r01 >> 15) & 1) * c01.a, s11 = float((r11 >> 15) & 1) * c11.a;
++        float bottomRightTri = step(1.0, fr.s + fr.t);
++        vec4 c0 = c00 + fr.s * (c10 - c00) + fr.t * (c01 - c00);
++        vec4 c1 = c11 + (1.0 - fr.s) * (c01 - c11) + (1.0 - fr.t) * (c10 - c11);
++        vec4 res = c0 + bottomRightTri * (c1 - c0);
++        float sp0 = s00 + fr.s * (s10 - s00) + fr.t * (s01 - s00);
++        float sp1 = s11 + (1.0 - fr.s) * (s01 - s11) + (1.0 - fr.t) * (s10 - s11);
++        float sres = sp0 + bottomRightTri * (sp1 - sp0);
++        cov = res.a;
++        if (res.a <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }
++        else { rgb = clamp(res.rgb / res.a, 0.0, 1.0); stp = (sres >= 0.5 * res.a) ? 1 : 0; }
++#elif PSX_TEXFILTER == 4
++        /* JINC2 - Hyllian's windowed-jinc 2-lobe sharper with anti-ringing, as
++         * DuckStation carries it: a 4x4 neighbourhood weighted by jinc2_w of
++         * the distance to each texel centre, normalised, then clamped towards
++         * the inner 2x2's min/max at AR strength 0.8. */
++        uv += vec2(pc.u_shift);
++        int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));
++        if (pc.u_edge == 0 && cA == 0) discard;
++        vec2 pcoord = uv;
++        ivec2 bi = ivec2(floor(pcoord - vec2(0.5)));   /* texel c11 of the 4x4 */
++        vec2 tc = vec2(bi) + vec2(0.5);
++        vec4 acc = vec4(0.0); float accs = 0.0, wsum = 0.0;
++        vec4 mn = vec4(1.0), mx = vec4(0.0); float mns = 1.0, mxs = 0.0;
++        for (int j = -1; j <= 2; j++) {
++            for (int i = -1; i <= 2; i++) {
++                int raw = fetch_texel(bi.x + i, bi.y + j);
++                vec4 cs = (raw == 0) ? vec4(0.0) : vec4(col5(raw), 1.0);
++                float ss = (raw == 0) ? 0.0 : float((raw >> 15) & 1);
++                float w = jinc2_w(distance(pcoord, tc + vec2(float(i), float(j))));
++                acc += w * cs; accs += w * ss; wsum += w;
++                if (i >= 0 && i <= 1 && j >= 0 && j <= 1) {
++                    mn = min(mn, cs); mx = max(mx, cs);
++                    mns = min(mns, ss); mxs = max(mxs, ss);
++                }
++            }
++        }
++        acc /= wsum; accs /= wsum;
++        acc  = mix(acc,  clamp(acc,  mn,  mx),  0.8);   /* anti-ringing */
++        accs = mix(accs, clamp(accs, mns, mxs), 0.8);
++        cov = acc.a;
++        if (acc.a <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }
++        else { rgb = clamp(acc.rgb / acc.a, 0.0, 1.0); stp = (accs >= 0.5 * acc.a) ? 1 : 0; }
++#else
+         /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base
+          * (cutout + STP authority), the neighbours lie toward the sub-texel
+-         * offset and clamp to v_limits. Transparent neighbours are ignored and
+-         * the colour is renormalised, but a transparent base stays cut out.
+-         * v_uv is aligned for PS1 top-left point sampling; recenter the
+-         * bilinear footprint so 1x rect tiles sample their own texels. */
++         * offset and clamp to v_limits, and each texel's weight is gated by its
++         * opacity with the colour renormalised - so prim edges and cutout
++         * borders keep their colour instead of dissolving into the transparent
++         * (black) neighbour. Recenter from PS1 top-left point sampling. */
+         uv += vec2(pc.u_shift);
+         int iu = int(floor(uv.x)), iv = int(floor(uv.y));
+         float fx = uv.x - float(iu) - 0.5, fy = uv.y - float(iv) - 0.5;
+         int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;
+         fx = abs(fx); fy = abs(fy);
+         int c00 = fetch_texel(iu, iv);
+-        if (c00 == 0) discard;
++        if (pc.u_edge == 0 && c00 == 0) discard;
+         int c10 = fetch_texel(iu + sx, iv);
+         int c01 = fetch_texel(iu, iv + sy);
+         int c11 = fetch_texel(iu + sx, iv + sy);
+@@ -85,10 +211,46 @@ void main() {
+         float w01 = (c01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;
+         float w11 = (c11 == 0 ? 0.0 : 1.0) * fx * fy;
+         float opac = w00 + w10 + w01 + w11;
+-        rgb = (col5(c00) * w00 + col5(c10) * w10 + col5(c01) * w01 + col5(c11) * w11) / opac;
++        cov = opac;
++        if (opac <= 0.0) { rgb = col5(c00); stp = (c00 >> 15) & 1; }
++        else {
++        rgb = (col5(c00)*w00 + col5(c10)*w10 + col5(c01)*w01 + col5(c11)*w11) / opac;
+         float stpf = (float((c00 >> 15) & 1) * w00 + float((c10 >> 15) & 1) * w10
+                     + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;
++        /* Trilinear: PS1 textures have no mip chain (CLUT data cannot be
++         * pre-averaged), so approximate the next level with a 2-texel-wide tent
++         * at the same weights and blend by the screen-space LOD - identical to
++         * bilinear at magnification, softens minification shimmer. */
++#if PSX_TEXFILTER == 3
++        {
++            float lod = clamp(log2(max(fwidth(uv.x), fwidth(uv.y))), 0.0, 1.0);
++            if (lod > 0.0) {
++                int d10 = fetch_texel(iu + 2*sx, iv);
++                int d01 = fetch_texel(iu, iv + 2*sy);
++                int d11 = fetch_texel(iu + 2*sx, iv + 2*sy);
++                float v10 = (d10 == 0 ? 0.0 : 1.0) * fx * (1.0 - fy);
++                float v01 = (d01 == 0 ? 0.0 : 1.0) * (1.0 - fx) * fy;
++                float v11 = (d11 == 0 ? 0.0 : 1.0) * fx * fy;
++                float opac2 = w00 + v10 + v01 + v11;
++                if (opac2 > 0.0) {
++                    vec3 rgb2 = (col5(c00)*w00 + col5(d10)*v10 + col5(d01)*v01
++                               + col5(d11)*v11) / opac2;
++                    float stpf2 = (float((c00 >> 15) & 1)*w00 + float((d10 >> 15) & 1)*v10
++                                 + float((d01 >> 15) & 1)*v01 + float((d11 >> 15) & 1)*v11) / opac2;
++                    rgb = mix(rgb, rgb2, lod);
++                    stpf = mix(stpf, stpf2, lod);
++                }
++            }
++        }
++#endif
+         stp = stpf >= 0.5 ? 1 : 0;
++        }
++#endif
++        /* Edge blending (u_edge): DuckStation's rule - a fragment whose
++         * filtered coverage is below one half is dropped. The OpenGL backend
++         * additionally blends the rest by coverage through a dual-source
++         * factor; that half is not here yet, so this is the cutout part only. */
++        if (pc.u_edge != 0 && cov < 0.5) discard;
+     }
+     if (pc.u_semipass == 1 && stp == 1) discard;
+     if (pc.u_semipass == 2 && stp == 0) discard;
+diff --git a/runtime/shaders/present.frag b/runtime/shaders/present.frag
+new file mode 100644
+index 00000000..3fad45bc
+--- /dev/null
++++ b/runtime/shaders/present.frag
+@@ -0,0 +1,102 @@
++#version 450
++/* Present pass fragment stage: the scaling and post-processing the OpenGL
++ * backend does in PRESENT_FS, ported line for line so a frame looks the same
++ * on either renderer.
++ *   u_sharp 0  plain sample (the sampler's own nearest/linear)
++ *           1  sharp-bilinear - flat texel interiors like nearest with the
++ *              ramp confined to one output pixel, which is what stops the
++ *              +-1px beating at non-integer magnification
++ *           2  Catmull-Rom bicubic via 9 bilinear taps (the launcher's
++ *              "FMV filtering: Bicubic")
++ *           3  FXAA 3.11 compact - 5-tap luma cross, edge-direction estimate,
++ *              two blended probes with an inner/outer acceptance test
++ * Not ported: the PGXP crack-fill branches, which need their own coverage
++ * texture and stay OpenGL-only. */
++layout(set = 0, binding = 0) uniform sampler2D u_tex;
++layout(push_constant) uniform PC {
++    vec4  u_dst;
++    vec4  u_uv_rect;
++    vec2  u_tex_size;
++    vec2  u_sharp_scale;
++    int   u_sharp;
++} pc;
++layout(location = 0) in  vec2 v_uv;
++layout(location = 0) out vec4 frag;
++
++vec4 bicubic(vec2 uv) {
++    vec2 sp = uv * pc.u_tex_size;
++    vec2 t1 = floor(sp - 0.5) + 0.5;
++    vec2 f  = sp - t1;
++    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
++    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
++    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
++    vec2 w3 = f * f * (-0.5 + 0.5 * f);
++    vec2 w12 = w1 + w2;
++    vec2 t0 = (t1 - 1.0) / pc.u_tex_size;
++    vec2 t3 = (t1 + 2.0) / pc.u_tex_size;
++    vec2 t12 = (t1 + w2 / w12) / pc.u_tex_size;
++    vec4 r = vec4(0.0);
++    r += texture(u_tex, vec2(t0.x , t0.y )) * (w0.x  * w0.y );
++    r += texture(u_tex, vec2(t12.x, t0.y )) * (w12.x * w0.y );
++    r += texture(u_tex, vec2(t3.x , t0.y )) * (w3.x  * w0.y );
++    r += texture(u_tex, vec2(t0.x , t12.y)) * (w0.x  * w12.y);
++    r += texture(u_tex, vec2(t12.x, t12.y)) * (w12.x * w12.y);
++    r += texture(u_tex, vec2(t3.x , t12.y)) * (w3.x  * w12.y);
++    r += texture(u_tex, vec2(t0.x , t3.y )) * (w0.x  * w3.y );
++    r += texture(u_tex, vec2(t12.x, t3.y )) * (w12.x * w3.y );
++    r += texture(u_tex, vec2(t3.x , t3.y )) * (w3.x  * w3.y );
++    return r;
++}
++
++vec2 fxaa_clamp(vec2 uv) {
++    vec2 lo = min(pc.u_uv_rect.xy, pc.u_uv_rect.zw);
++    vec2 hi = max(pc.u_uv_rect.xy, pc.u_uv_rect.zw);
++    return clamp(uv, lo, hi);
++}
++vec4 fxaa(vec2 uv) {
++    vec2 px = 1.0 / pc.u_tex_size;
++    const vec3 lw = vec3(0.299, 0.587, 0.114);
++    vec3 rgbNW = texture(u_tex, fxaa_clamp(uv + vec2(-1.0,-1.0)*px)).rgb;
++    vec3 rgbNE = texture(u_tex, fxaa_clamp(uv + vec2( 1.0,-1.0)*px)).rgb;
++    vec3 rgbSW = texture(u_tex, fxaa_clamp(uv + vec2(-1.0, 1.0)*px)).rgb;
++    vec3 rgbSE = texture(u_tex, fxaa_clamp(uv + vec2( 1.0, 1.0)*px)).rgb;
++    vec4 texM  = texture(u_tex, uv);
++    float lNW = dot(rgbNW, lw), lNE = dot(rgbNE, lw);
++    float lSW = dot(rgbSW, lw), lSE = dot(rgbSE, lw);
++    float lM  = dot(texM.rgb, lw);
++    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
++    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
++    vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)),
++                     ((lNW + lSW) - (lNE + lSE)));
++    float dirReduce = max((lNW + lNE + lSW + lSE) * 0.25 * 0.125, 1.0/128.0);
++    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
++    dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * px;
++    vec3 rgbA = 0.5 * (
++        texture(u_tex, fxaa_clamp(uv + dir * (1.0/3.0 - 0.5))).rgb +
++        texture(u_tex, fxaa_clamp(uv + dir * (2.0/3.0 - 0.5))).rgb);
++    vec3 rgbB = rgbA * 0.5 + 0.25 * (
++        texture(u_tex, fxaa_clamp(uv + dir * -0.5)).rgb +
++        texture(u_tex, fxaa_clamp(uv + dir *  0.5)).rgb);
++    float lB = dot(rgbB, lw);
++    vec3 rgb = (lB < lMin || lB > lMax) ? rgbA : rgbB;
++    return vec4(rgb, texM.a);
++}
++
++void main() {
++    vec2 uv = v_uv;
++    if (pc.u_sharp == 3) { frag = vec4(fxaa(uv).rgb, 1.0); return; }
++    if (pc.u_sharp == 2) { frag = vec4(bicubic(uv).rgb, 1.0); return; }
++    if (pc.u_sharp == 1) {
++        vec2 scale = max(pc.u_sharp_scale, vec2(1.0));
++        vec2 texel = uv * pc.u_tex_size;
++        vec2 tf    = floor(texel);
++        vec2 cd    = (texel - tf) - 0.5;
++        vec2 band  = 0.5 - 0.5 / scale;
++        vec2 f     = (cd - clamp(cd, -band, band)) * scale + 0.5;
++        uv = (tf + f) / pc.u_tex_size;
++        vec2 lo = min(pc.u_uv_rect.xy, pc.u_uv_rect.zw);
++        vec2 hi = max(pc.u_uv_rect.xy, pc.u_uv_rect.zw);
++        uv = clamp(uv, lo, hi);
++    }
++    frag = vec4(texture(u_tex, uv).rgb, 1.0);
++}
+diff --git a/runtime/shaders/present.vert b/runtime/shaders/present.vert
+new file mode 100644
+index 00000000..a18086d3
+--- /dev/null
++++ b/runtime/shaders/present.vert
+@@ -0,0 +1,20 @@
++#version 450
++/* Present pass vertex stage: one quad, vertex-less. The destination rect
++ * arrives in NDC (the letterbox the CPU already computes) and the source rect
++ * in normalised texture coordinates, so the same shader serves the VRAM
++ * present and the 24-bit (movie) present. */
++layout(push_constant) uniform PC {
++    vec4  u_dst;        /* NDC x0, y0, x1, y1 */
++    vec4  u_uv_rect;    /* source uv x0, y0, x1, y1 */
++    vec2  u_tex_size;   /* source size in texels */
++    vec2  u_sharp_scale;/* output px per texel (sharp-bilinear) */
++    int   u_sharp;      /* 0 plain, 1 sharp-bilinear, 2 bicubic, 3 FXAA */
++} pc;
++layout(location = 0) out vec2 v_uv;
++void main() {
++    vec2 c[6] = vec2[6](vec2(0,0), vec2(1,0), vec2(0,1),
++                        vec2(1,0), vec2(0,1), vec2(1,1));
++    vec2 t = c[gl_VertexIndex];
++    v_uv = mix(pc.u_uv_rect.xy, pc.u_uv_rect.zw, t);
++    gl_Position = vec4(mix(pc.u_dst.xy, pc.u_dst.zw, t), 0.0, 1.0);
++}
+diff --git a/runtime/shaders/texfilters.glsl b/runtime/shaders/texfilters.glsl
+new file mode 100644
+index 00000000..f742415f
+--- /dev/null
++++ b/runtime/shaders/texfilters.glsl
+@@ -0,0 +1,1661 @@
++/* Texture-filter blocks for the Vulkan fragment shader, generated by
++ * tools/glsl_from_texfilters.py from runtime/src/gpu_gl_texfilters.h -
++ * edit neither, re-run the generators. These are DuckStation's filters
++ * (see the header for the per-filter licences); the OpenGL backend
++ * compiles the very same text at runtime, so the two renderers cannot
++ * drift apart. Each block defines FilteredSampleFromVRAM against the
++ * HLSL-style names geo_tex.frag's compat layer supplies. */
++#ifndef PSX_TEXFILTERS_GLSL
++#define PSX_TEXFILTERS_GLSL
++
++#if PSX_TEXFILTER == 5   /* DuckStation xBR */
++CONSTANT int BLEND_NONE = 0;
++CONSTANT int BLEND_NORMAL = 1;
++CONSTANT int BLEND_DOMINANT = 2;
++CONSTANT float LUMINANCE_WEIGHT = 1.0;
++CONSTANT float EQUAL_COLOR_TOLERANCE = 0.1176470588235294;
++CONSTANT float STEEP_DIRECTION_THRESHOLD = 2.2;
++CONSTANT float DOMINANT_DIRECTION_THRESHOLD = 3.6;
++CONSTANT float4 w = float4(0.2627, 0.6780, 0.0593, 0.5);
++
++float DistYCbCr(float4 pixA, float4 pixB)
++{
++  const float scaleB = 0.5 / (1.0 - w.b);
++  const float scaleR = 0.5 / (1.0 - w.r);
++  float4 diff = pixA - pixB;
++  float Y = dot(diff, w);
++  float Cb = scaleB * (diff.b - Y);
++  float Cr = scaleR * (diff.r - Y);
++
++  return sqrt(((LUMINANCE_WEIGHT * Y) * (LUMINANCE_WEIGHT * Y)) + (Cb * Cb) + (Cr * Cr));
++}
++
++bool IsPixEqual(const float4 pixA, const float4 pixB)
++{
++  return (DistYCbCr(pixA, pixB) < EQUAL_COLOR_TOLERANCE);
++}
++
++float get_left_ratio(float2 center, float2 origin, float2 direction, float2 scale)
++{
++  float2 P0 = center - origin;
++  float2 proj = direction * (dot(P0, direction) / dot(direction, direction));
++  float2 distv = P0 - proj;
++  float2 orth = float2(-direction.y, direction.x);
++  float side = sign(dot(P0, orth));
++  float v = side * length(distv * scale);
++
++//  return step(0, v);
++  return smoothstep(-sqrt(2.0)/2.0, sqrt(2.0)/2.0, v);
++}
++
++#define P(coord, xoffs, yoffs) SampleFromVRAM(texpage, coords + float2((xoffs), (yoffs)), uv_limits)
++
++void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits,
++                            out float4 texcol, out float ialpha)
++{
++  //---------------------------------------
++  // Input Pixel Mapping:  -|x|x|x|-
++  //                       x|A|B|C|x
++  //                       x|D|E|F|x
++  //                       x|G|H|I|x
++  //                       -|x|x|x|-
++
++  float2 scale = float2(8.0, 8.0);
++  float2 pos = frac(coords.xy) - float2(0.5, 0.5);
++  float2 coord = coords.xy - pos;
++
++  float4 A = P(coord, -1,-1);
++  float Aw = A.w;
++  A.w = float(VECTOR_NEQ(A, TRANSPARENT_PIXEL_COLOR));
++  float4 B = P(coord,  0,-1);
++  float Bw = B.w;
++  B.w = float(VECTOR_NEQ(B, TRANSPARENT_PIXEL_COLOR));
++  float4 C = P(coord,  1,-1);
++  float Cw = C.w;
++  C.w = float(VECTOR_NEQ(C, TRANSPARENT_PIXEL_COLOR));
++  float4 D = P(coord, -1, 0);
++  float Dw = D.w;
++  D.w = float(VECTOR_NEQ(D, TRANSPARENT_PIXEL_COLOR));
++  float4 E = P(coord, 0, 0);
++  float Ew = E.w;
++  E.w = float(VECTOR_NEQ(E, TRANSPARENT_PIXEL_COLOR));
++  float4 F = P(coord,  1, 0);
++  float Fw = F.w;
++  F.w = float(VECTOR_NEQ(F, TRANSPARENT_PIXEL_COLOR));
++  float4 G = P(coord, -1, 1);
++  float Gw = G.w;
++  G.w = float(VECTOR_NEQ(G, TRANSPARENT_PIXEL_COLOR));
++  float4 H = P(coord,  0, 1);
++  float Hw = H.w;
++  H.w = float(VECTOR_NEQ(H, TRANSPARENT_PIXEL_COLOR));
++  float4 I = P(coord,  1, 1);
++  float Iw = I.w;
++  I.w = float(VECTOR_NEQ(I, TRANSPARENT_PIXEL_COLOR));
++
++  // blendResult Mapping: x|y|
++  //                      w|z|
++  int4 blendResult = int4(BLEND_NONE,BLEND_NONE,BLEND_NONE,BLEND_NONE);
++
++  // Preprocess corners
++  // Pixel Tap Mapping: -|-|-|-|-
++  //                    -|-|B|C|-
++  //                    -|D|E|F|x
++  //                    -|G|H|I|x
++  //                    -|-|x|x|-
++  if (!((VECTOR_EQ(E,F) && VECTOR_EQ(H,I)) || (VECTOR_EQ(E,H) && VECTOR_EQ(F,I))))
++  {
++    float dist_H_F = DistYCbCr(G, E) + DistYCbCr(E, C) + DistYCbCr(P(coord, 0,2), I) + DistYCbCr(I, P(coord, 2,0)) + (4.0 * DistYCbCr(H, F));
++    float dist_E_I = DistYCbCr(D, H) + DistYCbCr(H, P(coord, 1,2)) + DistYCbCr(B, F) + DistYCbCr(F, P(coord, 2,1)) + (4.0 * DistYCbCr(E, I));
++    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_H_F) < dist_E_I;
++    blendResult.z = ((dist_H_F < dist_E_I) && VECTOR_NEQ(E,F) && VECTOR_NEQ(E,H)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
++  }
++
++
++  // Pixel Tap Mapping: -|-|-|-|-
++  //                    -|A|B|-|-
++  //                    x|D|E|F|-
++  //                    x|G|H|I|-
++  //                    -|x|x|-|-
++  if (!((VECTOR_EQ(D,E) && VECTOR_EQ(G,H)) || (VECTOR_EQ(D,G) && VECTOR_EQ(E,H))))
++  {
++    float dist_G_E = DistYCbCr(P(coord, -2,1)  , D) + DistYCbCr(D, B) + DistYCbCr(P(coord, -1,2), H) + DistYCbCr(H, F) + (4.0 * DistYCbCr(G, E));
++    float dist_D_H = DistYCbCr(P(coord, -2,0)  , G) + DistYCbCr(G, P(coord, 0,2)) + DistYCbCr(A, E) + DistYCbCr(E, I) + (4.0 * DistYCbCr(D, H));
++    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_D_H) < dist_G_E;
++    blendResult.w = ((dist_G_E > dist_D_H) && VECTOR_NEQ(E,D) && VECTOR_NEQ(E,H)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
++  }
++
++  // Pixel Tap Mapping: -|-|x|x|-
++  //                    -|A|B|C|x
++  //                    -|D|E|F|x
++  //                    -|-|H|I|-
++  //                    -|-|-|-|-
++  if (!((VECTOR_EQ(B,C) && VECTOR_EQ(E,F)) || (VECTOR_EQ(B,E) && VECTOR_EQ(C,F))))
++  {
++    float dist_E_C = DistYCbCr(D, B) + DistYCbCr(B, P(coord, 1,-2)) + DistYCbCr(H, F) + DistYCbCr(F, P(coord, 2,-1)) + (4.0 * DistYCbCr(E, C));
++    float dist_B_F = DistYCbCr(A, E) + DistYCbCr(E, I) + DistYCbCr(P(coord, 0,-2), C) + DistYCbCr(C, P(coord, 2,0)) + (4.0 * DistYCbCr(B, F));
++    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_B_F) < dist_E_C;
++    blendResult.y = ((dist_E_C > dist_B_F) && VECTOR_NEQ(E,B) && VECTOR_NEQ(E,F)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
++  }
++
++  // Pixel Tap Mapping: -|x|x|-|-
++  //                    x|A|B|C|-
++  //                    x|D|E|F|-
++  //                    -|G|H|-|-
++  //                    -|-|-|-|-
++  if (!((VECTOR_EQ(A,B) && VECTOR_EQ(D,E)) || (VECTOR_EQ(A,D) && VECTOR_EQ(B,E))))
++  {
++    float dist_D_B = DistYCbCr(P(coord, -2,0), A) + DistYCbCr(A, P(coord, 0,-2)) + DistYCbCr(G, E) + DistYCbCr(E, C) + (4.0 * DistYCbCr(D, B));
++    float dist_A_E = DistYCbCr(P(coord, -2,-1), D) + DistYCbCr(D, H) + DistYCbCr(P(coord, -1,-2), B) + DistYCbCr(B, F) + (4.0 * DistYCbCr(A, E));
++    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_D_B) < dist_A_E;
++    blendResult.x = ((dist_D_B < dist_A_E) && VECTOR_NEQ(E,D) && VECTOR_NEQ(E,B)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
++  }
++
++  float4 res = E;
++  float resW = Ew;
++
++  // Pixel Tap Mapping: -|-|-|-|-
++  //                    -|-|B|C|-
++  //                    -|D|E|F|x
++  //                    -|G|H|I|x
++  //                    -|-|x|x|-
++  if(blendResult.z != BLEND_NONE)
++  {
++    float dist_F_G = DistYCbCr(F, G);
++    float dist_H_C = DistYCbCr(H, C);
++    bool doLineBlend = (blendResult.z == BLEND_DOMINANT ||
++                !((blendResult.y != BLEND_NONE && !IsPixEqual(E, G)) || (blendResult.w != BLEND_NONE && !IsPixEqual(E, C)) ||
++                  (IsPixEqual(G, H) && IsPixEqual(H, I) && IsPixEqual(I, F) && IsPixEqual(F, C) && !IsPixEqual(E, I))));
++
++    float2 origin = float2(0.0, 1.0 / sqrt(2.0));
++    float2 direction = float2(1.0, -1.0);
++    if(doLineBlend)
++    {
++      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_F_G <= dist_H_C) && VECTOR_NEQ(E,G) && VECTOR_NEQ(D,G);
++      bool haveSteepLine = (STEEP_DIRECTION_THRESHOLD * dist_H_C <= dist_F_G) && VECTOR_NEQ(E,C) && VECTOR_NEQ(B,C);
++      origin = haveShallowLine? float2(0.0, 0.25) : float2(0.0, 0.5);
++      direction.x += haveShallowLine? 1.0: 0.0;
++      direction.y -= haveSteepLine? 1.0: 0.0;
++    }
++
++    float4 blendPix = lerp(H,F, step(DistYCbCr(E, F), DistYCbCr(E, H)));
++    float blendW = lerp(Hw,Fw, step(DistYCbCr(E, F), DistYCbCr(E, H)));
++    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));
++    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));
++  }
++
++  // Pixel Tap Mapping: -|-|-|-|-
++  //                    -|A|B|-|-
++  //                    x|D|E|F|-
++  //                    x|G|H|I|-
++  //                    -|x|x|-|-
++  if(blendResult.w != BLEND_NONE)
++  {
++    float dist_H_A = DistYCbCr(H, A);
++    float dist_D_I = DistYCbCr(D, I);
++    bool doLineBlend = (blendResult.w == BLEND_DOMINANT ||
++                !((blendResult.z != BLEND_NONE && !IsPixEqual(E, A)) || (blendResult.x != BLEND_NONE && !IsPixEqual(E, I)) ||
++                  (IsPixEqual(A, D) && IsPixEqual(D, G) && IsPixEqual(G, H) && IsPixEqual(H, I) && !IsPixEqual(E, G))));
++
++    float2 origin = float2(-1.0 / sqrt(2.0), 0.0);
++    float2 direction = float2(1.0, 1.0);
++    if(doLineBlend)
++    {
++      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_H_A <= dist_D_I) && VECTOR_NEQ(E,A) && VECTOR_NEQ(B,A);
++      bool haveSteepLine  = (STEEP_DIRECTION_THRESHOLD * dist_D_I <= dist_H_A) && VECTOR_NEQ(E,I) && VECTOR_NEQ(F,I);
++      origin = haveShallowLine? float2(-0.25, 0.0) : float2(-0.5, 0.0);
++      direction.y += haveShallowLine? 1.0: 0.0;
++      direction.x += haveSteepLine? 1.0: 0.0;
++    }
++    origin = origin;
++    direction = direction;
++
++    float4 blendPix = lerp(H,D, step(DistYCbCr(E, D), DistYCbCr(E, H)));
++    float blendW = lerp(Hw,Dw, step(DistYCbCr(E, D), DistYCbCr(E, H)));
++    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));
++    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));
++  }
++
++  // Pixel Tap Mapping: -|-|x|x|-
++  //                    -|A|B|C|x
++  //                    -|D|E|F|x
++  //                    -|-|H|I|-
++  //                    -|-|-|-|-
++  if(blendResult.y != BLEND_NONE)
++  {
++    float dist_B_I = DistYCbCr(B, I);
++    float dist_F_A = DistYCbCr(F, A);
++    bool doLineBlend = (blendResult.y == BLEND_DOMINANT ||
++                !((blendResult.x != BLEND_NONE && !IsPixEqual(E, I)) || (blendResult.z != BLEND_NONE && !IsPixEqual(E, A)) ||
++                  (IsPixEqual(I, F) && IsPixEqual(F, C) && IsPixEqual(C, B) && IsPixEqual(B, A) && !IsPixEqual(E, C))));
++
++    float2 origin = float2(1.0 / sqrt(2.0), 0.0);
++    float2 direction = float2(-1.0, -1.0);
++
++    if(doLineBlend)
++    {
++      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_B_I <= dist_F_A) && VECTOR_NEQ(E,I) && VECTOR_NEQ(H,I);
++      bool haveSteepLine  = (STEEP_DIRECTION_THRESHOLD * dist_F_A <= dist_B_I) && VECTOR_NEQ(E,A) && VECTOR_NEQ(D,A);
++      origin = haveShallowLine? float2(0.25, 0.0) : float2(0.5, 0.0);
++      direction.y -= haveShallowLine? 1.0: 0.0;
++      direction.x -= haveSteepLine? 1.0: 0.0;
++    }
++
++    float4 blendPix = lerp(F,B, step(DistYCbCr(E, B), DistYCbCr(E, F)));
++    float blendW = lerp(Fw,Bw, step(DistYCbCr(E, B), DistYCbCr(E, F)));
++    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));
++    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));
++  }
++
++  // Pixel Tap Mapping: -|x|x|-|-
++  //                    x|A|B|C|-
++  //                    x|D|E|F|-
++  //                    -|G|H|-|-
++  //                    -|-|-|-|-
++  if(blendResult.x != BLEND_NONE)
++  {
++    float dist_D_C = DistYCbCr(D, C);
++    float dist_B_G = DistYCbCr(B, G);
++    bool doLineBlend = (blendResult.x == BLEND_DOMINANT ||
++                !((blendResult.w != BLEND_NONE && !IsPixEqual(E, C)) || (blendResult.y != BLEND_NONE && !IsPixEqual(E, G)) ||
++                  (IsPixEqual(C, B) && IsPixEqual(B, A) && IsPixEqual(A, D) && IsPixEqual(D, G) && !IsPixEqual(E, A))));
++
++    float2 origin = float2(0.0, -1.0 / sqrt(2.0));
++    float2 direction = float2(-1.0, 1.0);
++    if(doLineBlend)
++    {
++      bool haveShallowLine = (STEEP_DIRECTION_THRESHOLD * dist_D_C <= dist_B_G) && VECTOR_NEQ(E,C) && VECTOR_NEQ(F,C);
++      bool haveSteepLine  = (STEEP_DIRECTION_THRESHOLD * dist_B_G <= dist_D_C) && VECTOR_NEQ(E,G) && VECTOR_NEQ(H,G);
++      origin = haveShallowLine? float2(0.0, -0.25) : float2(0.0, -0.5);
++      direction.x -= haveShallowLine? 1.0: 0.0;
++      direction.y += haveSteepLine? 1.0: 0.0;
++    }
++
++    float4 blendPix = lerp(D,B, step(DistYCbCr(E, B), DistYCbCr(E, D)));
++    float blendW = lerp(Dw,Bw, step(DistYCbCr(E, B), DistYCbCr(E, D)));
++    res = lerp(res, blendPix, get_left_ratio(pos, origin, direction, scale));
++    resW = lerp(resW, blendW, get_left_ratio(pos, origin, direction, scale));
++  }
++
++  ialpha = res.w;
++  texcol = float4(res.xyz, resW);
++
++  // Compensate for partially transparent sampling.
++  if (ialpha > 0.0)
++    texcol.rgb /= float3(ialpha, ialpha, ialpha);
++
++#if !TEXTURE_ALPHA_BLENDING
++  ialpha = (ialpha >= 0.5) ? 1.0 : 0.0;
++#endif
++}
++
++#undef P
++#endif
++
++#if PSX_TEXFILTER == 6   /* DuckStation Scale2x */
++#define src(xoffs, yoffs) packUnorm4x8(SampleFromVRAM(texpage, bcoords + float2((xoffs), (yoffs)), uv_limits))
++
++void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)
++{
++    float2 bcoords = floor(coords);
++
++    uint E = src(+0, +0);
++    uint B = src(+0, - 1);
++    uint D = src(-1, +0);
++    uint F = src(+1, +0);
++    uint H = src(+0, +1);
++
++    uint J = (D == B && B != F && D != H) ? D : E;
++    uint K = (B == F && D != F && H != F) ? F : E;
++    uint L = (H == D && F != D && B != D) ? D : E;
++    uint M = (H == F && D != H && B != F) ? F : E;
++
++    // select quadrant based on fractional part of texture coordinates
++    float2 fpart = frac(coords);
++    uint res = (fpart.x < 0.5f) ? ((fpart.y < 0.5f) ? J : L) : ((fpart.y < 0.5f) ? K : M);
++
++    ialpha = float(res != 0u);
++    texcol = unpackUnorm4x8(res);
++}
++
++#undef src
++#endif
++
++#if PSX_TEXFILTER == 7   /* DuckStation Scale3x */
++#define src(xoffs, yoffs) packUnorm4x8(SampleFromVRAM(texpage, bcoords + float2((xoffs), (yoffs)), uv_limits))
++
++void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)
++{
++    float2 bcoords = floor(coords);
++
++    uint E = src(+0, +0);
++    uint B = src(+0, -1);
++    uint D = src(-1, +0);
++    uint F = src(+1, +0);
++    uint H = src(+0, +1);
++
++    uint res = E;
++    if (B != H && D != F) {
++        uint A = src(-1, -1);
++        uint C = src(+1, -1);
++        uint G = src(-1, +1);
++        uint I = src(+1, +1);
++
++        uint E0 = (D == B) ? D : E;
++        uint E1 = (D == B && E != C) || (B == F && E != A) ? B : E;
++        uint E2 = (B == F) ? F : E;
++        uint E3 = (D == B && E != G) || (D == H && E != A) ? D : E;
++        uint E4 = E;
++        uint E5 = (B == F && E != I) || (H == F && E != C) ? F : E;
++        uint E6 = (D == H) ? D : E;
++        uint E7 = (D == H && E != I) || (H == F && E != G) ? H : E;
++        uint E8 = (H == F) ? F : E;
++
++        // select quadrant based on fractional part of texture coordinates
++        float2 fpart = frac(coords);
++        uint R0, R1, R2;
++        if (fpart.y < 0.34f) {
++            R0 = E0;
++            R1 = E1;
++            R2 = E2;
++        } else if (fpart.y < 0.67f) {
++            R0 = E3;
++            R1 = E4;
++            R2 = E5;
++        } else {
++            R0 = E6;
++            R1 = E7;
++            R2 = E8;
++        }
++
++        res = (fpart.x < 0.34f) ? R0 : ((fpart.x < 0.67f) ? R1 : R2);
++    }
++
++    ialpha = float(res != 0u);
++    texcol = unpackUnorm4x8(res);
++}
++
++#undef src
++#endif
++
++#if PSX_TEXFILTER == 8   /* DuckStation MMPX */
++#define src(xoffs, yoffs) packUnorm4x8(SampleFromVRAM(texpage, bcoords + float2((xoffs), (yoffs)), uv_limits))
++
++uint luma(uint C) {
++    uint alpha = (C & 0xFF000000u) >> 24;
++    return (((C & 0x00FF0000u) >> 16) + ((C & 0x0000FF00u) >> 8) + (C & 0x000000FFu) + 1u) * (256u - alpha);
++}
++
++bool all_eq2(uint B, uint A0, uint A1) {
++    return ((B ^ A0) | (B ^ A1)) == 0u;
++}
++
++bool all_eq3(uint B, uint A0, uint A1, uint A2) {
++    return ((B ^ A0) | (B ^ A1) | (B ^ A2)) == 0u;
++}
++
++bool all_eq4(uint B, uint A0, uint A1, uint A2, uint A3) {
++    return ((B ^ A0) | (B ^ A1) | (B ^ A2) | (B ^ A3)) == 0u;
++}
++
++bool any_eq3(uint B, uint A0, uint A1, uint A2) {
++    return B == A0 || B == A1 || B == A2;
++}
++
++bool none_eq2(uint B, uint A0, uint A1) {
++    return (B != A0) && (B != A1);
++}
++
++bool none_eq4(uint B, uint A0, uint A1, uint A2, uint A3) {
++    return B != A0 && B != A1 && B != A2 && B != A3;
++}
++
++void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)
++{
++  float2 bcoords = floor(coords);
++
++  uint A = src(-1, -1), B = src(+0, -1), C = src(+1, -1);
++  uint D = src(-1, +0), E = src(+0, +0), F = src(+1, +0);
++  uint G = src(-1, +1), H = src(+0, +1), I = src(+1, +1);
++
++  uint J = E, K = E, L = E, M = E;
++
++  if (((A ^ E) | (B ^ E) | (C ^ E) | (D ^ E) | (F ^ E) | (G ^ E) | (H ^ E) | (I ^ E)) != 0u) {
++    uint P = src(+0, -2), S = src(+0, +2);
++    uint Q = src(-2, +0), R = src(+2, +0);
++    uint Bl = luma(B), Dl = luma(D), El = luma(E), Fl = luma(F), Hl = luma(H);
++
++    // 1:1 slope rules
++    if ((D == B && D != H && D != F) && (El >= Dl || E == A) && any_eq3(E, A, C, G) && ((El < Dl) || A != D || E != P || E != Q)) J = D;
++    if ((B == F && B != D && B != H) && (El >= Bl || E == C) && any_eq3(E, A, C, I) && ((El < Bl) || C != B || E != P || E != R)) K = B;
++    if ((H == D && H != F && H != B) && (El >= Hl || E == G) && any_eq3(E, A, G, I) && ((El < Hl) || G != H || E != S || E != Q)) L = H;
++    if ((F == H && F != B && F != D) && (El >= Fl || E == I) && any_eq3(E, C, G, I) && ((El < Fl) || I != H || E != R || E != S)) M = F;
++
++    // Intersection rules
++    if ((E != F && all_eq4(E, C, I, D, Q) && all_eq2(F, B, H)) && (F != src(+3, +0))) K = M = F;
++    if ((E != D && all_eq4(E, A, G, F, R) && all_eq2(D, B, H)) && (D != src(-3, +0))) J = L = D;
++    if ((E != H && all_eq4(E, G, I, B, P) && all_eq2(H, D, F)) && (H != src(+0, +3))) L = M = H;
++    if ((E != B && all_eq4(E, A, C, H, S) && all_eq2(B, D, F)) && (B != src(+0, -3))) J = K = B;
++    if (Bl < El && all_eq4(E, G, H, I, S) && none_eq4(E, A, D, C, F)) J = K = B;
++    if (Hl < El && all_eq4(E, A, B, C, P) && none_eq4(E, D, G, I, F)) L = M = H;
++    if (Fl < El && all_eq4(E, A, D, G, Q) && none_eq4(E, B, C, I, H)) K = M = F;
++    if (Dl < El && all_eq4(E, C, F, I, R) && none_eq4(E, B, A, G, H)) J = L = D;
++
++    // 2:1 slope rules
++    if (H != B) {
++      if (H != A && H != E && H != C) {
++        if (all_eq3(H, G, F, R) && none_eq2(H, D, src(+2, -1))) L = M;
++        if (all_eq3(H, I, D, Q) && none_eq2(H, F, src(-2, -1))) M = L;
++      }
++
++      if (B != I && B != G && B != E) {
++        if (all_eq3(B, A, F, R) && none_eq2(B, D, src(+2, +1))) J = K;
++        if (all_eq3(B, C, D, Q) && none_eq2(B, F, src(-2, +1))) K = J;
++      }
++    } // H !== B
++
++    if (F != D) {
++      if (D != I && D != E && D != C) {
++        if (all_eq3(D, A, H, S) && none_eq2(D, B, src(+1, +2))) J = L;
++        if (all_eq3(D, G, B, P) && none_eq2(D, H, src(+1, -2))) L = J;
++      }
++
++      if (F != E && F != A && F != G) {
++        if (all_eq3(F, C, H, S) && none_eq2(F, B, src(-1, +2))) K = M;
++        if (all_eq3(F, I, B, P) && none_eq2(F, H, src(-1, -2))) M = K;
++      }
++    } // F !== D
++  } // not constant
++
++  // select quadrant based on fractional part of texture coordinates
++  float2 fpart = frac(coords);
++  uint res = (fpart.x < 0.5f) ? ((fpart.y < 0.5f) ? J : L) : ((fpart.y < 0.5f) ? K : M);
++
++  ialpha = float(res != 0u);
++  texcol = unpackUnorm4x8(res);
++}
++
++#undef src
++#endif
++
++#if PSX_TEXFILTER == 9   /* DuckStation MMPX Enhanced */
++
++    #define srcf(xoffs,yoffs) \
++      SampleFromVRAM(texpage, bcoords + float2(xoffs, yoffs), uv_limits) * \
++      step(abs(bcoords.x + (xoffs) - clamp(bcoords.x + (xoffs), uv_limits.x, uv_limits.z)), 0.001) * \
++      step(abs(bcoords.y + (yoffs) - clamp(bcoords.y + (yoffs), uv_limits.y, uv_limits.w)), 0.001)
++
++    #define src(xoffs,yoffs) packUnorm4x8(srcf(xoffs,yoffs))
++
++float luma(float4 col) {
++
++    //Use CRT-era BT.601 standard.
++    return dot(col.rgb, float3(0.299, 0.587, 0.114));
++}
++
++float mixGate(float4 col1, float4 col2) {
++
++    float4 diff = col1 - col2;
++
++    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));
++
++    float dot_diff = dot(diff, diff);
++
++    float factor = (delta_range * delta_range) * 2.618034;
++
++    return step(dot_diff, mix(0.75, 0.0, factor));
++}
++
++#define all_eq2(a, b1, b2) (a == b1 && a == b2)
++#define all_eq4(a, b1, b2, b3, b4) (a == b1 && a == b2 && a == b3 && a == b4)
++#define any_eq2(a, b1, b2) (a == b1 || a == b2)
++#define none_eq2(a, b1, b2) !any_eq2(a, b1, b2)
++#define none_eq4(a, b1, b2, b3, b4) (a!=b1 && a!=b2 && a!=b3 && a!=b4)
++
++float4 admixC(float4 vX, float4 vE) {
++
++    float mixFactor = mixGate(vX, vE) * (-0.381966) + 1.0;
++
++    return mix(vX,vE,mixFactor);
++}
++
++float4 admixK(float4 vX, float4 vE) {
++
++    float4 diff = vX - vE;
++
++    float mixFactor = dot(diff.rgb, diff.rgb) * 0.16666 + 0.5;
++
++    return mix(vX,vE,mixFactor);
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)
++{
++
++    float2 bcoords = floor(coords);
++
++    float4 vE = SampleFromVRAM(texpage, bcoords, uv_limits);
++
++    float4 vB = srcf(0.0, -1.0);
++    float4 vD = srcf(-1.0, 0.0);
++    float4 vF = srcf(+1.0, 0.0);
++    float4 vH = srcf(0.0, +1.0);
++
++    uint E = packUnorm4x8(vE);
++    uint B = packUnorm4x8(vB);
++    uint D = packUnorm4x8(vD);
++    uint F = packUnorm4x8(vF);
++    uint H = packUnorm4x8(vH);
++
++    // default pixel
++    ialpha = float(E != 0u);
++    texcol = vE;
++
++bool skiprest = (E == D && E == F) || (E == B && E == H) || (B == H && D == F);
++if (!skiprest) {
++
++    // 5x5
++    uint A = src(-1.0, -1.0);
++    uint C = src(+1.0, -1.0);
++    uint G = src(-1.0, +1.0);
++    uint I = src(+1.0, +1.0);
++
++    uint P  = src( 0.0, -2.0);
++    uint Q  = src(-2.0,  0.0);
++    uint R  = src(+2.0,  0.0);
++    uint S  = src( 0.0, +2.0);
++
++    uint PA = src(-1.0, -2.0);
++    uint PC = src(+1.0, -2.0);
++    uint QA = src(-2.0, -1.0);
++    uint QG = src(-2.0, +1.0);
++    uint RC = src(+2.0, -1.0);
++    uint RI = src(+2.0, +1.0);
++    uint SG = src(-1.0, +2.0);
++    uint SI = src(+1.0, +2.0);
++
++
++    float4 J = vE;    float4 K = vE;    float4 L = vE;    float4 M = vE;
++
++
++    float Bl = luma(vB) + float(B==0u) *2.0;
++    float Dl = luma(vD) + float(D==0u) *2.0;
++    float El = luma(vE) + float(E==0u) *2.0;
++    float Fl = luma(vF) + float(F==0u) *2.0;
++    float Hl = luma(vH) + float(H==0u) *2.0;
++
++    bool slope1 = false;    bool slope2 = false;    bool slope3 = false;    bool slope4 = false;
++
++// B - D
++    if ( E!=B && (D == B && D != H && D != F) && (El >= Dl || E == A && B !=PA && D !=QA) && any_eq2(E, C, G) && ((El < Dl) || A != D || E != P || E != Q)
++        ) {
++        J=vB;
++        slope1 = true;
++    }
++
++// B - F
++    if ( E!=B && (B == F && B != D && B != H) && (El >= Bl || E == C && B !=PC && F !=RC) && any_eq2(E, A, I) && ((El < Bl) || C != B || E != P || E != R)
++     ) {
++        K=vB;
++        slope2 = true;
++    }
++
++// D - H
++    if ( E!=H && (H == D && H != F && H != B) && (El >= Hl || E == G && D !=QG && H !=SG) && any_eq2(E, A, I) && ((El < Hl) || G != H || E != S || E != Q)
++     ) {
++        L=vH;
++        slope3 = true;
++    }
++// F - H
++    if ( E!=H && (F == H && F != B && F != D) && (El >= Fl || E == I && F !=RI && H !=SI) && any_eq2(E, C, G) && ((El < Fl) || I != H || E != R || E != S)
++      ) {
++        M=vH;
++        slope4 = true;
++    }
++
++//  long gentle 2:1 slope
++
++if (slope4) { //zone4 long slope
++    if (all_eq2(R,F,G) && R != RC && Q != G) L=M;
++    // vertical
++    if (all_eq2(S,H,C) && S != SG && P != C) K=M;
++}
++
++if (slope3) { //zone3 long slope
++    // horizontal
++    if (all_eq2(Q,D,I) && Q != QA && R != I) M=L;
++    // vertical
++    if (all_eq2(S,H,A) && S != SI && A != P) J=L;
++}
++
++if (slope2) { //zone2 long slope
++    // horizontal
++    if (all_eq2(R,F,A) && R != RI && A != Q) J=K;
++    // vertical
++    if (all_eq2(P,B,I) && P != PA && I != S) M=K;
++}
++
++if (slope1) { //zone1 long slope
++    // horizontal
++    if (all_eq2(Q,D,C) && Q != QG && C != R) K=J;
++    // vertical
++    if (all_eq2(P,B,G) && P != PC && G != S) L=J;
++}
++
++skiprest = skiprest||slope1||slope2||slope3||slope4||E==0u||B==0u||D==0u||F==0u||H==0u;
++
++/* Concave + Cross type */
++
++    if (!skiprest && Bl < El && all_eq4(E, G, H, I, S) && none_eq4(E, A, D, C, F)) { J=admixC(vB,J);    K=J;    skiprest = true;}
++    if (!skiprest && Hl < El && all_eq4(E, A, B, C, P) && none_eq4(E, D, G, I, F)) { L=admixC(vH,L);    M=L;    skiprest = true;}
++    if (!skiprest && Fl < El && all_eq4(E, A, D, G, Q) && none_eq4(E, B, C, I, H)) { K=admixC(vF,K);    M=K;    skiprest = true;}
++    if (!skiprest && Dl < El && all_eq4(E, C, F, I, R) && none_eq4(E, B, A, G, H)) { J=admixC(vD,J);    L=J;    skiprest = true;}
++
++/* K type */
++
++    if (!skiprest && (E != F && all_eq4(E, C, I, D, Q) && all_eq2(F, B, H)) && (F != src(+3.0, +0.0))) {K=admixK(vF,K); M=K;skiprest=true;}    // RIGHT
++    if (!skiprest && (E != D && all_eq4(E, A, G, F, R) && all_eq2(D, B, H)) && (D != src(-3.0, +0.0))) {J=admixK(vD,J); L=J;skiprest=true;}    // LEFT
++    if (!skiprest && (E != H && all_eq4(E, G, I, B, P) && all_eq2(H, D, F)) && (H != src(+0.0, +3.0))) {L=admixK(vH,L); M=L;skiprest=true;}    // BOTTOM
++    if (!skiprest && (E != B && all_eq4(E, A, C, H, S) && all_eq2(B, D, F)) && (B != src(+0.0, -3.0))) {J=admixK(vB,J); K=J;}                // TOP
++
++    //final write
++    float2 fpart = frac(coords);
++
++    float4 res = (fpart.x < 0.5) ? ((fpart.y < 0.5) ? J : L) : ((fpart.y < 0.5) ? K : M);
++
++    ialpha = step(0.002, res.r+res.g+res.b+res.a);
++    texcol = res;
++}
++    
++}
++
++#undef src
++#undef srcf
++#undef all_eq2
++#undef all_eq4
++#undef any_eq2
++#undef none_eq2
++#undef none_eq4
++#endif
++
++#if PSX_TEXFILTER == 10   /* DuckStation MMPX Advanced */
++
++    #define srcf(xoffs,yoffs) \
++      SampleFromVRAM(texpage, bcoords + float2(xoffs, yoffs), uv_limits) * \
++      step(abs(bcoords.x + (xoffs) - clamp(bcoords.x + (xoffs), uv_limits.x, uv_limits.z)), 0.001) * \
++      step(abs(bcoords.y + (yoffs) - clamp(bcoords.y + (yoffs), uv_limits.y, uv_limits.w)), 0.001)
++
++    #define src(xoffs,yoffs) packUnorm4x8(srcf(xoffs,yoffs))
++
++//RGB visual weight + alpha bias
++float luma(float4 col) {
++
++    //Use CRT-era BT.601 standard. Clamp range to [0.0 - 0.999]
++    return min(dot(col.rgb, float3(0.299, 0.587, 0.114)), 0.999);
++}
++
++/* Constant Descriptions:
++ * 0.145898    : (~0.382) ^2
++ * 0.8541      : 1.0 -(~0.382) ^2
++ * 0.0638587   : (RGB Euclidean distance scaled by ~0.382 twice) ^2
++ * 0.75        : (RGB Euclidean distance scaled by  0.500) ^2
++ */
++
++// duck calculation: dot(diff,diff) directly incorporates alpha channel  //duck.alpha
++// Note: Transparent duck pixels are determined outside sim and mixFactor functions
++
++bool simb(float4 col1, float4 col2) {
++
++    float4 diff = col1 - col2;
++
++    // RGB color difference range (max_diff - min_diff)
++    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));
++
++    float dot_diff = dot(diff, diff);
++
++    // Equivalent to (delta_range / 0.145898 )^2
++    float factor = (delta_range * delta_range) * 46.9787;
++
++    return dot_diff < mix(0.0638587, 0.0, factor);
++}
++
++bool sim(float4 col1, float4 col2) {
++
++    float4 diff = col1 - col2;
++
++    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));
++
++    float dot_diff = dot(diff, diff);
++
++    // Equivalent to (delta_range / 0.382 )^2
++    float factor = (delta_range * delta_range) * 6.8541;
++
++    return dot_diff < mix(0.0638587, 0.0, factor);
++}
++
++float mixGate(float4 col1, float4 col2) {
++
++    float4 diff = col1 - col2;
++
++    float delta_range = max(diff.r, max(diff.g, diff.b)) - min(diff.r, min(diff.g, diff.b));
++
++    float dot_diff = dot(diff, diff);
++
++    // Equivalent to (delta_range / 0.618 )^2
++    float factor = (delta_range * delta_range) * 2.618034;
++
++    return step(dot_diff, mix(0.75, 0.0, factor));
++}
++
++#define eq(a,b) (a==b)
++
++#define neq(a,b) (a!=b)
++
++#define all_eq2(a, b1, b2) \
++    ( eq(a,b1) && eq(a,b2))
++
++#define all_eq3(a, b1, b2, b3) \
++    ( eq(a,b1) && eq(a,b2) && eq(a,b3))
++
++#define all_eq4(a, b1, b2, b3, b4) \
++    ( eq(a,b1) && eq(a,b2) && eq(a,b3) && eq(a,b4))
++
++#define any_eq2(a, b1, b2) (eq(a,b1)||eq(a,b2))
++#define any_eq3(a, b1, b2, b3) (eq(a,b1)||eq(a,b2)||eq(a,b3))
++#define none_eq2(a, b1, b2) !any_eq2(a, b1, b2)
++
++
++// Debug Hooks
++//#define testcolor float4(1.0, 0.0, 1.0, 1.0)  // Magenta
++//#define testcolor2 float4(0.0, 1.0, 1.0, 1.0)  // Cyan
++//#define testcolor3 float4(1.0, 1.0, 0.0, 1.0)  // Yellow
++//#define testcolor4 float4(1.0, 1.0, 1.0, 1.0)  // White
++#define slopOFF float4(2.0, 2.0, 2.0, 2.0)
++#define slopeBAD float4(4.0, 4.0, 4.0, 4.0)
++#define theEXIT float4(8.0, 8.0, 8.0, 8.0)
++
++#define mixXE mix(vX,vE,mixFactor)
++#define mixXEoff mixXE+slopOFF
++#define Xoff vX+slopOFF
++
++#if GLSL
++
++    #define checkblack(col) all(lessThan((col).rgb, float3(0.1, 0.078, 0.1)))
++    #define checkwhite(col) all(greaterThan((col).rgb, float3(0.92, 0.92, 0.92)))
++
++#else
++
++    #define checkblack(col) all((col).rgb < float3(0.1, 0.078, 0.1))
++    #define checkwhite(col) all((col).rgb > float3(0.92, 0.92, 0.92))
++
++#endif
++
++float4 admixC(float4 vX, float4 vE) {
++
++    float mixFactor = mixGate(vX, vE) * (-0.381966) + 1.0;
++
++    return mixXE;
++}
++
++float4 admixK(float4 vX, float4 vE) {
++
++    float4 diff = vX - vE;
++
++    float mixFactor = dot(diff.rgb, diff.rgb) * 0.16666 + 0.5;    // xxx.alpha
++
++    return mixXE;
++}
++
++float4 admixL(float4 vE, float4 vX) {
++
++    float mixFactor = 0.381966 * mixGate(vX,vE) * step(0.002,vE.r+vE.g+vE.b+vE.a); // xxx.alpha.duck
++
++    return mixXE;
++}
++
++//**************************************************************************************************************************************
++//*                                                 main slope + X cross-processing mechanism                                        *
++//******************************************************************************************************************************** zz  *
++float4 admixX( uint A, uint B, uint C, uint D, uint E, uint F, uint G, uint H, uint I
++          , uint P, uint PA, uint PC, uint Q, uint QA, uint QG, uint R, uint RC, uint RI, uint S, uint SG, uint SI, uint AA, uint CC, uint GG
++          , float El, float Bl, float Dl, float Fl, float Hl
++          , float4 vE, float4 vB, float4 vD, float4 vC, float4 vG
++          ) {
++
++
++    bool eq_B_C = eq(B,C);
++    bool eq_D_G = eq(D,G);
++
++    if (eq_B_C && eq_D_G) return slopeBAD;
++
++
++    //Pre-declare
++    bool eq_B_P;        bool eq_B_PA;        bool eq_B_PC;
++    bool eq_D_Q;        bool eq_D_QA;        bool eq_D_QG;
++    bool eq_E_F;        bool eq_E_H;        bool eq_A_AA;
++
++    float4 vX;
++    float mixFactor;
++
++    bool eq_E_C = eq(E,C);
++    bool eq_E_G = eq(E,G);
++    bool eq_A_P = eq(A,P);
++    bool eq_A_Q = eq(A,Q);
++    bool comboE3 = eq_E_C && eq_E_G;
++    bool comboA3 = eq_A_P && eq_A_Q;
++
++    // remove the alpha weighting first ,to avoid jagged edges when E is fully transparent and interacts with black and gray.
++    // xxx.alpha.duck
++    Bl = fract(Bl);
++    Dl = fract(Dl);
++    El = fract(El);
++    Fl = fract(Fl);
++    Hl = fract(Hl);
++
++//* =========================================
++//*                    B != D
++//* ==================================== zz =
++if (neq(B,D)){
++
++    if (eq(E,A)) return slopeBAD;
++
++    float diffBD = abs(Bl-Dl);
++    if (diffBD > El-Bl || diffBD > El-Dl) return slopeBAD;
++
++
++    vX = mix(vB, vD, 0.5);
++
++    mixFactor = 0.381966 * mixGate(vX,vE) * float(E!=0u);
++
++    eq_B_PC = eq(B,PC);
++    eq_D_QG = eq(D,QG);
++ 
++    if (none_eq2(A,B,D)){
++        if (comboA3) return mixXEoff;
++        if ( eq_A_P && eq_B_PC && !eq_B_C ) return mixXEoff;
++        if ( eq_A_Q && eq_D_QG && !eq_D_G ) return mixXEoff;
++
++        if ( eq_A_P && eq_E_G ) return mixXEoff;
++        if ( eq_A_Q && eq_E_C ) return mixXEoff;
++
++        if ( eq_E_C && eq_D_G ) return mixXEoff;
++        if ( eq_E_G && eq_B_C ) return mixXEoff;
++
++}
++    if ( comboE3 ) return mixXEoff;
++
++    if ( eq_E_C && eq_B_PC && neq(B,P)) return mixXEoff;
++    if ( eq_E_G && eq_D_QG && neq(D,Q)) return mixXEoff;
++
++    eq_E_F = eq(E,F);
++
++    if (eq(F,H)) {
++
++        if ( eq_E_C && !eq_D_G && (!eq_E_F||neq(E,P)) ) return mixXEoff;
++        if ( eq_E_G && !eq_B_C && (!eq_E_F||neq(E,Q)) ) return mixXEoff;
++
++        if ( !eq_E_F && eq_B_PC && eq(F,RC) ) return mixXEoff;
++        if ( !eq_E_F && eq_D_QG && eq(H,SG) ) return mixXEoff;
++    }
++
++    return slopeBAD;
++} //* B != D
++
++
++                        //*********  B == D  *********
++
++    bool Xisblack = checkblack(vB);
++    if ( Xisblack && El >0.5 && (Fl<0.078 || Hl<0.078) ) return theEXIT;
++
++    vX = vB;
++
++    mixFactor = 0.381966 * mixGate(vX,vE) * float(E!=0u);
++
++    bool B_slope;    bool B_tower;    bool B_wall;
++    bool D_slope;    bool D_tower;    bool D_wall;
++    bool En3;
++    #define En4square En3&&eq(E,I)
++
++//* ===================================================
++//*                   E - A  x cross
++//* =========================================== zz ====
++if (eq(E,A)) {
++
++
++    eq_E_F = eq(E,F);
++    eq_E_H = eq(E,H);
++
++    bool Eisblack = checkblack(vE);
++
++    if ( comboE3 && !eq_E_F && !eq_E_H && eq(E,I) ) {
++
++        if (Eisblack) return theEXIT;
++        mixFactor = 0.618034 * (1.0 - mixFactor);
++        return mixXEoff;
++    }
++
++    eq_A_AA = eq(A,AA);
++
++    if ( comboA3 && eq_A_AA && none_eq2(A,PA,QA) )  {
++        if (Eisblack) return theEXIT;
++        mixFactor = 0.618034 * (1.0 - mixFactor);
++        if ( neq(B,PA) && eq(PA,QA) ) return mixXEoff;
++        mixFactor += 0.236068;
++        return mixXEoff;
++    }
++
++    eq_B_PC = eq(B,PC);
++    eq_B_PA = eq(B,PA);
++    eq_D_QG = eq(D,QG);
++    eq_D_QA = eq(D,QA);
++
++
++    if ( comboE3 && comboA3 &&
++        (eq_B_PC || eq_D_QG) && eq_D_QA && eq_B_PA) {
++        mixFactor = mixFactor * (-0.618034) + 0.8541;
++        mixFactor = max(mixFactor, float(E==0u));    // xxx.alpha.duck
++        return mixXEoff;
++    }
++
++
++    if ( comboE3 && eq_A_P
++         && eq_B_PA && eq_D_QA && eq_D_QG
++         && eq_E_H
++        ) {
++        mixFactor = mixFactor * (-0.618034) + 0.8541;
++        mixFactor = max(mixFactor, float(E==0u));    // xxx.alpha.duck
++        return mixXEoff;
++        }
++
++    if ( comboE3 && eq_A_Q
++         && eq_B_PA && eq_D_QA && eq_B_PC
++         && eq_E_F
++        ) {
++        mixFactor = mixFactor * (-0.618034) + 0.8541;
++        mixFactor = max(mixFactor, float(E==0u));    // xxx.alpha.duck
++        return mixXEoff;
++        }
++
++
++    if (comboA3) return Xoff;
++
++    if (comboE3) return mixXEoff;
++
++    eq_B_P = eq(B, P);
++    eq_D_Q = eq(D, Q);
++
++    B_slope = eq_B_PC && !eq_B_P && !eq_B_C && !eq_B_PA;
++    D_slope = eq_D_QG && !eq_D_Q && !eq_D_G && !eq_D_QA;
++
++    B_wall = eq_B_C && !eq_B_PC && !eq_B_P;
++    D_wall = eq_D_G && !eq_D_QG && !eq_D_Q;
++    
++    B_tower = eq_B_P && !eq_B_PC && !eq_B_C && !eq_B_PA;
++    D_tower = eq_D_Q && !eq_D_QG && !eq_D_G && !eq_D_QA;
++
++    if ( B_slope && eq_E_G ) return mixXEoff;
++    if ( D_slope && eq_E_C ) return mixXEoff;
++
++
++//* E B D Region Checkerboard Scoring Rule
++
++    float scoreE = 0.0; float scoreB = 0.0; float scoreD = 0.0; float scoreZ = 0.0;
++
++//*    E Zone
++    if (eq_E_C) {
++        scoreE += 1.0 +float(eq(F,H)) +float(B_slope);
++        scoreE -= float(all_eq2(E,P,PC)&&!D_wall);
++    }
++
++    if (eq_E_G) {
++        scoreE += 1.0 +float(eq(F,H)) +float(D_slope);
++        scoreE -= float(all_eq2(E,Q,QG)&&!B_wall);
++    }
++
++    scoreE += float(B_slope && eq_A_Q || D_slope && eq_A_P);
++
++    En3 = eq_E_F && eq_E_H;
++
++    if ( scoreE<0.01 && mixFactor<0.01 && En4square && eq(E,S)==eq(E,SI) && eq(E,R)==eq(E,RI) ) return theEXIT;
++
++
++    if ( scoreE<0.01 && !En3 && neq(E,I) ) {
++        if ( B_wall && eq_E_F ) return theEXIT;
++        if ( D_wall && eq_E_H ) return theEXIT;
++    }
++
++    if (E==0u && !Xisblack) return vX;    // xxx.alpha.duck
++
++    scoreE += float(B_slope && eq_A_P || D_slope && eq_A_Q);
++
++    if ( !En3 && eq(F,H) ) {
++        if (Eisblack) return slopeBAD;
++
++        bool condZ1 = B_wall && (eq(F,R) || eq(F,RC) || eq(G,H) || eq(F,I));
++        bool condZ2 = D_wall && (eq(C,F) || eq(H,SG) || eq(H,S) || eq(F,I));
++        scoreZ = float(condZ1 || condZ2);
++    }
++
++
++//*    B Zone
++
++    if (eq_B_PA) {
++        scoreB -= 1.0 +float(eq(P,C)) +float(eq_A_AA);
++    }
++
++    if (eq(P,C)){
++        scoreB -= float(eq_A_AA);
++        scoreZ *= float(scoreE < 0.01);
++    }
++
++//*  D Zone
++
++    if (eq_D_QA) {
++        scoreD -= 1.0 +float(eq(G,Q)) +float(eq_A_AA);
++    }
++
++    if (eq(G,Q)){
++        scoreD -= float(eq_A_AA);
++        scoreZ *= float(scoreE < 0.01);
++    }
++
++    float scoreFinal = scoreE + scoreB + scoreD + scoreZ ;
++
++    scoreFinal += float(min(scoreB,scoreD) > -0.01 && (B_wall && D_tower || B_tower && D_wall)) *2.0;
++
++    mixFactor *= (1.0 - step(1.99, scoreFinal));
++    return mixXE + slopeBAD*(1.0 - step(0.99, scoreFinal));
++
++}    //* E == A
++
++
++//* ===============================================
++//*                  E - C - G     main rules
++//* ========================================= zz ==
++
++    if (eq_E_C ) {
++        if (comboA3) return vX;
++        if (comboE3) return mixXE;
++        if (all_eq2(B,A,PA) && all_eq3(E,F,P,PC)) return theEXIT;
++        return mixXE;
++    }
++
++    if (eq_E_G) {
++        if (comboA3) return vX;
++        if (comboE3) return mixXE;
++        if (all_eq2(D,A,QA) && all_eq3(E,H,Q,QG)) return theEXIT;
++        return mixXE;
++    }
++
++    if (E==0u) return theEXIT;        // xxx.alpha
++
++//* =======================================================
++//*                  F - H / B+ D+ Extended Rules
++//* ================================================= zz ==
++
++
++    bool eq_A_B = eq(A,B);
++    bool eq_F_H = eq(F,H);
++
++    eq_B_P  = eq(B,P);
++    eq_B_PC = eq(B,PC);
++    eq_B_PA = eq(B,PA);
++    eq_D_Q  = eq(D,Q);
++    eq_D_QG = eq(D,QG);
++    eq_D_QA = eq(D,QA);
++
++    B_slope = eq_B_PC && !eq_B_P && !eq_B_C;
++    D_slope = eq_D_QG && !eq_D_Q && !eq_D_G;
++    B_tower = eq_B_P && !eq_B_PC && !eq_B_C && !eq_B_PA;
++    D_tower = eq_D_Q && !eq_D_QG && !eq_D_G && !eq_D_QA;
++    B_wall = eq_B_C && !eq_B_PC && !eq_B_P;
++    D_wall = eq_D_G && !eq_D_QG && !eq_D_Q;
++
++
++    if (!eq_A_B) {
++
++        if (comboA3) return Xoff;
++
++        if ( (B_slope||B_tower) && (D_slope||D_tower) ) return Xoff;
++
++        if ( B_slope && eq_A_P ) return mixXEoff;
++        if ( D_slope && eq_A_Q ) return mixXEoff;
++
++        if ( (B_slope || D_slope) && eq_F_H ) return mixXEoff;
++
++        if ( B_slope && eq(H,SG) ) return mixXEoff;
++        if ( D_slope && eq(F,RC) ) return mixXEoff;
++
++        if ( B_slope && eq_A_Q && eq(Q,QG) ) return mixXEoff;
++        if ( D_slope && eq_A_P && eq(P,PC) ) return mixXEoff;
++
++    }
++
++    bool sim_EC = E!=0u && C!=0u && sim(vE, vC);    // xxx.alpha.duck
++    bool sim_EG = E!=0u && G!=0u && sim(vE, vG);    // xxx.alpha.duck
++
++    float E_lumDiff = mix(0.381966, 0.145898, max((El - 0.8541),0.0) * 6.8541);
++
++    if ( mixFactor<0.01 && !sim_EC && !sim_EG && neq(E,I) && abs(El-Fl)>E_lumDiff && abs(El-Hl)>E_lumDiff ) return slopeBAD;
++
++
++    eq_E_F = eq(E,F);
++    eq_E_H = eq(E,H);
++
++    if ( eq_B_C && eq_D_Q ) {
++        if ( eq(P,PC) && eq(A,QA) && !eq_D_QG && eq_E_F && !eq_E_H && eq(H,I)) return theEXIT;
++        if ( eq_A_B ) return slopeBAD;
++        if ( B_wall && D_tower && eq_E_F) return vX;
++        return mixXEoff;
++    }
++
++    if ( eq(D,G) && eq(B,P)) {
++        if ( eq(Q,QG) && eq(A,PA) && !eq_B_PC && eq_E_H && !eq_E_F && eq(F,I)) return theEXIT;
++        if ( eq_A_B ) return slopeBAD;
++        if ( B_tower && D_wall && eq_E_H) return vX;
++        return mixXEoff;
++    }
++
++
++    En3 = eq_E_F && eq_E_H;
++
++    if ( En4square ) {
++        if ( ( eq_B_C || eq_D_G) && eq_A_B) return theEXIT;
++        if ( ( eq_B_C || eq_D_G || mixFactor<0.01) && (eq(E,S) == eq(E, SI) && eq(E,R) == eq(E, RI)) ) return theEXIT;
++        return mixXEoff;
++    }
++
++    if (!eq_B_C && !eq_D_G ) {
++        if ( comboA3 && eq_F_H ) return Xoff;
++
++        if ( comboA3&&eq_B_PC&&eq(C,CC) ) return Xoff;
++        if ( comboA3&&eq_D_QG&&eq(G,GG) ) return Xoff;
++
++        if ( !eq_B_P && !eq_B_PC && !eq_D_Q && !eq_D_QG && !En3 ) return slopeBAD;
++
++        if (eq_A_Q&&sim_EC) return mixXEoff;
++        if (eq_A_P&&sim_EG) return mixXEoff;
++        if (sim_EC&&sim_EG ) return mixXEoff;
++    }
++
++     if ( En3 && eq_A_B) return theEXIT;
++
++    if (eq_F_H) {
++
++        if ( eq_B_PC&&eq(F,RC) || eq_D_QG&&eq(H,SG) ) return mixXEoff;
++
++        if (eq_A_B) return slopeBAD;
++
++        if ( eq_B_C || eq_D_G) return mixXEoff;
++        if ( eq_B_PC || eq_D_QG) return mixXEoff;
++
++    }
++
++    return slopeBAD;
++
++}    //* admixX
++
++
++float4 admixS( uint A, uint B, uint C, uint D, uint E, uint F, uint G, uint H, uint I
++           , uint R, uint RC, uint RI, uint S, uint SG, uint SI, uint II, uint CC
++           , float4 vE, float4 vF, float4 vC
++           ) {
++
++
++
++    if (any_eq2(F,C,I)) return vE;
++
++    if ( (eq(F,RI) || eq(G,S) || eq(R, RI)) && neq(R,I) ) return vE;
++
++    if (eq(H, S) && none_eq2(H,I,SG)) return vE;
++
++    if ( eq(R, RC) || eq(G,SG) ) return vE;
++
++    if ( checkwhite(vE) && all_eq2(E,C,D) && none_eq2(E,RC,CC)) return vE;
++
++
++    #define vX vF
++    float mixFactor = 0.381966 * mixGate(vX,vE) * float(E!=0u);    // xxx.alpha.duck
++
++    if ( eq(E,C) && (eq(E,D)||eq(B,D)) ) return mixXE;
++
++    bool sim_E_C = E!=0u && E!=0u && sim(vE,vC);    // xxx.alpha.duck
++
++    if ( sim_E_C && eq(E,D) && eq(B,C) ) return mixXE;
++
++    if ( (sim_E_C || mixFactor>0.01) && all_eq2(B,C,D) ) return mixXE;
++
++    return vE;
++}
++void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits, out float4 texcol, out float ialpha)
++{
++
++  float2 bcoords = floor(coords);
++
++    float4 vE = SampleFromVRAM(texpage, bcoords, uv_limits);
++
++    float4 vB = srcf(0.0, -1.0);
++    float4 vD = srcf(-1.0, 0.0);
++    float4 vF = srcf(+1.0, 0.0);
++    float4 vH = srcf(0.0, +1.0);
++
++    uint E = packUnorm4x8(vE);
++    uint B = packUnorm4x8(vB);
++    uint D = packUnorm4x8(vD);
++    uint F = packUnorm4x8(vF);
++    uint H = packUnorm4x8(vH);
++
++    // default pixel
++    ialpha = float(E != 0u);
++    texcol = vE;
++
++    bool eq_E_D = eq(E,D);
++    bool eq_E_F = eq(E,F);
++    bool eq_E_B = eq(E,B);
++    bool eq_E_H = eq(E,H);
++    bool eq_B_H = eq(B,H);
++    bool eq_D_F = eq(D,F);
++
++//* Skip processing for horizontal/vertical 3-pixel identical & mirror symmetric patterns
++bool skiprest = (eq_E_D && eq_E_F) || (eq_E_B && eq_E_H) || (eq_B_H && eq_D_F);
++if (!skiprest) {
++
++
++
++    // 5x5
++    float4 vA = srcf(-1.0, -1.0);
++    float4 vC = srcf(+1.0, -1.0);
++    float4 vG = srcf(-1.0, +1.0);
++    float4 vI = srcf(+1.0, +1.0);
++
++    uint A = packUnorm4x8(vA);
++    uint C = packUnorm4x8(vC);
++    uint G = packUnorm4x8(vG);
++    uint I = packUnorm4x8(vI);
++
++    uint P  = src( 0.0, -2.0);
++    uint Q  = src(-2.0,  0.0);
++    uint R  = src(+2.0,  0.0);
++    uint S  = src( 0.0, +2.0);
++
++    uint PA = src(-1.0, -2.0);
++    uint PC = src(+1.0, -2.0);
++    uint QA = src(-2.0, -1.0);
++    uint QG = src(-2.0, +1.0); //*             AA   PA   [P]  PC   CC
++    uint RC = src(+2.0, -1.0); //*               -|----|----|----|-
++    uint RI = src(+2.0, +1.0); //*             QA |  A |  B | C  | RC
++    uint SG = src(-1.0, +2.0); //*               -|----|----|----|-
++    uint SI = src(+1.0, +2.0); //*            [Q] |  D |  E | F  | [R]
++    uint AA = src(-2.0, -2.0); //*               -|----|----|----|-
++    uint CC = src(+2.0, -2.0); //*             QG |  G |  H | I  | RI
++    uint GG = src(-2.0, +2.0); //*               -|----|----|----|-
++    uint II = src(+2.0, +2.0); //*             GG   SG   [S]  SI   II
++
++
++    float4 J = vE;    float4 K = vE;    float4 L = vE;    float4 M = vE;
++
++
++    //*    pre-cal
++    float Bl = luma(vB) + float(B==0u);
++    float Dl = luma(vD) + float(D==0u);
++    float El = luma(vE) + float(E==0u);
++    float Fl = luma(vF) + float(F==0u);
++    float Hl = luma(vH) + float(H==0u);
++
++    bool eq_B_D = eq(B,D);
++    bool eq_B_F = eq(B,F);
++    bool eq_D_H = eq(D,H);
++    bool eq_F_H = eq(F,H);
++
++
++    bool oppoPix =  eq_B_H || eq_D_F;
++
++    bool slope1 = false;    bool slope2 = false;    bool slope3 = false;    bool slope4 = false;
++
++    bool slope1ok = false;  bool slope2ok = false;  bool slope3ok = false;  bool slope4ok = false;
++    bool slope1end = false;  bool slope2end = false;  bool slope3end = false;  bool slope4end = false;
++
++
++// B - D
++    if ( (B!=0u && D!=0u) && // xxx.alpha
++        (!eq_E_B && !eq_E_D && !oppoPix) && (!eq_D_H && !eq_B_F)
++     && (eq(E,A) || El>=Dl&&El>=Bl) && ( (El<Dl&&El<Bl) || none_eq2(A,B,D) || neq(E,P) || neq(E,Q) )
++     && ( eq_B_D &&(eq(E,A)||eq(B,PC)||eq(D,QG)||sim(vE,vC)||sim(vE,vG)) || simb(vB,vD)&&(eq_F_H||eq(E,C)||eq(E,G)) )
++        ) {
++        J=admixX(A,B,C,D,E,F,G,H,I
++                ,P,PA,PC,Q,QA,QG,R,RC,RI,S,SG,SI,AA,CC,GG
++                ,El, Bl, Dl, Fl, Hl
++                ,vE, vB, vD, vC, vG
++                );
++        slope1 = true;
++        slope1ok = (J.b < 1.1);
++        slope1end = (J.b < 3.1);
++        skiprest = (J.b > 7.1);
++        J = (J.b > 3.1) ? vE :
++            (J.b > 1.1) ? (J - 2.0) :
++            J;
++    }
++// B - F
++    if ( !slope1 && (B!=0u && F!=0u)
++     && (!eq_E_B && !eq_E_F && !oppoPix) && (!eq_B_D && !eq_F_H)
++     && (eq(E,C) || El>=Bl&&El>=Fl) && ( (El<Bl&&El<Fl) || none_eq2(C,B,F) || neq(E,P) || neq(E,R) )
++     && ( eq_B_F &&(eq(E,C)||eq(B,PA)||eq(F,RI)||sim(vE,vA)||sim(vE,vI)) || simb(vB,vF)&&(eq_D_H||eq(E,A)||eq(E,I)) )
++     ) {
++        K=admixX(C,F,I,B,E,H,A,D,G
++                ,R,RC,RI,P,PC,PA,S,SI,SG,Q,QA,QG,CC,II,AA
++                ,El,Fl,Bl,Hl,Dl
++                ,vE,vF,vB,vI,vA
++                );
++        slope2 = true;
++        slope2ok = (K.b < 1.1);
++        slope2end = (K.b < 3.1);
++        skiprest = (K.b > 7.1);
++        K = (K.b > 3.1) ? vE :
++            (K.b > 1.1) ? (K - 2.0) :
++            K;
++    }
++// D - H
++    if ( !slope1 && !skiprest && (D!=0u && H!=0u)
++     && (!eq_E_D && !eq_E_H && !oppoPix) && (!eq_F_H && !eq_B_D)
++     && (eq(E,G) || El>=Hl&&El>=Dl)  &&  ((El<Hl&&El<Dl) || none_eq2(G,D,H) || neq(E,S) || neq(E,Q))
++     &&    ( eq_D_H &&(eq(E,G)||eq(D,QA)||eq(H,SI)||sim(vE,vA)||sim(vE,vI)) || simb(vD,vH)&&(eq_B_F||eq(E,A)||eq(E,I)) )
++     ) {
++        L=admixX(G,D,A,H,E,B,I,F,C
++                ,Q,QG,QA,S,SG,SI,P,PA,PC,R,RI,RC,GG,AA,II
++                ,El,Dl,Hl,Bl,Fl
++                ,vE,vD,vH,vA,vI
++                );
++        slope3 = true;
++        slope3ok = (L.b < 1.1);
++        slope3end = (L.b < 3.1);
++        skiprest = (L.b > 7.1);
++        L = (L.b > 3.1) ? vE :
++            (L.b > 1.1) ? (L - 2.0) :
++            L;
++    }
++// F - H
++    if ( !slope2 && !slope3 && !skiprest && (F!=0u && H!=0u)
++     && (!eq_E_F && !eq_E_H && !oppoPix) && (!eq_B_F && !eq_D_H)
++     && (eq(E,I) || El>=Fl&&El>=Hl)  &&  ((El<Fl&&El<Hl) || none_eq2(I,F,H) || neq(E,R) || neq(E,S))
++     && ( eq_F_H &&(eq(E,I)||eq(F,RC)||eq(H,SG)||sim(vE,vC)||sim(vE,vG)) || simb(vF,vH)&&(eq_B_D||eq(E,C)||eq(E,G)) )
++      ) {
++        M=admixX(I,H,G,F,E,D,C,B,A
++                ,S,SI,SG,R,RI,RC,Q,QG,QA,P,PC,PA,II,GG,CC
++                ,El,Hl,Fl,Dl,Bl
++                ,vE,vH,vF,vG,vC
++                );
++        slope4 = true;
++        slope4ok = (M.b < 1.1);
++        slope4end = (M.b < 3.1);
++        skiprest = (M.b > 7.1);
++        M = (M.b > 3.1) ? vE :
++            (M.b > 1.1) ? (M - 2.0) :
++            M;
++    }
++
++//* =========================  2:1 long stepped slope  =========================
++
++    if (slope4ok) {
++        if (all_eq2(R,F,G) && neq(R, RC) && (neq(Q,G)||eq(Q, QA))) {L=admixL(vE,vH); skiprest = true;}
++        if (all_eq2(S,H,C) && neq(S, SG) && (neq(P,C)||eq(P, PA))) {K=admixL(vE,vF); skiprest = true;}
++    }
++
++    if (slope3ok) {
++        if (all_eq2(Q,D,I) && neq(Q, QA) && (neq(R,I)||eq(R, RC))) {M=admixL(vE,vH); skiprest = true;}
++        if (all_eq2(S,H,A) && neq(S, SI) && (neq(A,P)||eq(P, PC))) {J=admixL(vE,vD); skiprest = true;}
++    }
++
++    if (slope2ok) {
++        if (all_eq2(R,F,A) && neq(R, RI) && (neq(A,Q)||eq(Q, QG))) {J=admixL(vE,vB); skiprest = true;}
++        if (all_eq2(P,B,I) && neq(P, PA) && (neq(I,S)||eq(S, SG))) {M=admixL(vE,vF); skiprest = true;}
++    }
++
++    if (slope1ok) {
++        if (all_eq2(Q,D,C) && neq(Q, QG) && (neq(C,R)||eq(R, RI))) {K=admixL(vE,vB); skiprest = true;}
++        if (all_eq2(P,B,G) && neq(P, PC) && (neq(G,S)||eq(S, SI))) {L=admixL(vE,vD); skiprest = true;}
++    }
++
++
++
++//* =========================  2:1 staggered slope  (new rule)  ===========================
++
++if (!skiprest && !oppoPix) {
++
++
++    if (!eq_E_H && none_eq2(H,A,C)) {
++
++        if ( (!slope2 && !eq_B_F) && (!slope3 && !eq_D_H) && (!slope4end && !eq_F_H) && F!=0u &&
++            !eq_E_F && eq(R,H) && eq(F,G) ) {
++            M = admixS( A, B, C, D, E, F, G, H, I
++                      , R, RC, RI, S, SG, SI, II, CC
++                      , vE, vF, vC
++                      );
++            skiprest = true;}
++
++        if ( !skiprest && (!slope1 && !eq_B_D) && (!slope4 && !eq_F_H) && (!slope3end && !eq_D_H) && D!=0u &&
++             !eq_E_D && eq(Q,H) && eq(D,I) ) {
++            L = admixS( C, B, A, F, E, D, I, H, G
++                      , Q, QA, QG, S, SI, SG, GG, AA
++                      , vE, vD, vA
++                      );
++            skiprest = true;}
++    }
++
++    if ( !skiprest && !eq_E_B && none_eq2(B,G,I)) {
++
++        if ( (!slope1 && !eq_B_D)  && (!slope4 && !eq_F_H) && (!slope2end && !eq_B_F) && F!=0u &&
++              !eq_E_F && eq(B,R) && eq(A,F) ) {
++            K = admixS( G, H, I, D, E, F, A, B, C
++                      , R, RI, RC, P, PA, PC, CC, II
++                      , vE, vF, vI
++                      );
++            skiprest = true;}
++
++        if ( !skiprest && (!slope2 && !eq_B_F) && (!slope3 && !eq_D_H) && (!slope1end && !eq_B_D) && D!=0u &&
++             !eq_E_D && eq(B,Q) && eq(C,D) ) {
++            J = admixS( I, H, G, F, E, D, C, B, A
++                      , Q, QG, QA, P, PC, PA, AA, GG
++                      , vE, vD, vG
++                      );
++            skiprest = true;}
++
++    }
++
++
++    if ( !skiprest && !eq_E_D && none_eq2(D,C,I) ) {
++
++        if ( (!slope1 && !eq_B_D) && (!slope4 && !eq_F_H) && (!slope3end && !eq_D_H) && H!=0u &&
++              !eq_E_H && eq(D,S) && eq(A,H) ) {
++            L = admixS( C, F, I, B, E, H, A, D, G
++                      , S, SI, SG, Q, QA, QG, GG, II
++                      , vE, vH, vI
++                      );
++            skiprest = true;}
++
++        if ( !skiprest && (!slope3 && !eq_D_H) && (!slope2 && !eq_B_F) && (!slope1end && !eq_B_D) && B!=0u &&
++              !eq_E_B && eq(P,D) && eq(B,G) ) {
++            J = admixS( I, F, C, H, E, B, G, D, A
++                      , P, PC, PA, Q, QG, QA, AA, CC
++                      , vE, vB, vC
++                      );
++            skiprest = true;}
++
++    }
++
++    if ( !skiprest && !eq_E_F && none_eq2(F,A,G) ) {
++
++        if ( (!slope2 && !eq_B_F) && (!slope3 && !eq_D_H) && (!slope4end && !eq_F_H) && H!=0u &&
++              !eq_E_H && eq(S,F) && eq(H,C) ) {
++            M = admixS( A, D, G, B, E, H, C, F, I
++                      , S, SG, SI, R, RC, RI, II, GG
++                      , vE, vH, vG
++                      );
++            skiprest = true;}
++
++        if ( !skiprest && (!slope1 && !eq_B_D) && (!slope4 && !eq_F_H) && (!slope2end && !eq_B_F) && B!=0u &&
++             !eq_E_B && eq(P,F) && eq(B,I) ) {
++            K = admixS( G, D, A, H, E, B, I, F, C
++                      , P, PA, PC, R, RI, RC, CC, AA
++                      , vE, vB, vA
++                      );
++            skiprest = true;}
++
++    }
++}
++
++skiprest = skiprest||slope1||slope2||slope3||slope4||E==0u||B==0u||D==0u||F==0u||H==0u;
++
++//* =================== Concave+Cross pattern (P100) =================
++
++float4 vT;        float maxl;
++ //* top [B]
++if (!skiprest &&
++    Bl<El && !eq_E_D && !eq_E_F && eq_E_H && none_eq2(E,A,C) && all_eq3(E,G,I,S) ) {
++
++    float B1 = float(eq(B, A));
++    float B2 = float(eq(B, C));
++    float DD = float(eq(A, D));
++    float FF = float(eq(C, F));
++
++    float sideFactor = eq_D_F && DD!=FF ? 1.0 : -0.145898;
++    Bl = Bl - (B1 +B2 +B1*B2) *0.381966;
++    Dl = Dl - step(El, Dl) + DD*sideFactor;
++    Fl = Fl - step(El, Fl) + FF*sideFactor;
++
++    maxl = max(Bl, max(Dl, Fl));
++
++    vT = eq_B_D || eq_B_F ? vB :
++         maxl <= Dl      ? vD :
++         maxl <= Fl      ? vF :
++                           vB ;
++    vT = admixC(vT,vE);
++
++    bool nolink = !eq_D_F && (DD==0.0) && (FF==0.0);
++    J = Dl<0.0&&nolink ? vE : vT;
++    K = Fl<0.0&&nolink ? vE : vT;
++    L = mix(vE, J, 0.381966*float(eq_D_F));
++    M = L;
++
++   skiprest = true;
++}
++ //* bottom (H)
++if (!skiprest &&
++    Hl<El && !eq_E_D && !eq_E_F && eq_E_B && none_eq2(E,G,I) && all_eq3(E,A,C,P) ) {
++
++    float H1 = float(eq(H, G));
++    float H2 = float(eq(H, I));
++    float DD = float(eq(D, G));
++    float FF = float(eq(F, I));
++
++    float sideFactor = eq_D_F && DD!=FF ? 1.0 : -0.145898;
++
++    Hl = Hl - (H1+H2+H1*H2) *0.381966;
++    Dl = Dl - step(El, Dl) + DD*sideFactor;
++    Fl = Fl - step(El, Fl) + FF*sideFactor;
++
++    maxl = max(Hl, max(Dl, Fl));
++
++    vT = eq_D_H || eq_F_H ? vH :
++         maxl <= Dl      ? vD :
++         maxl <= Fl      ? vF :
++                           vH ;
++    vT=admixC(vT,vE);
++
++    bool nolink = !eq_D_F && (DD==0.0) && (FF==0.0);
++
++    L = Dl<0.0&&nolink ? vE : vT;
++    M = Fl<0.0&&nolink ? vE : vT;
++    J = mix(vE, L, 0.381966*float(eq_D_F));
++    K = J;
++
++   skiprest = true;
++}
++ //* right [F]
++if (!skiprest &&
++    Fl<El && !eq_E_B && !eq_E_H && eq_E_D && none_eq2(E,C,I) && all_eq3(E,A,G,Q) ) {
++
++    float F1 = float(eq(F, C));
++    float F2 = float(eq(F, I));
++    float BB = float(eq(B, C));
++    float HH = float(eq(H, I));
++
++    float sideFactor = eq_B_H && BB!=HH ? 1.0 : -0.145898;
++
++    Fl = Fl - (F1+F2+F1*F2) *0.381966;
++    Bl = Bl - step(El, Bl) + BB*sideFactor;
++    Hl = Hl - step(El, Hl) + HH*sideFactor;
++
++    maxl = max(Fl, max(Bl, Hl));
++
++    vT = eq_B_F || eq_F_H ? vF :
++         maxl <= Bl      ? vB :
++         maxl <= Hl      ? vH :
++                           vF ;
++    vT=admixC(vT,vE);
++
++    bool nolink =  !eq_B_H && (BB==0.0) && (HH==0.0);
++
++    K = Bl<0.0&&nolink ? vE : vT;
++    M = Hl<0.0&&nolink ? vE : vT;
++    J = mix(vE, K, 0.381966*float(eq_B_H));
++    L = J;
++
++   skiprest = true;
++}
++ //* left [D]
++if (!skiprest &&
++    Dl<El && !eq_E_B && !eq_E_H && eq_E_F && none_eq2(E,A,G) && all_eq3(E,C,I,R) ) {
++
++    float D1 = float(eq(D, A));
++    float D2 = float(eq(D, G));
++    float BB = float(eq(B, A));
++    float HH = float(eq(H, G));
++
++    float sideFactor = eq_B_H && BB!=HH ? 1.0 : -0.145898;
++
++    Dl = Dl - (D1+D2+D1*D2) *0.381966;
++    Bl = Bl - step(El, Bl) + BB*sideFactor;
++    Hl = Hl - step(El, Hl) + HH*sideFactor;
++
++    maxl = max(Dl, max(Bl, Hl));
++
++    vT = eq_B_D || eq_D_H ? vD :
++         maxl <= Bl      ? vB :
++         maxl <= Hl      ? vH :
++                           vD ;
++    vT=admixC(vT,vE);
++
++    bool nolink =  !eq_B_H && (BB==0.0) && (HH==0.0);
++
++    J = Bl<0.0&&nolink ? vE : vT;
++    L = Hl<0.0&&nolink ? vE : vT;
++    K = mix(vE, J, 0.381966*float(eq_B_H));
++    M = K;
++
++   skiprest = true;
++}
++
++//* ===================  SKorpion pattern (P99) ==================
++
++
++if (!skiprest && !eq_E_F&&eq_E_D&&eq_B_F&&eq_F_H && all_eq2(E,C,I) && (eq(E,Q)||El>Fl) && neq(F,src(+3.0, 0.0)) ) {K=admixK(vF,vE); M=K; skiprest=true;}    //* RIGHT
++if (!skiprest && !eq_E_D&&eq_E_F&&eq_B_D&&eq_D_H && all_eq2(E,A,G) && (eq(E,R)||El>Dl) && neq(D,src(-3.0, 0.0)) ) {J=admixK(vD,vE); L=J; skiprest=true;}    //* LEFT
++if (!skiprest && !eq_E_H&&eq_E_B&&eq_D_H&&eq_F_H && all_eq2(E,G,I) && (eq(E,P)||El>Hl) && neq(H,src(0.0, +3.0)) ) {L=admixK(vH,vE); M=L; skiprest=true;}    //* BOTTOM
++if (!skiprest && !eq_E_B&&eq_E_H&&eq_B_D&&eq_B_F && all_eq2(E,A,C) && (eq(E,S)||El>Bl) && neq(B,src(0.0, -3.0)) ) {J=admixK(vB,vE); K=J;}                    //* TOP
++
++
++    //final write
++    float2 fpart = frac(coords);
++
++    float4 res = (fpart.x < 0.5) ? ((fpart.y < 0.5) ? J : L) : ((fpart.y < 0.5) ? K : M);
++
++    ialpha = step(0.002, res.r+res.g+res.b+res.a);
++    texcol = res;
++}
++    
++}
++
++#undef src
++#endif
++
++#endif  /* PSX_TEXFILTERS_GLSL */
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index d1a8e437..5a104952 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -31,6 +31,7 @@
+ extern void gte_pgxp_culling_set(int on);
+ extern int gte_pgxp_culling_enabled(void);
+ #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
++#include "gpu_vk_renderer.h"  /* the same A/B knobs on the Vulkan backend */
+ #include "present_ring.h"
+ #include "load_transition_ring.h"
+ #include "cdrom.h"
+@@ -5353,9 +5354,14 @@ static void handle_pgxp(int id, const char *json)
+     if (tf >= 0 && tf <= 10)
+         gr_set_texture_filter(tf);
+     int eb = json_get_int(json, "edge_blend", -1);
+-    if (eb >= 0) gl_renderer_set_texture_edge_blend(eb != 0);
++    if (eb >= 0) { gl_renderer_set_texture_edge_blend(eb != 0);
++                   vk_renderer_set_texture_edge_blend(eb != 0); }
+     int fc = json_get_int(json, "fmv_chroma", -1);
+-    if (fc >= 0) gl_renderer_set_fmv_chroma_smoothing(fc != 0);
++    if (fc >= 0) { gl_renderer_set_fmv_chroma_smoothing(fc != 0);
++                   vk_renderer_set_fmv_chroma_smoothing(fc != 0); }
++    int f2 = json_get_int(json, "filter_2d", -1);
++    if (f2 >= 0) { gl_renderer_set_texture_filter_2d(f2 != 0);
++                   vk_renderer_set_texture_filter_2d(f2 != 0); }
+     if (geom >= 0 && tex < 0) {
+         /* keep the engine armed consistently with both flags */
+         gpu_texture_correction_set(gpu_texture_correction_enabled());
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index e33ac17f..78ddd951 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -51,6 +51,9 @@ void vk_renderer_set_fmv_crop(int r){(void)r;}
+ void vk_renderer_set_fmv_letterbox(int r){(void)r;}
+ void vk_renderer_set_fmv_filter(int c){(void)c;}
+ void vk_renderer_set_fmv_chroma_smoothing(int o){(void)o;}
++void vk_renderer_set_texture_filter_2d(int o){(void)o;}
++void vk_renderer_set_texture_edge_blend(int o){(void)o;}
++void vk_renderer_set_post_processing(int m){(void)m;}
+ int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
+ const GpuRenderBackend *vk_backend_get(void) { return 0; }
+ 
+@@ -324,6 +327,36 @@ static int            s_wide_cur_base = 0;
+ static void wide_free_all(void);           /* defined with the wide helpers below */
+ 
+ static VkSampler       s_samp;
++
++/* ---- present shader pass ---------------------------------------------------
++ * The plain present is a vkCmdBlitImage straight to the swapchain, which is
++ * cheap and covers nearest and bilinear. The Display rows that need real
++ * filtering - sharp-bilinear scaling, FXAA post-processing, bicubic FMV
++ * reconstruction - cannot be expressed as a blit, so those frames go through a
++ * one-quad render pass into the swapchain image instead (present.vert/frag,
++ * the OpenGL backend's PRESENT_FS ported over). Everything here is optional:
++ * if any object fails to build, s_present_pass_ok stays 0 and every frame
++ * keeps using the blit, so a driver that cannot do this still runs the game. */
++static VkRenderPass          s_present_rp;
++static VkImageView           s_sc_views[8];
++static VkFramebuffer         s_sc_fbs[8];
++static VkDescriptorSetLayout s_dsl_present;
++static VkPipelineLayout      s_pl_present;
++static VkPipeline            s_pipe_present;
++static VkSampler             s_samp_present;      /* LINEAR, clamp-to-edge */
++#define PRESENT_DESC_RING 8
++static VkDescriptorSet       s_ds_present_ring[PRESENT_DESC_RING];
++static int                   s_ds_present_idx;
++static int                   s_present_pass_ok;
++static VkShaderModule        s_mod_present_v, s_mod_present_f;
++
++typedef struct {
++    float dst[4];          /* NDC x0,y0,x1,y1 */
++    float uv_rect[4];      /* source uv x0,y0,x1,y1 */
++    float tex_size[2];
++    float sharp_scale[2];
++    int   sharp;
++} PresentPush;             /* 68 bytes */
+ static VkDescriptorPool s_dpool;
+ static VkDescriptorSetLayout s_dsl_tex;   /* binding0: raw usampler2D (frag) */
+ static VkDescriptorSetLayout s_dsl_pack;  /* binding0: hr sampler, binding1: raw storage (compute) */
+@@ -392,6 +425,17 @@ static VkPipeline       s_pipe_pack;      /* compute */
+ static VkPipeline s_pipe_cache[PIPE_CACHE_N];
+ static VkShaderModule s_mod_geo_v, s_mod_geo_f, s_mod_tex_v, s_mod_tex_f, s_mod_blit_v, s_mod_blit_f;
+ 
++/* Texture-filter program variants. geo_tex.frag is compiled once per mode at
++ * build time (embed_spirv.py --variants), exactly as the OpenGL backend builds
++ * one program per mode; s_mod_tex_f is whichever variant the current setting
++ * selects. Changing the setting swaps the module and drops every cached TEX
++ * pipeline, since a pipeline bakes in its shader. Modules are made on first
++ * use so a session only pays for the modes it actually runs. */
++#define TEX_FILTER_MODES 11
++static VkShaderModule s_mod_tex_f_var[TEX_FILTER_MODES];
++static int s_mod_tex_f_failed[TEX_FILTER_MODES];   /* module creation failed: stay on nearest */
++static int s_texfilter_built = -1;                 /* mode s_mod_tex_f currently holds */
++
+ /* Untextured batch (flat/gouraud triangles, lines-as-quads, flat rects). */
+ typedef struct { float x, y, r, g, b, a; } Vert;   /* GEO vertex, stride 24 */
+ #define VK_VBUF_VERTS 65536
+@@ -888,7 +932,195 @@ static int create_swapchain(void) {
+     return 1;
+ }
+ 
++static VkShaderModule make_module(const uint32_t *code, uint32_t size);
++
++/* Render pass, sampler, descriptors and pipeline for the present pass. Built
++ * once; the swapchain-sized half (views + framebuffers) is create_present_
++ * targets(). Returns 0 on any failure - the caller then keeps the blit. */
++static int create_present_pass(void) {
++    VkAttachmentDescription att = {0};
++    att.format = s_sc_format;
++    att.samples = VK_SAMPLE_COUNT_1_BIT;
++    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;       /* the letterbox bars */
++    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    /* Hand the image back in TRANSFER_DST: the OSD blit and
++     * finish_present's barrier to PRESENT_SRC both expect that. */
++    att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++    VkSubpassDescription sub = {0};
++    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++    sub.colorAttachmentCount = 1; sub.pColorAttachments = &ref;
++    VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
++    rpi.attachmentCount = 1; rpi.pAttachments = &att;
++    rpi.subpassCount = 1; rpi.pSubpasses = &sub;
++    if (p_vkCreateRenderPass(s_dev, &rpi, NULL, &s_present_rp) != VK_SUCCESS) return 0;
++
++    /* LINEAR + clamp-to-edge: every mode either wants the hardware lerp or
++     * does its own weighting from taps that must not wrap. */
++    VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++    si.magFilter = VK_FILTER_LINEAR; si.minFilter = VK_FILTER_LINEAR;
++    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    si.addressModeU = si.addressModeV = si.addressModeW =
++        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    si.maxLod = 0.0f;
++    if (p_vkCreateSampler(s_dev, &si, NULL, &s_samp_present) != VK_SUCCESS) return 0;
++
++    VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
++                                       VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
++    VkDescriptorSetLayoutCreateInfo dci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
++    dci.bindingCount = 1; dci.pBindings = &b;
++    if (p_vkCreateDescriptorSetLayout(s_dev, &dci, NULL, &s_dsl_present) != VK_SUCCESS) return 0;
++    for (int i = 0; i < PRESENT_DESC_RING; i++) {
++        VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++        ai.descriptorPool = s_dpool; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_dsl_present;
++        if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_ds_present_ring[i]) != VK_SUCCESS) return 0;
++    }
++
++    VkPushConstantRange pr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++                               0, sizeof(PresentPush) };
++    VkPipelineLayoutCreateInfo li = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    li.setLayoutCount = 1; li.pSetLayouts = &s_dsl_present;
++    li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pr;
++    if (p_vkCreatePipelineLayout(s_dev, &li, NULL, &s_pl_present) != VK_SUCCESS) return 0;
++
++    s_mod_present_v = make_module(spv_present_vert, spv_present_vert_size);
++    s_mod_present_f = make_module(spv_present_frag, spv_present_frag_size);
++    if (!s_mod_present_v || !s_mod_present_f) return 0;
++
++    VkPipelineShaderStageCreateInfo st[2] = {
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
++    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = s_mod_present_v; st[0].pName = "main";
++    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = s_mod_present_f; st[1].pName = "main";
++    VkPipelineVertexInputStateCreateInfo vi2 = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    vp.viewportCount = 1; vp.scissorCount = 1;
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
++    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    VkPipelineColorBlendAttachmentState cba = {0};
++    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++    cb.attachmentCount = 1; cb.pAttachments = &cba;
++    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++    VkPipelineDynamicStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    ds.dynamicStateCount = 2; ds.pDynamicStates = dyn;
++    VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    gp.stageCount = 2; gp.pStages = st;
++    gp.pVertexInputState = &vi2; gp.pInputAssemblyState = &ia;
++    gp.pViewportState = &vp; gp.pRasterizationState = &rs;
++    gp.pMultisampleState = &ms; gp.pColorBlendState = &cb;
++    gp.pDynamicState = &ds; gp.layout = s_pl_present;
++    gp.renderPass = s_present_rp; gp.subpass = 0;
++    if (p_vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gp, NULL, &s_pipe_present) != VK_SUCCESS)
++        return 0;
++    return 1;
++}
++
++/* Views + framebuffers for the swapchain images, so the present pass can
++ * render into them. Torn down and rebuilt with the swapchain. */
++static void destroy_present_targets(void) {
++    for (uint32_t i = 0; i < 8; i++) {
++        if (s_sc_fbs[i])   { p_vkDestroyFramebuffer(s_dev, s_sc_fbs[i], NULL);  s_sc_fbs[i] = VK_NULL_HANDLE; }
++        if (s_sc_views[i]) { p_vkDestroyImageView(s_dev, s_sc_views[i], NULL);  s_sc_views[i] = VK_NULL_HANDLE; }
++    }
++}
++
++static int create_present_targets(void) {
++    if (!s_present_rp) return 0;
++    destroy_present_targets();
++    for (uint32_t i = 0; i < s_sc_count; i++) {
++        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++        vi.image = s_sc_images[i];
++        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        vi.format = s_sc_format;
++        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        vi.subresourceRange.levelCount = 1;
++        vi.subresourceRange.layerCount = 1;
++        if (p_vkCreateImageView(s_dev, &vi, NULL, &s_sc_views[i]) != VK_SUCCESS) {
++            destroy_present_targets(); return 0;
++        }
++        VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++        fi.renderPass = s_present_rp;
++        fi.attachmentCount = 1; fi.pAttachments = &s_sc_views[i];
++        fi.width = s_sc_extent.width; fi.height = s_sc_extent.height; fi.layers = 1;
++        if (p_vkCreateFramebuffer(s_dev, &fi, NULL, &s_sc_fbs[i]) != VK_SUCCESS) {
++            destroy_present_targets(); return 0;
++        }
++    }
++    return 1;
++}
++
++/* Run the present pass: one quad from `view` into swapchain image `idx`,
++ * letterboxed to `dst` (pixels) with the source region `sx0..sy1` (texels of a
++ * tex_w x tex_h image). `sharp` selects the filter (see present.frag). The
++ * source image must already be in SHADER_READ_ONLY_OPTIMAL. */
++static void present_shader_draw(VkCommandBuffer cb, uint32_t idx, VkImageView view,
++                                const VkOffset3D dst[2], int tex_w, int tex_h,
++                                float sx0, float sy0, float sx1, float sy1,
++                                int sharp) {
++    VkDescriptorSet ds = s_ds_present_ring[s_ds_present_idx];
++    s_ds_present_idx = (s_ds_present_idx + 1) % PRESENT_DESC_RING;
++    VkDescriptorImageInfo ii = { s_samp_present, view,
++                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
++    VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
++    w.dstSet = ds; w.dstBinding = 0; w.descriptorCount = 1;
++    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
++    p_vkUpdateDescriptorSets(s_dev, 1, &w, 0, NULL);
++
++    VkClearValue clear = {{{0.0f, 0.0f, 0.0f, 1.0f}}};   /* letterbox bars */
++    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
++    rp.renderPass = s_present_rp; rp.framebuffer = s_sc_fbs[idx];
++    rp.renderArea.extent = s_sc_extent;
++    rp.clearValueCount = 1; rp.pClearValues = &clear;
++    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
++
++    VkViewport vp = { 0.0f, 0.0f, (float)s_sc_extent.width, (float)s_sc_extent.height, 0.0f, 1.0f };
++    VkRect2D sc2 = { {0, 0}, s_sc_extent };
++    p_vkCmdSetViewport(cb, 0, 1, &vp);
++    p_vkCmdSetScissor(cb, 0, 1, &sc2);
++    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipe_present);
++    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_present,
++                              0, 1, &ds, 0, NULL);
++
++    PresentPush pp;
++    const float W = (float)s_sc_extent.width, H = (float)s_sc_extent.height;
++    pp.dst[0] = (float)dst[0].x / W * 2.0f - 1.0f;
++    pp.dst[1] = (float)dst[0].y / H * 2.0f - 1.0f;
++    pp.dst[2] = (float)dst[1].x / W * 2.0f - 1.0f;
++    pp.dst[3] = (float)dst[1].y / H * 2.0f - 1.0f;
++    /* Half-texel inset, as the OpenGL present does: corner-mapped uvs would
++     * make the outermost destination pixels blend texels from outside the
++     * displayed region (a visible edge stripe with any linear tap). */
++    pp.uv_rect[0] = (sx0 + 0.5f) / (float)tex_w;
++    pp.uv_rect[1] = (sy0 + 0.5f) / (float)tex_h;
++    pp.uv_rect[2] = (sx1 - 0.5f) / (float)tex_w;
++    pp.uv_rect[3] = (sy1 - 0.5f) / (float)tex_h;
++    pp.tex_size[0] = (float)tex_w; pp.tex_size[1] = (float)tex_h;
++    /* Output pixels per source texel over the WHOLE texture, which is what
++     * present.frag's sharp band is expressed in. */
++    const float span_x = (sx1 - sx0) > 0.0f ? (sx1 - sx0) : 1.0f;
++    const float span_y = (sy1 - sy0) > 0.0f ? (sy1 - sy0) : 1.0f;
++    pp.sharp_scale[0] = (float)(dst[1].x - dst[0].x) / span_x;
++    pp.sharp_scale[1] = (float)(dst[1].y - dst[0].y) / span_y;
++    pp.sharp = sharp;
++    p_vkCmdPushConstants(cb, s_pl_present,
++                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++                         0, sizeof pp, &pp);
++    p_vkCmdDraw(cb, 6, 1, 0, 0);
++    p_vkCmdEndRenderPass(cb);
++}
++
+ static void destroy_swapchain(void) {
++    destroy_present_targets();
+     if (s_swapchain) { p_vkDestroySwapchainKHR(s_dev, s_swapchain, NULL); s_swapchain = VK_NULL_HANDLE; }
+ }
+ 
+@@ -960,12 +1192,48 @@ static VkShaderModule make_module(const uint32_t *code, uint32_t size) {
+     return m;
+ }
+ 
++/* Point s_mod_tex_f at the variant for `mode`, dropping the cached TEX
++ * pipelines that baked in the old one. Called from the batch flush (never
++ * mid-render-pass) so a setting change lands on the next batch, and falls back
++ * to nearest if a module cannot be made - never to no renderer. */
++static void tex_module_select(int mode) {
++    if (mode < 0 || mode >= TEX_FILTER_MODES || mode >= SPV_GEO_TEX_VARIANT_COUNT) mode = 0;
++    if (s_mod_tex_f_failed[mode]) mode = 0;
++    if (mode == s_texfilter_built && s_mod_tex_f) return;
++    if (!s_mod_tex_f_var[mode]) {
++        s_mod_tex_f_var[mode] = make_module(spv_geo_tex_variants[mode],
++                                            spv_geo_tex_variant_sizes[mode]);
++        if (!s_mod_tex_f_var[mode]) {
++            s_mod_tex_f_failed[mode] = 1;
++            fprintf(stderr, "psxrecomp: vulkan: texture filter mode %d unavailable "
++                            "(shader module); using nearest\n", mode);
++            if (mode != 0) { tex_module_select(0); return; }
++            return;
++        }
++    }
++    /* A pipeline holds its shader, so every cached TEX pipeline is stale. They
++     * are only ever bound inside a render pass we are not in here. */
++    if (s_texfilter_built >= 0) {
++        p_vkDeviceWaitIdle(s_dev);
++        for (int i = 0; i < PIPE_CACHE_N; i++) {
++            int prog = i / (PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS * PIPE_CMASKS);
++            if (prog == 1 && s_pipe_cache[i]) {
++                p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
++                s_pipe_cache[i] = VK_NULL_HANDLE;
++            }
++        }
++    }
++    s_mod_tex_f = s_mod_tex_f_var[mode];
++    s_texfilter_built = mode;
++}
++
+ /* ---- push-constant blocks (must match the shaders' layouts) ------------- */
+ typedef struct { float shift, xoff, xhalf; } GeoPush;          /* 12 bytes */
+ typedef struct {
+     float shift, xoff, xhalf;        /* 0,4,8 */
+     int   semipass, maskset, filter; /* 12,16,20 */
+-    int   _pad[2];                   /* 24,28 -> ivec4 16-byte align */
++    int   edge;                      /* 24: edge blending (coverage cutout) */
++    int   _pad;                      /* 28 -> ivec4 16-byte align */
+     int   twin[4];                   /* 32..47 */
+ } TexPush;                           /* 48 bytes */
+ typedef struct {
+@@ -1151,10 +1419,11 @@ static int create_render_targets(void) {
+     /* Descriptor pool + sets: ds_tex (1) + ds_pack (1) + blit ring (BLIT_DESC_RING). */
+     {
+         VkDescriptorPoolSize sizes[2] = {
+-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, BLIT_DESC_RING + 2 },
++            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, BLIT_DESC_RING + PRESENT_DESC_RING + 2 },
+             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1 } };
+         VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+-        pci.maxSets = BLIT_DESC_RING + 2; pci.poolSizeCount = 2; pci.pPoolSizes = sizes;
++        pci.maxSets = BLIT_DESC_RING + PRESENT_DESC_RING + 2;
++        pci.poolSizeCount = 2; pci.pPoolSizes = sizes;
+         if (p_vkCreateDescriptorPool(s_dev, &pci, NULL, &s_dpool) != VK_SUCCESS) return vk_die("desc pool");
+         VkDescriptorSetLayout layouts[2] = { s_dsl_tex, s_dsl_pack };
+         VkDescriptorSet *sets[2] = { &s_ds_tex, &s_ds_pack };
+@@ -1202,7 +1471,8 @@ static int create_render_targets(void) {
+     s_mod_geo_v  = make_module(spv_geo_vert, spv_geo_vert_size);
+     s_mod_geo_f  = make_module(spv_geo_frag, spv_geo_frag_size);
+     s_mod_tex_v  = make_module(spv_geo_tex_vert, spv_geo_tex_vert_size);
+-    s_mod_tex_f  = make_module(spv_geo_tex_frag, spv_geo_tex_frag_size);
++    s_texfilter_built = -1;
++    tex_module_select(s_texfilter);   /* the configured mode's variant */
+     s_mod_blit_v = make_module(spv_blit_vert, spv_blit_vert_size);
+     s_mod_blit_f = make_module(spv_blit_frag, spv_blit_frag_size);
+     if (!s_mod_geo_v || !s_mod_geo_f || !s_mod_tex_v || !s_mod_tex_f || !s_mod_blit_v || !s_mod_blit_f)
+@@ -1463,6 +1733,12 @@ int vk_renderer_init_context(SDL_Window *win) {
+     if (!create_sync()) return 0;
+     if (!create_vram_image()) return 0;
+     if (!create_render_targets()) return 0;
++    /* Optional: without it every frame simply keeps using the blit. */
++    s_present_pass_ok = create_present_pass() && create_present_targets();
++    if (!s_present_pass_ok)
++        fprintf(stderr, "psxrecomp: vulkan: present shader pass unavailable - "
++                        "sharp-bilinear scaling, FXAA and bicubic FMV filtering "
++                        "fall back to plain bilinear\n");
+ 
+     s_ctx_ok = 1;
+     vk_log("instance/device/swapchain/VRAM + raw mirror/pipelines ready");
+@@ -1554,6 +1830,7 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
+         p_vkDeviceWaitIdle(s_dev);
+         destroy_swapchain();
+         if (!create_swapchain()) return 0;
++        if (s_present_pass_ok && !create_present_targets()) s_present_pass_ok = 0;
+         return 0;  /* skip this frame; next one uses the new swapchain */
+     }
+     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return 0;
+@@ -1744,12 +2021,25 @@ static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
+  * a blit: FXAA post-processing and sharp-bilinear, which fall back to plain
+  * bilinear (see docs/RENDERING_QUALITY.md). */
+ static int s_aspect_num = 4, s_aspect_den = 3;
++static int s_texfilter_2d = 0;   /* filter screen-aligned 2D prims too */
++static int s_edge_blend = 0;     /* filtered-coverage cutout */
+ static int s_display_scaling = -1;   /* -1 follow antialiasing, 0 nearest, 1/2 linear */
+ static int s_fmv_crop = 0;           /* overscan rows trimmed from a movie frame */
+ static int s_fmv_band_seed = 0;      /* [video] fmv_letterbox_rows */
+ static int s_fmv_filter_cfg = 0;     /* 0 follow, 1 nearest, 2+ linear */
+ static int s_fmv_chroma = 0;
+ 
++/* [video] texture_filter_2d: filtering smears screen-aligned 2D art (HUD,
++ * menus), so those prims sample nearest unless this is on - the classification
++ * below is the OpenGL backend's, prim for prim. */
++void vk_renderer_set_texture_filter_2d(int on) { s_texfilter_2d = on ? 1 : 0; }
++/* [video] texture_edge_blending: DuckStation's rule that a fragment whose
++ * filtered coverage is under one half is dropped. The OpenGL backend also
++ * blends the survivors by coverage through a dual-source factor; that half
++ * needs a second colour output and the dualSrcBlend feature, and is not here
++ * yet - so this is the cutout part alone. */
++void vk_renderer_set_texture_edge_blend(int on) { s_edge_blend = on ? 1 : 0; }
++
+ void vk_renderer_set_display_aspect(int num, int den) {
+     if (num <= 0 || den <= 0) { num = 4; den = 3; }
+     s_aspect_num = num; s_aspect_den = den;
+@@ -1762,14 +2052,31 @@ void vk_renderer_set_fmv_filter(int cfg_value) {
+ }
+ void vk_renderer_set_fmv_chroma_smoothing(int on) { s_fmv_chroma = on ? 1 : 0; }
+ 
+-/* Nearest or linear for the final blit. Sharp-bilinear (mode 2) has no
+- * blit-only form, so it takes plain linear until the present gains a shader. */
++/* Nearest or linear for the plain blit path. */
+ static VkFilter present_filter(int linear) {
+     if (s_display_scaling == 0) linear = 0;
+     else if (s_display_scaling == 1 || s_display_scaling == 2) linear = 1;
+     return linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+ }
+ 
++static int s_present_postfx;   /* [video] post_processing: 1 = FXAA */
++void vk_renderer_set_post_processing(int mode) { s_present_postfx = (mode == 1) ? 1 : 0; }
++
++/* present.frag's mode for a VRAM frame, or 0 when a plain blit will do. The
++ * OpenGL backend's rule: FXAA first, else sharp-bilinear when the display
++ * scaling asks for it AND the magnification is non-integer (at an integer
++ * ratio nearest is already exact and sharper). */
++static int present_shader_mode(int dst_w, int src_w) {
++    if (!s_present_pass_ok) return 0;
++    if (s_present_postfx == 1) return 3;
++    if (s_display_scaling == 2 && src_w > 0 && dst_w > 0) {
++        const float mag = (float)dst_w / (float)src_w;
++        const float near_int = (float)(int)(mag + 0.5f);
++        if (mag > 1.0f && (mag < near_int - 0.01f || mag > near_int + 0.01f)) return 1;
++    }
++    return 0;
++}
++
+ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
+                              int linear, int force_4_3) {
+     if (!s_ctx_ok) return 0;
+@@ -1791,6 +2098,22 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
+     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
+               force_4_3 ? 4 : s_aspect_num, force_4_3 ? 3 : s_aspect_den, dst);
+ 
++    /* Sharp-bilinear or FXAA cannot be expressed as a blit: render the quad
++     * through present.frag instead (the swapchain image comes back in
++     * TRANSFER_DST, so the OSD blit and finish_present are unaffected). */
++    const int smode = present_shader_mode(dst[1].x - dst[0].x, w * S);
++    if (smode) {
++        vram_to(cb, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        present_shader_draw(cb, idx, s_vram_view, dst, VRAM_W * S, VRAM_H * S,
++                            (float)(disp_x * S), (float)(disp_y * S),
++                            (float)((disp_x + w) * S), (float)((disp_y + h) * S),
++                            smode);
++        vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        finish_present(cb, sc, idx, fr);
++        perf_snapshot_present();
++        return 1;
++    }
++
+     VkImageBlit blit = {0};
+     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+     blit.srcSubresource.layerCount = 1;
+@@ -1837,6 +2160,7 @@ void vk_renderer_present_blank(void) {
+  * The per-frame vkQueueWaitIdle below also makes reuse race-free (the copy
+  * from the staging has fully completed before the next frame rewrites it). */
+ static VkImage        s_cpres_img  = VK_NULL_HANDLE;
++static VkImageView    s_cpres_view = VK_NULL_HANDLE;   /* for the present pass */
+ static VkDeviceMemory s_cpres_imem = VK_NULL_HANDLE;
+ static VkImageLayout  s_cpres_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+ static VkBuffer       s_cpres_buf  = VK_NULL_HANDLE;
+@@ -1845,6 +2169,7 @@ static void          *s_cpres_map  = NULL;
+ static int            s_cpres_w = 0, s_cpres_h = 0;
+ 
+ static void cpres_cache_free(void) {
++    if (s_cpres_view) { p_vkDestroyImageView(s_dev, s_cpres_view, NULL); s_cpres_view = VK_NULL_HANDLE; }
+     if (s_cpres_img)  { p_vkDestroyImage(s_dev, s_cpres_img, NULL);  s_cpres_img = VK_NULL_HANDLE; }
+     if (s_cpres_imem) { p_vkFreeMemory(s_dev, s_cpres_imem, NULL);   s_cpres_imem = VK_NULL_HANDLE; }
+     if (s_cpres_buf)  {
+@@ -1906,8 +2231,9 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
+             vk_renderer_present_blank(); return;
+         }
+         if (!make_image(VK_FORMAT_B8G8R8A8_UNORM, src_w, src_h,
+-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+-                        VK_IMAGE_ASPECT_COLOR_BIT, &s_cpres_img, &s_cpres_imem, NULL)) {
++                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                        VK_IMAGE_USAGE_SAMPLED_BIT,
++                        VK_IMAGE_ASPECT_COLOR_BIT, &s_cpres_img, &s_cpres_imem, &s_cpres_view)) {
+             cpres_cache_free(); vk_renderer_present_blank(); return;
+         }
+         s_cpres_w = src_w; s_cpres_h = src_h;
+@@ -1955,6 +2281,23 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
+         dst[0].y = y0;
+         dst[1].y = y0 + content_h;
+     }
++    /* Bicubic FMV reconstruction (fmv_filter cfg 3) and FXAA are shader-only;
++     * everything else stays on the blit. */
++    int fmv_shader = 0;
++    if (s_present_pass_ok) {
++        if (s_present_postfx == 1)      fmv_shader = 3;
++        else if (s_fmv_filter_cfg == 3) fmv_shader = 2;
++    }
++    if (fmv_shader && s_cpres_view) {
++        img_to(cb, img, &s_cpres_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        present_shader_draw(cb, idx, s_cpres_view, dst, src_w, src_h,
++                            (float)fx0, (float)fy0, (float)fx1, (float)fy1, fmv_shader);
++        finish_present(cb, sc, idx, fr);
++        p_vkQueueWaitIdle(s_queue);
++        perf_snapshot_present();
++        return;
++    }
++
+     VkImageBlit blit = {0};
+     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; blit.srcSubresource.layerCount = 1;
+     blit.srcOffsets[0].x = fx0;   blit.srcOffsets[0].y = fy0;
+@@ -2495,7 +2838,15 @@ static void ensure_cpu(void) {
+ static void vkb_init(uint16_t *vram) { s_vram = vram; s_cpu_dirty = 0; sw_renderer_init(vram); }
+ static void vkb_set_scale(int scale) { if (scale >= 1 && scale <= 4) s_scale = scale; }
+ static int  vkb_scale(void) { return s_scale; }
+-static void vkb_set_texture_filter(int b) { s_texfilter = b ? 1 : 0; }
++/* 0=nearest 1=bilinear 2=3-point(N64) 3=trilinear 4=JINC2 5=xBR 6=Scale2x
++ * 7=Scale3x 8=MMPX 9=MMPX Enhanced 10=MMPX Advanced - the same modes and the
++ * same shader code as the OpenGL backend (geo_tex.frag / texfilters.glsl).
++ * The module swap happens at the next batch flush, not here: this can be
++ * called from the settings UI mid-frame. */
++static void vkb_set_texture_filter(int b) {
++    s_texfilter = (b >= 0 && b < TEX_FILTER_MODES) ? b : (b ? 1 : 0);
++    sw_set_texture_filter(b != 0);
++}
+ static int  vkb_texture_filter(void) { return s_texfilter; }
+ 
+ static void vkb_set_draw_area(int x1, int y1, int x2, int y2) {
+@@ -3025,6 +3376,9 @@ static void vkb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
+  * pipeline. The raw mirror was made coherent at append time (flush_pack_if_sampling). */
+ static void flush_tex_batch(void) {
+     if (s_tcount == 0 || !s_ready) return;
++    /* Between batches is the one safe place to swap the filter variant: no
++     * render pass is open and no pipeline is bound. */
++    if (s_texfilter != s_texfilter_built) tex_module_select(s_texfilter);
+     s_perf_cur.tex_flushes++;
+     uint32_t base = s_tbase, n = s_tcount;
+     s_tbase += n; s_tcount = 0;   /* consumed region stays untouched until gpu_sync */
+@@ -3039,7 +3393,12 @@ static void flush_tex_batch(void) {
+     p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
+     TexPush tp = {0};
+     tp.shift = px_shift(); tp.xoff = 0.0f; tp.xhalf = 512.0f;
+-    tp.maskset = s_tb_mask; tp.filter = s_tb_filter;
++    tp.maskset = s_tb_mask;
++    /* The bound module IS the mode (one variant per filter), so the push only
++     * says filter-or-not: a batch of 2D prims with "Filter 2D elements" off
++     * takes the nearest path that every variant carries. */
++    tp.filter = (s_tb_filter != 0) ? 1 : 0;
++    tp.edge   = (s_edge_blend && s_tb_filter != 0) ? 1 : 0;
+     tp.twin[0] = s_tb_twin[0]; tp.twin[1] = s_tb_twin[1]; tp.twin[2] = s_tb_twin[2]; tp.twin[3] = s_tb_twin[3];
+     if (semi < 0) {
+         /* OPAQUE batch: the STP bit does not gate COLOUR (every texel is
+@@ -3116,6 +3475,22 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
+     if (!s_ready) return;
+     int lim_buf[4];
+     int uv_buf[6];
++    /* 2D classification for the filter exclusion, on the ORIGINAL uvs (before
++     * the mirror bump below perturbs them): rect/sprite prims arrive with a
++     * precomputed lim; a poly is 2D when every edge maps texels 1:1 to pixels
++     * on both axes (u = a + s*x, v = b + t*y, so the cross terms vanish) -
++     * every screen-aligned UI quad, where filtering only smears pixel art.
++     * Perspective-projected world geometry virtually never lands on an exact
++     * axis-aligned integer mapping. Identical to the OpenGL backend's. */
++    int prim_2d = (lim != NULL);
++    if (!prim_2d && !s_texfilter_2d && s_texfilter != 0) {
++        int dx1 = xs[1] - xs[0], dy1 = ys[1] - ys[0];
++        int dx2 = xs[2] - xs[0], dy2 = ys[2] - ys[0];
++        int du1 = us[1] - us[0], dv1 = vs[1] - vs[0];
++        int du2 = us[2] - us[0], dv2 = vs[2] - vs[0];
++        prim_2d = (dx1 * du2 == dx2 * du1) && (dv1 * dy2 == dv2 * dy1);
++    }
++    const int eff_filter = (prim_2d && !s_texfilter_2d) ? 0 : s_texfilter;
+     if (!lim) {
+         /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
+          * center-sampling mirror compensation (rect prims arrive with their
+@@ -3147,7 +3522,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
+     int isolate = (semi >= 0);
+     if (s_tcount > 0 &&
+         (isolate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
+-         s_texfilter != s_tb_filter ||
++         eff_filter != s_tb_filter ||
+          twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
+         flush_tex_batch();
+     if (s_tbase + s_tcount + 3 > VK_TBUF_VERTS) {
+@@ -3156,7 +3531,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
+             gpu_sync();   /* buffer exhausted: wait idle, cursors recycle to 0 */
+     }
+     if (s_tcount == 0) {
+-        s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = s_texfilter;
++        s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = eff_filter;
+         s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+     }
+     int bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 7a95b9a6..770c6e55 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -15267,10 +15267,13 @@ session_reboot:
+     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+     gr_set_texture_filter(g_video_texfilter);
+     gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
++    vk_renderer_set_texture_filter_2d(g_video_texfilter_2d);
+     gl_renderer_set_texture_edge_blend(g_video_texfilter_edge);
++    vk_renderer_set_texture_edge_blend(g_video_texfilter_edge);
+     gl_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+     vk_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+     gl_renderer_set_post_processing(g_video_postfx);
++    vk_renderer_set_post_processing(g_video_postfx);
+     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
+      * with both off every setter below leaves the tracking caches disabled and
+      * the draw path is the faithful integer one, unchanged. */
+@@ -16824,10 +16827,13 @@ soft_return_lobby:
+              * batch/present. */
+             gr_set_texture_filter(g_video_texfilter);
+             gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
++            vk_renderer_set_texture_filter_2d(g_video_texfilter_2d);
+     gl_renderer_set_texture_edge_blend(g_video_texfilter_edge);
++    vk_renderer_set_texture_edge_blend(g_video_texfilter_edge);
+     gl_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+     vk_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+             gl_renderer_set_post_processing(g_video_postfx);
++            vk_renderer_set_post_processing(g_video_postfx);
+             g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+             if (ls.display_scaling >= 1) g_video_display_scaling = launcher_display_scaling_to_cfg(ls.display_scaling);
+diff --git a/tools/embed_spirv.py b/tools/embed_spirv.py
+index d9493c06..f8ba1263 100644
+--- a/tools/embed_spirv.py
++++ b/tools/embed_spirv.py
+@@ -23,9 +23,21 @@ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--glslc", required=True)
+     ap.add_argument("--out", required=True)
++    # One shader can be compiled several times with a macro set to different
++    # values, the way the OpenGL backend builds one program per texture-filter
++    # mode. "geo_tex.frag:PSX_TEXFILTER:0-10" emits spv_geo_tex_f0_frag ...
++    # spv_geo_tex_f10_frag plus an array of pointers to them.
++    ap.add_argument("--variants", action="append", default=[],
++                    metavar="BASENAME:MACRO:LO-HI")
+     ap.add_argument("shaders", nargs="+")
+     a = ap.parse_args()
+ 
++    variants = {}
++    for v in a.variants:
++        base, macro, span = v.split(":")
++        lo, hi = (int(x) for x in span.split("-"))
++        variants[base] = (macro, lo, hi)
++
+     os.makedirs(os.path.dirname(a.out), exist_ok=True)
+     out = ["/* Auto-generated by embed_spirv.py — do not edit. */",
+            "#ifndef PSX_VK_SHADERS_SPV_H",
+@@ -42,22 +54,25 @@ def main():
+     # TemporaryDirectory also stops a crash from leaving .spv litter in the
+     # source tree.
+     with tempfile.TemporaryDirectory(prefix="psx_spirv_") as scratch:
+-      for sh in a.shaders:
+-        name, stage = ident(sh)
+-        spv = os.path.join(scratch, os.path.basename(sh) + ".spv")
+-        cmd = [a.glslc, "--target-env=vulkan1.1", "-O", sh, "-o", spv]
++      incdir = os.path.dirname(os.path.abspath(a.shaders[0]))
++
++      def compile_one(sh, sym, defines):
++        spv = os.path.join(scratch, sym + ".spv")
++        cmd = [a.glslc, "--target-env=vulkan1.1", "-I", incdir]
++        cmd += ["-D%s=%s" % kv for kv in defines]
++        cmd += ["-O", sh, "-o", spv]
+         r = subprocess.run(cmd, capture_output=True, text=True)
+         if r.returncode != 0:
+             sys.stderr.write("glslc failed for %s:\n%s\n" % (sh, r.stderr))
+-            return 1
++            return False
+         with open(spv, "rb") as f:
+             data = f.read()
+         os.remove(spv)
+         if len(data) % 4 != 0:
+             sys.stderr.write("SPIR-V for %s not 4-byte aligned\n" % sh)
+-            return 1
++            return False
+         words = struct.unpack("<%dI" % (len(data) // 4), data)
+-        out.append("static const uint32_t spv_%s[] = {" % name)
++        out.append("static const uint32_t spv_%s[] = {" % sym)
+         line = "  "
+         for w in words:
+             tok = "0x%08x," % w
+@@ -67,7 +82,30 @@ def main():
+         if line.strip():
+             out.append(line)
+         out.append("};")
+-        out.append("static const uint32_t spv_%s_size = sizeof(spv_%s);" % (name, name))
++        out.append("static const uint32_t spv_%s_size = sizeof(spv_%s);" % (sym, sym))
++        out.append("")
++        return True
++
++      for sh in a.shaders:
++        name, stage = ident(sh)
++        var = variants.get(os.path.basename(sh))
++        if not var:
++            if not compile_one(sh, name, []):
++                return 1
++            continue
++        macro, lo, hi = var
++        base = name[:-(len(stage) + 1)]     # "geo_tex_frag" -> "geo_tex"
++        syms = []
++        for i in range(lo, hi + 1):
++            sym = "%s_f%d_%s" % (base, i, stage)
++            if not compile_one(sh, sym, [(macro, str(i))]):
++                return 1
++            syms.append(sym)
++        out.append("static const uint32_t *const spv_%s_variants[] = { %s };"
++                   % (base, ", ".join("spv_" + s for s in syms)))
++        out.append("static const uint32_t spv_%s_variant_sizes[] = { %s };"
++                   % (base, ", ".join("spv_%s_size" % s for s in syms)))
++        out.append("#define SPV_%s_VARIANT_COUNT %d" % (base.upper(), hi - lo + 1))
+         out.append("")
+ 
+     out.append("#endif")
+diff --git a/tools/glsl_from_texfilters.py b/tools/glsl_from_texfilters.py
+new file mode 100755
+index 00000000..56a0bf99
+--- /dev/null
++++ b/tools/glsl_from_texfilters.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""glsl_from_texfilters.py - runtime/src/gpu_gl_texfilters.h -> runtime/shaders/texfilters.glsl
++
++    glsl_from_texfilters.py [gpu_gl_texfilters.h] [texfilters.glsl]
++
++The OpenGL backend assembles its texture-filter fragment shader at RUNTIME by
++concatenating C string constants (gpu_gl_texfilters.h, itself generated from
++DuckStation by port_duckstation_texfilters.py). Vulkan compiles its shaders to
++SPIR-V at BUILD time, so it needs the same blocks as an actual GLSL file it can
++#include. This unescapes the C strings back into GLSL and wraps each block in
++the `#if PSX_TEXFILTER == n` guard for its mode, so both backends run the same
++filter code from one source of truth: edit neither generated file - re-run
++port_duckstation_texfilters.py, then this.
++"""
++import re, sys
++
++MODES = [("XBR", 5, "xBR"), ("SCALE2X", 6, "Scale2x"), ("SCALE3X", 7, "Scale3x"),
++         ("MMPX", 8, "MMPX"), ("MMPX_ENHANCED", 9, "MMPX Enhanced"),
++         ("MMPX_ADVANCED", 10, "MMPX Advanced")]
++
++def unescape_block(text, cname):
++    """Pull `static const char *TEXFILTER_<cname>_SRC = "..." ... ;` back to GLSL."""
++    m = re.search(r'static const char \*TEXFILTER_%s_SRC\s*=\s*(.*?);\s*\n' % cname,
++                  text, re.S)
++    if not m:
++        raise SystemExit("no TEXFILTER_%s_SRC in the header" % cname)
++    out = []
++    for lit in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
++        out.append(lit.encode().decode('unicode_escape'))
++    return ''.join(out)
++
++def main(argv):
++    src = argv[1] if len(argv) > 1 else 'runtime/src/gpu_gl_texfilters.h'
++    dst = argv[2] if len(argv) > 2 else 'runtime/shaders/texfilters.glsl'
++    text = open(src, encoding='utf-8').read()
++    out = ["/* Texture-filter blocks for the Vulkan fragment shader, generated by",
++           " * tools/glsl_from_texfilters.py from runtime/src/gpu_gl_texfilters.h -",
++           " * edit neither, re-run the generators. These are DuckStation's filters",
++           " * (see the header for the per-filter licences); the OpenGL backend",
++           " * compiles the very same text at runtime, so the two renderers cannot",
++           " * drift apart. Each block defines FilteredSampleFromVRAM against the",
++           " * HLSL-style names geo_tex.frag's compat layer supplies. */",
++           "#ifndef PSX_TEXFILTERS_GLSL",
++           "#define PSX_TEXFILTERS_GLSL",
++           ""]
++    for cname, mode, label in MODES:
++        body = unescape_block(text, cname).rstrip('\n')
++        out.append("#if PSX_TEXFILTER == %d   /* DuckStation %s */" % (mode, label))
++        out.append(body)
++        out.append("#endif")
++        out.append("")
++    out.append("#endif  /* PSX_TEXFILTERS_GLSL */")
++    open(dst, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
++    print("%s: %d blocks" % (dst, len(MODES)))
++    return 0
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv))

@@ -1,0 +1,348 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index df233ea..6d59f37 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -597,8 +597,15 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
+     ImGuiIO& io = ImGui::GetIO();
+     io.Fonts->Clear();
+     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 2;
+-    (void)scale;   // DPI is handled by the framebuffer scale, not by re-scaling layout/fonts
+-    const float body = th.font_body;
++    // Layout stays in logical units (px() is identity; the style tokens below
++    // are logical too) — only the GLYPH RASTER follows the framebuffer scale,
++    // and FontGlobalScale divides it straight back out so every string still
++    // MEASURES the same. Without this the atlas is built once at the logical
++    // size and the framebuffer resamples it: soft text on a 4K desktop, and
++    // soft again below 1.0 where the UI shrinks to fit a small panel.
++    if (!(scale > 0.05f) || scale > 8.0f) scale = 1.0f;
++    const float body = th.font_body * scale;
++    io.FontGlobalScale = 1.0f / scale;
+     // Cover Basic Latin + Latin-1 AND General Punctuation so em/en dashes and
+     // curly quotes used in the game notes render as glyphs, not "?" tofu.
+     static const ImWchar kRanges[] = {
+@@ -9780,11 +9787,15 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
+             default:
+                 break;
+             }
+-            // Synthetic-scale displays (Windows DPI / resolution fallback /
+-            // LNG_FORCE_SCALE): events carry pixel coordinates while ImGui
+-            // lays out in logical units — de-scale mouse positions to match.
+-            if ((force_dpi || p->synthetic_scale) && p->display_scale > 1.001f) {
+-                const float inv = 1.0f / p->display_scale;
++            // Synthetic-scale displays (Windows DPI, the resolution rule, or
++            // the shrink-to-fit below 1.0): events carry window coordinates
++            // while ImGui lays out in pixels/display_scale — convert them with
++            // the factor the platform layer worked out. Note this is ABOVE 1
++            // when the UI is shrunk to fit, so the test is "not 1", not ">1".
++            const float ev_scale = (p->event_to_ui > 0.0f) ? p->event_to_ui : 1.0f;
++            if ((force_dpi || p->synthetic_scale) &&
++                (ev_scale > 1.001f || ev_scale < 0.999f)) {
++                const float inv = ev_scale;
+                 if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                     ev.motion.x = (decltype(ev.motion.x))(ev.motion.x * inv);
+                     ev.motion.y = (decltype(ev.motion.y))(ev.motion.y * inv);
+diff --git a/src/common/launcher_platform.h b/src/common/launcher_platform.h
+index 17f7f46..f0c5a7d 100644
+--- a/src/common/launcher_platform.h
++++ b/src/common/launcher_platform.h
+@@ -35,13 +35,28 @@ typedef struct LauncherPlatform {
+     int   logical_w, logical_h;
+     // Physical framebuffer size in pixels — what glViewport uses.
+     int   pixel_w, pixel_h;
+-    // Content scale from SDL (1.0, 1.25, 1.5, 1.75, 2.0, ...). Backends multiply
+-    // font raster sizes and any physical dimensions by this.
++    // Pixels per logical unit: the single scale the UI is rendered at. Above 1
++    // on a high-DPI or high-resolution desktop (the UI keeps its share of the
++    // screen); BELOW 1 when the drawable is smaller than the design size, so
++    // the whole layout shrinks to fit instead of being clipped - a 1280x800
++    // Steam Deck panel, a 1366x768 laptop, or any window dragged small.
++    // Backends multiply font raster sizes by this and divide it back out of
++    // layout (see apply_scale), so widget geometry stays in logical units.
+     float display_scale;
+     // Nonzero when display_scale is NOT expressed by the pixel/window split
+-    // (Windows DPI, or the resolution-derived fallback): the ImGui host must
+-    // inject logical size + framebuffer scale and de-scale mouse input.
++    // (Windows DPI, the resolution-derived rule, or any shrink-to-fit): the
++    // ImGui host must inject logical size + framebuffer scale and rescale
++    // mouse input by event_to_ui.
+     int   synthetic_scale;
++    // Multiplier from SDL event coordinates to the units ImGui lays out in.
++    // Events arrive in window units (pixels on Windows/X11, points on
++    // macOS/Wayland) while ImGui sees pixel/display_scale, so this is
++    // (pixel_w / window_w) / display_scale - 1.0 whenever nothing is injected.
++    float event_to_ui;
++    // Logical size the layout is authored against (what launcher_platform_open
++    // was passed). The window is sized from it and the UI never lays out
++    // smaller, so no panel is ever cut off.
++    int   design_w, design_h;
+ 
+     bool  scale_changed;   // set for one frame after a DPI/monitor change
+     bool  size_changed;    // set for one frame after a resize
+diff --git a/src/common/launcher_platform_sdl2.c b/src/common/launcher_platform_sdl2.c
+index 5dbd046..b50f640 100644
+--- a/src/common/launcher_platform_sdl2.c
++++ b/src/common/launcher_platform_sdl2.c
+@@ -74,6 +74,8 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
+                             int logical_w, int logical_h) {
+     if (!p) return false;
+     SDL_zerop(p);
++    p->design_w = logical_w;
++    p->design_h = logical_h;
+     launcher_boot_timing_mark("rui:platform_open:begin");
+ 
+     SDL_SetMainReady();   // we built with SDL_MAIN_HANDLED (real main() is entry)
+@@ -261,6 +263,9 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+     // scale is not expressed by the pixel/window split. Derive the logical
+     // size from it and mark the split synthetic so the ImGui host injects it
+     // and de-scales mouse coordinates.
++    /* The SDL2 path keeps its original scale-up-only model; it only has to
++     * publish the fields the shared host now reads (see launcher_platform.h).
++     * event_to_ui is filled in below once synthetic_scale is known. */
+     p->synthetic_scale = 0;
+     if (env_applied) {
+         p->synthetic_scale = 1;
+@@ -271,6 +276,7 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+         p->synthetic_scale = 1;
+     }
+     p->display_scale = s;
++    p->event_to_ui = (p->synthetic_scale && s > 0.0f) ? 1.0f / s : 1.0f;
+ }
+ 
+ void launcher_platform_present(LauncherPlatform* p) {
+diff --git a/src/common/launcher_platform_sdl3.c b/src/common/launcher_platform_sdl3.c
+index 851d4ca..3fcaece 100644
+--- a/src/common/launcher_platform_sdl3.c
++++ b/src/common/launcher_platform_sdl3.c
+@@ -26,40 +26,98 @@ static bool forced_usable_bounds(SDL_Rect* out) {
+     return true;
+ }
+ 
+-static void fit_initial_window_to_display(int* width, int* height) {
+-    if (!width || !height || *width <= 0 || *height <= 0) return;
++/* The launcher's layout is authored at a fixed logical size and never reflows.
++ * Everything below answers one question: how many PIXELS is one logical unit?
++ * Above 1 the UI keeps its share of a big screen; below 1 the whole layout
++ * shrinks so it still fits a small one. The old code could only scale up and
++ * shrank the WINDOW instead when the screen was small, which cut the panels
++ * off on a 1280x800 Steam Deck panel and on 1366x768 laptops. */
++#define LNG_MIN_UI_SCALE 0.55f   /* below this the text stops being readable */
++#define LNG_MAX_UI_SCALE 3.0f
++#define LNG_DESKTOP_MARGIN 64    /* room for the taskbar / title bar */
+ 
++/* How big the UI wants to be, before it is asked to fit anywhere. OS scaling
++ * first (100%, 125%, 150% ... on Windows; the fractional scale on Wayland),
++ * else derived from the desktop's resolution: the launcher is designed for a
++ * 1080p desktop, so a 1440p one gets 1.33x and a 4K one 2x and the launcher
++ * takes the same share of the screen instead of shrinking as monitors grow. */
++static float ui_scale_target(SDL_Window* win) {
++    SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win)
++                                : SDL_GetPrimaryDisplay();
++    float s = win ? SDL_GetWindowDisplayScale(win)
++                  : (display ? SDL_GetDisplayContentScale(display) : 1.0f);
++    if (s <= 0.0f) s = 1.0f;
++    if (s <= 1.001f) {
++        const SDL_DisplayMode* dm = SDL_GetDesktopDisplayMode(display);
++        if (dm && dm->h > 1100) s = (float)dm->h / 1080.0f;
++    }
++    /* Test hook: LNG_FORCE_SCALE=<0.5..4> pins the scale on any display, which
++     * is how the Deck/HiDPI layouts are checked without that hardware. */
++    const char* fs = SDL_getenv("LNG_FORCE_SCALE");
++    if (fs && fs[0]) {
++        float v = (float)SDL_atof(fs);
++        if (v >= 0.25f && v <= 4.0f) s = v;
++    }
++    if (s > LNG_MAX_UI_SCALE) s = LNG_MAX_UI_SCALE;
++    return s;
++}
++
++/* Clamp a scale so design_w x design_h logical units fit avail_w x avail_h of
++ * the same units, then apply the readability floor. */
++static float ui_scale_fit(float s, int avail_w, int avail_h,
++                          int design_w, int design_h) {
++    if (design_w > 0 && design_h > 0 && avail_w > 0 && avail_h > 0) {
++        float fw = (float)avail_w / (float)design_w;
++        float fh = (float)avail_h / (float)design_h;
++        float fit = fw < fh ? fw : fh;
++        if (s > fit) s = fit;
++    }
++    if (s < LNG_MIN_UI_SCALE) s = LNG_MIN_UI_SCALE;
++    return s;
++}
++
++/* Usable desktop area (minus panels) in WINDOW units, less a margin. */
++static bool usable_area(SDL_Window* win, int* w, int* h) {
+     SDL_Rect usable = {0};
+-    bool have_bounds = forced_usable_bounds(&usable);
+-    if (!have_bounds) {
+-        SDL_DisplayID display = SDL_GetPrimaryDisplay();
+-        have_bounds = display != 0 && SDL_GetDisplayUsableBounds(display, &usable);
++    bool have = forced_usable_bounds(&usable);
++    if (!have) {
++        SDL_DisplayID display = win ? SDL_GetDisplayForWindow(win)
++                                    : SDL_GetPrimaryDisplay();
++        have = display != 0 && SDL_GetDisplayUsableBounds(display, &usable);
+     }
+-    if (!have_bounds || usable.w <= 0 || usable.h <= 0) return;
+-
+-    // Leave room for desktop panels/title bars. Normal desktop sizes keep the
+-    // default 1100x880 window; only cramped displays get a smaller launch size.
+-    const int margin = 64;
+-    int max_w = usable.w - margin;
+-    int max_h = usable.h - margin;
+-    if (max_w <= 0 || max_h <= 0) return;
+-    if (*width <= max_w && *height <= max_h) return;
+-
+-    float scale_w = (float)max_w / (float)*width;
+-    float scale_h = (float)max_h / (float)*height;
+-    float scale = scale_w < scale_h ? scale_w : scale_h;
+-    if (scale <= 0.0f || scale >= 1.0f) return;
+-
+-    const int min_w = 820;
+-    const int min_h = 600;
+-    int fitted_w = (int)((float)*width * scale);
+-    int fitted_h = (int)((float)*height * scale);
+-    if (fitted_w < min_w && max_w >= min_w) fitted_w = min_w;
+-    if (fitted_h < min_h && max_h >= min_h) fitted_h = min_h;
+-    if (fitted_w > max_w) fitted_w = max_w;
+-    if (fitted_h > max_h) fitted_h = max_h;
+-    if (fitted_w > 0) *width = fitted_w;
+-    if (fitted_h > 0) *height = fitted_h;
++    if (!have || usable.w <= 0 || usable.h <= 0) return false;
++    *w = usable.w - LNG_DESKTOP_MARGIN;
++    *h = usable.h - LNG_DESKTOP_MARGIN;
++    return *w > 0 && *h > 0;
++}
++
++/* Size the window so the design fits at the scale the display asks for. Called
++ * once the window exists, because only then is the point/pixel split known:
++ * `native` is 1 where window sizes are pixels (Windows, X11, gamescope) and
++ * the DPI scale where they are points (macOS, Wayland), and the window is
++ * measured in those same units. */
++static void size_window_for_scale(LauncherPlatform* p) {
++    if (!p || !p->window || p->design_w <= 0 || p->design_h <= 0) return;
++    float native = 1.0f;
++    if (p->logical_w > 0 && p->pixel_w > 0)
++        native = (float)p->pixel_w / (float)p->logical_w;
++    if (native <= 0.0f) native = 1.0f;
++
++    float want = ui_scale_target(p->window);
++    if (want < native) want = native;   /* the split already delivers `native` */
++    int aw = 0, ah = 0;
++    if (usable_area(p->window, &aw, &ah))
++        want = ui_scale_fit(want, (int)(aw * native), (int)(ah * native),
++                            p->design_w, p->design_h);
++
++    int win_w = (int)((float)p->design_w * want / native + 0.5f);
++    int win_h = (int)((float)p->design_h * want / native + 0.5f);
++    if (win_w < 1 || win_h < 1) return;
++    if (win_w == p->logical_w && win_h == p->logical_h) return;
++    SDL_SetWindowSize(p->window, win_w, win_h);
++    SDL_SetWindowPosition(p->window, SDL_WINDOWPOS_CENTERED,
++                          SDL_WINDOWPOS_CENTERED);
++    launcher_platform_refresh_metrics(p);
+ }
+ 
+ bool launcher_platform_open(LauncherPlatform* p, const char* title,
+@@ -88,9 +146,23 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
+     const SDL_WindowFlags flags =
+         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+ 
++    p->design_w = logical_w;
++    p->design_h = logical_h;
++    /* First guess in window units; size_window_for_scale() below settles it
++     * once the point/pixel split is known. Guessing small keeps a window
++     * manager from clamping an oversized window and confusing that step. */
+     int win_w = logical_w;
+     int win_h = logical_h;
+-    fit_initial_window_to_display(&win_w, &win_h);
++    int aw = 0, ah = 0;
++    if (usable_area(NULL, &aw, &ah)) {
++        float s0 = ui_scale_fit(1.0f, aw, ah, logical_w, logical_h);
++        if (s0 < 1.0f) {
++            win_w = (int)((float)logical_w * s0 + 0.5f);
++            win_h = (int)((float)logical_h * s0 + 0.5f);
++            if (win_w > aw) win_w = aw;
++            if (win_h > ah) win_h = ah;
++        }
++    }
+ 
+     p->window = SDL_CreateWindow(title ? title : "Launcher",
+                                  win_w, win_h, flags);
+@@ -113,17 +185,7 @@ bool launcher_platform_open(LauncherPlatform* p, const char* title,
+     SDL_GL_SetSwapInterval(1);   // vsync — a launcher has no reason to spin
+ 
+     launcher_platform_refresh_metrics(p);
+-    // A synthetic scale means the window was created in pixels at the logical
+-    // design size — enlarge it so the scaled UI fits (fit keeps it on screen).
+-    if (p->synthetic_scale) {
+-        int w2 = (int)((float)logical_w * p->display_scale);
+-        int h2 = (int)((float)logical_h * p->display_scale);
+-        fit_initial_window_to_display(&w2, &h2);
+-        SDL_SetWindowSize(p->window, w2, h2);
+-        SDL_SetWindowPosition(p->window, SDL_WINDOWPOS_CENTERED,
+-                              SDL_WINDOWPOS_CENTERED);
+-        launcher_platform_refresh_metrics(p);
+-    }
++    size_window_for_scale(p);
+     launcher_boot_timing_mark("rui:platform_open:window+gl_ready");
+     return true;
+ }
+@@ -150,34 +212,35 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+     SDL_GetWindowSize(p->window, &p->logical_w, &p->logical_h);
+     SDL_GetWindowSizeInPixels(p->window, &p->pixel_w, &p->pixel_h);
+ 
+-    float s = SDL_GetWindowDisplayScale(p->window);
+-    if (s <= 0.0f) s = 1.0f;
++    /* What the point/pixel split already provides on its own: 1.0 where window
++     * sizes ARE pixels (Windows, X11, gamescope), the DPI scale on macOS and
++     * Wayland. Anything the UI needs beyond this we have to inject. */
++    float native = 1.0f;
++    if (p->logical_w > 0 && p->pixel_w > 0)
++        native = (float)p->pixel_w / (float)p->logical_w;
++    if (native <= 0.0f) native = 1.0f;
+ 
+-    // Resolution-derived scale at 100% OS scaling: the launcher is designed
+-    // for a 1080p desktop; a 1440p desktop gets 1.33x, 4K 2x (capped at 3),
+-    // so it takes the same share of the screen everywhere instead of
+-    // shrinking as monitors grow. OS scaling above 100% already grows it.
+-    if (s <= 1.001f) {
+-        const SDL_DisplayMode* dm =
+-            SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(p->window));
+-        if (dm && dm->h > 1100) {
+-            s = (float)dm->h / 1080.0f;
+-            if (s > 3.0f) s = 3.0f;
+-        }
+-    }
++    float s = ui_scale_target(p->window);
++    if (s < native) s = native;
++    /* The layout must never be wider or taller than the drawable, whatever the
++     * display asked for: a window dragged smaller, or a screen shorter than the
++     * design, scales the whole UI down instead of cutting panels off. */
++    s = ui_scale_fit(s, p->pixel_w, p->pixel_h, p->design_w, p->design_h);
+ 
+-    // On displays where window sizes are pixels (Windows, X11) the scale above
+-    // is not expressed by the pixel/window split. Derive the logical size from
+-    // it and mark the split synthetic so the ImGui host injects it and
+-    // de-scales mouse coordinates.
++    p->display_scale = s;
+     p->synthetic_scale = 0;
+-    if (s > 1.001f && p->logical_w > 0 &&
+-        p->pixel_w < (int)((float)p->logical_w * s * 0.999f)) {
+-        p->logical_w = (int)((float)p->pixel_w / s);
+-        p->logical_h = (int)((float)p->pixel_h / s);
++    p->event_to_ui = 1.0f;
++    if (s > native * 1.001f || s < native * 0.999f) {
++        /* Lay the UI out in pixels/s so the design always fits, and tell the
++         * host how to convert event coordinates (which stay in window units)
++         * into those same units. */
++        if (s > 0.0f) {
++            p->logical_w = (int)((float)p->pixel_w / s + 0.5f);
++            p->logical_h = (int)((float)p->pixel_h / s + 0.5f);
++            p->event_to_ui = native / s;
++        }
+         p->synthetic_scale = 1;
+     }
+-    p->display_scale = s;
+ }
+ 
+ void launcher_platform_present(LauncherPlatform* p) {

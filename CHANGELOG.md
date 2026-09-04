@@ -1,5 +1,219 @@
 # Changelog
 
+## 0.4.0 — Vulkan renderer, a launcher that fits any screen, a calmer F1 menu (2026-09-04)
+
+### Graphics
+- **Crop FMVs no longer pops.** The letterbox-band crop switched on only
+  after the first bright movie frame and switched off again through every
+  fade to black, so the intro jumped between the uncropped 4:3 frame and the
+  cropped picture — for over two seconds on the Polyphony logo and again
+  between the logo and the intro. GT2's movies are letterboxed with 24 black
+  rows top and bottom; the title config now says so (`[video]
+  fmv_letterbox_rows = 24`, framework patch p) and the crop is static from
+  the first frame. A detected band can still only make the crop smaller,
+  never larger, so nothing is cut that was not black.
+- **JINC2 texture filtering** — the filter GT2 players pick on DuckStation
+  for car bodies and wheel arches — is a fourth Texture filtering choice in
+  the launcher (Nearest → Bilinear → 3-Point (N64) → JINC2) and in the F1
+  menu. It is Hyllian's windowed-jinc 2-lobe kernel with anti-ringing,
+  ported from DuckStation's shader with its constants, on the same
+  cutout/semi-transparency rules as the other modes. 16 taps per pixel:
+  measurably heavier on the GPU than bilinear at 9× supersampling.
+- **3-Point (N64) is mupen64plus's**: the exact formulation GLideN64 renders
+  (the ArthurCarvalho / twinaphex shader from mupen64plus-libretro), with its
+  colour-bleeding handling for cut-outs. Side by side
+  at 4×: `docs/evidence/render-4x-texture-filters-car.png` and `-wall.png`
+  (nearest / bilinear / 3-point / JINC2 on the same frame of John's Seattle
+  replay).
+- The F1 menu's Texture filtering row no longer collapses 3-Point or JINC2
+  to Bilinear when touched.
+- **F1 → Advanced PGXP rows now stick across launches** (settings.toml
+  `[pgxp]`, applied over the PGXP mod's shipped defaults). **Reset PGXP to
+  GT2 defaults** sits at the bottom of the section: it restores the shipped
+  values and forgets your edits, so the mod's defaults rule again.
+- **Every DuckStation texture filter is now here**: xBR, Scale2x (EPX),
+  Scale3x, MMPX, MMPX Enhanced and MMPX Advanced join the list, as
+  DuckStation's own shaders (lifted verbatim, three one-line fixes). The
+  pixel-art scalers (Scale2x/3x, MMPX) are made for hard-edged 2D art —
+  tick **Filter 2D elements** to see what they do to the HUD and fonts;
+  on GT2's photographic textures they read close to Nearest. MMPX Advanced
+  is a very large shader: expect a pause of a second or two the first time
+  it is selected.
+- **Edge blending** (Graphics page, under Filter 2D elements): DuckStation's
+  edge blending for the filtered modes — cut-out textures (trees, fences,
+  crowds) get a soft edge instead of a hard texel outline; off by default
+  so nothing changes until you ask. Side by side:
+  `docs/evidence/render-4x-texture-edge-blending.png`.
+- **FMV chroma smoothing** (Graphics page, under FMV filtering):
+  DuckStation's 24-bit chroma smoothing — the video codec stores colour at
+  half resolution, so movies show 2×2 colour blocks at any upscale; this
+  reconstructs the colour bilinearly and leaves the detail alone. Off by
+  default.
+
+- **Vulkan renderer.** The launcher's Renderer row now offers Software,
+  OpenGL and Vulkan (`[video] offer_vulkan = true` in every title config;
+  an existing game.toml picks the key up on the next Setup). The framework's
+  Vulkan backend rasterises on the GPU with the same 1x-4x supersampling,
+  PGXP and widescreen as OpenGL. Its present path is a plain blit for now:
+  texture filtering beyond bilinear, edge blending, FXAA, the display
+  scaling filters, the FMV crop and chroma smoothing are OpenGL-only until
+  the next release ports them. Vulkan is loaded at run time, and a machine
+  without a Vulkan driver or device falls back to OpenGL with a line in the
+  log instead of exiting at start (framework patch w). Pick Vulkan on Steam
+  Deck; see `docs/STEAM_DECK.md`.
+- **Garbled menu text on Vulkan is fixed** (framework patch za). The options
+  and load-game menus drew from stale VRAM because the Vulkan backend threw
+  away queued texture uploads whenever the display entered or left 24-bit
+  mode - and GT2 uploads its menu font atlas near the end of the intro movie,
+  so the atlas never reached the GPU. The OpenGL backend had the identical
+  bug and was fixed long ago; Vulkan now flushes those uploads instead of
+  dropping them. Measured at the font-atlas page against OpenGL on the same
+  boot: 1022 of 1024 texels differed before the fix, none after.
+- **Four Vulkan spec violations fixed** (framework patch za). The validation
+  layers flagged 21 errors across three rules - a depth/stencil image cleared
+  and transitioned without the usage flag that requires, barriers naming only
+  the stencil half of a combined depth/stencil format, and a staging buffer
+  used for readbacks without the matching usage flag. All are undefined
+  behaviour on a stricter driver than the one the lab runs, which is exactly
+  what a Steam Deck's driver is. Now zero.
+- **Vulkan does the whole texture-filter set** (framework patch y). All
+  eleven modes — nearest, bilinear, 3-point, trilinear, JINC2, xBR, Scale2x,
+  Scale3x and the three MMPX variants — plus *Filter 2D elements* and edge
+  blending's coverage cutout. They are the same shader text the OpenGL
+  backend compiles, from the same generated DuckStation blocks, so the two
+  renderers cannot drift apart; verified mode by mode from a fixed save
+  state, with five of the eleven pixel-identical between backends and the
+  rest differing by a handful of pixels of floating-point rounding. Vulkan
+  compiles these at build time rather than on first use, so switching to a
+  heavy filter does not stall the way it can on OpenGL.
+- **Sharp-bilinear, FXAA and bicubic FMV filtering on Vulkan** (framework
+  patch y). The present is a plain blit for nearest and bilinear and a
+  shader pass for the rest; if that pass cannot be built the renderer keeps
+  the blit, so a driver that cannot run it still runs the game. Edge
+  blending's second half (blending survivors by coverage through a
+  dual-source factor) is the one texture-filter feature still OpenGL-only.
+- **The Vulkan present follows the Display settings** (framework patch x).
+  Its final blit was pinned to 4:3, so a widescreen or 16:10 aspect came out
+  letterboxed wrongly; it now uses the same aspect OpenGL does. *Display
+  scaling* picks the filter, and movies get *Crop FMVs*, *FMV filtering* and
+  *FMV chroma smoothing* — the crop uses the same static band the OpenGL
+  path does, verified frame-stable across a whole intro movie. Still
+  OpenGL-only: texture filtering beyond bilinear, edge blending,
+  post-processing (FXAA) and sharp-bilinear scaling, which need shader
+  passes rather than a blit.
+
+### Launcher
+- **Display settings open on six rows, not eighteen** (launcher patch 0016).
+  This is a remaster, not an emulator front end: the panel now shows
+  *Presets*, *Window size*, *Fullscreen*, *Supersampling* and *Texture
+  filtering*, and everything else sits behind a **Show advanced settings**
+  checkbox at the bottom. Expanded, the remaining rows are grouped under
+  *Picture*, *Movies*, *Window & presentation* and *Rewind* so they read as
+  four short lists rather than one wall. *Renderer* is one of the advanced
+  rows: the Original and Enhanced presets already set a sensible one and a
+  wrong pick falls back to OpenGL by itself, so it is a tuning choice rather
+  than a first-run decision — Steam Deck players who want Vulkan tick the
+  box first (`docs/STEAM_DECK.md` says so). Nothing was removed and no
+  default changed; the toggle is a view state, not a setting, so it is not
+  written to `settings.toml` and the launcher always opens on the short
+  list.
+- **The F1 menu is reorganised** (framework patch z, launcher patch 0014).
+  *Resume game* is the top entry and acts on the spot; *Disc* sits under it;
+  *Settings* holds Display, Graphics, Audio and Input; the PGXP rows are
+  now four levels down at *Settings > Graphics > Advanced > PGXP*, where a
+  player who does not know what PGXP is will not meet them by accident (the
+  *Advanced* and *System* sections are gone); and *Quit* and *Quit to
+  launcher* are the last two rows. The menu shows the trail in its header so
+  you can see where you are, and Back walks out one level at a time. The
+  header also names the disc you are on ("Arcade disc", "Simulation disc"),
+  at every level of the menu, so a pause never leaves you guessing which one
+  is running. Quit
+  flushes memory cards through the same path as closing the window, and
+  quit to launcher restarts the disc you are playing back into the launcher.
+- **The launcher's hotkeys table is back to one binding per hotkey**
+  (launcher patch 0015) — the *Secondary* column added in 0010 is gone
+  along with the column headers. `config.ini`'s `[KeyMap]` still accepts a
+  comma-separated list for anyone who wants two keys on one action.
+
+- **The launcher fits every screen now.** Its layout is authored at a fixed
+  size and the window was only ever allowed to scale *up* (for high-DPI and
+  high-resolution desktops); on anything smaller than that design size the
+  window shrank instead and the panels were simply cut off — a Steam Deck's
+  1280x800 panel lost most of Player 2 and the memory cards, 1366x768
+  laptops the same, and dragging the window small did it on any PC. The UI
+  scale is now one continuous number that can go below 1, so the whole
+  layout shrinks to fit and nothing is ever clipped; on a 1080p, 1440p or 4K
+  desktop the size is exactly what it was. Text is also sharper everywhere
+  the scale is not 1: the font is rasterised at the scale it will be drawn
+  at instead of being resampled from a fixed atlas (measurably crisper on a
+  4K desktop, which is most of what you would notice on the Neo G9).
+
+- **The disc's own title art** on the game card instead of the placeholder
+  cartridge: Setup rips the title screen (`GT2.VOL`, `arcade/title_*.tim`)
+  from your disc dump with `tools/rip_gt2_title_art.py` — the PS1's own
+  transparency rules, written as the launcher's `assets/img/boxart.tga`.
+  Nothing is downloaded and nothing ships with the project; no disc, no art.
+- **Hotkeys have a second binding.** The Hotkeys panel is a Primary /
+  Secondary table; either key triggers the action. Backspace while capturing
+  clears a slot. **Switch disc** is a hotkey on multi-disc installs
+  (unbound by default) — it does what the Disc row's button does.
+- **Hide cursor in fullscreen** (Display, under Fullscreen; on by default):
+  the pointer disappears in borderless and exclusive fullscreen and comes
+  back for the F1 menu and in a window.
+- The launcher sizes itself to the desktop: 1080p is 1×, 1440p 1.33×, 4K
+  2× (OS display scaling above 100 % is honoured as before).
+- **Presets** at the top of Settings → Display: **Original** (how the
+  PlayStation drew it — native resolution, no texture filtering, raw pixels,
+  movies as decoded) and **Enhanced** (4× supersampling, bilinear texture
+  filtering, FXAA, bilinear scaling, cropped, bicubic, chroma-smoothed
+  movies). Picture settings only — the Mods page keeps its own presets.
+- The **Screen model** row is gone from Settings (it changed nothing
+  visible on GT2).
+- **Hotkeys now work on multi-disc installs.** The launcher saved them to
+  the shared config.ini but the game read the per-disc copy first, so edits
+  never took effect — which is why a Switch disc key did nothing.
+- **Filter 2D elements** now defaults off — the HUD, fonts and menu art stay
+  pixel-exact unless you tick it.
+- Controller hotkeys (Rewind Select+R3, Save states Select+R1, and now
+  Switch disc, F1 menu, Fullscreen, Fast-forward, FPS readout) are read
+  from `settings.toml [hotkeys]`; the controller page no longer has a
+  block for them.
+- The **Authentic 1999** preset on the Mods page is now called **Original**,
+  and the presets no longer appear on the Cheats page (applying one there
+  would have cleared the cheats and switched on enhancements).
+- On a multi-disc install the **Disc** row is a button, not a drop-down: it
+  names the disc you are running and offers *Switch to <the other disc>*
+  (with all three installed it walks through them); discs you do not have
+  installed are listed under it.
+
+### Setup
+- Setup installs the Vulkan headers and shader compiler
+  (`mingw-w64-x86_64-vulkan-headers`, `mingw-w64-x86_64-shaderc`) with the
+  rest of the toolchain; without them the Vulkan backend was silently built
+  as an inert stub and every Vulkan request fell back to OpenGL.
+- Re-running Setup after an update failed with `FAILED TO APPLY` on the
+  texture-filter patch: patches that add files left them behind from the
+  previous run and `git apply` refused to overwrite them. Setup now clears
+  untracked files in the framework checkouts before applying the stack
+  (build directories are gitignored and untouched).
+
+### Known issues
+- **Vulkan has not run on a real Steam Deck yet.** Everything in this
+  release was measured on a Linux lab machine using Mesa's software Vulkan
+  driver, which proves the code is correct but says nothing about how RADV
+  and Proton behave. If Vulkan misbehaves on a Deck, the Renderer row (under
+  *Show advanced settings*) puts you back on OpenGL, and a machine with no
+  usable Vulkan driver falls back on its own.
+- **Edge blending is still softer on OpenGL.** Vulkan does the coverage
+  cutout but not the second half - blending the surviving fragments by
+  coverage - which needs a dual-source blend the Vulkan pipelines do not set
+  up yet. Both presets leave *Edge blending* off, so this only shows if you
+  turn it on yourself.
+- **Netplay runs on the software renderer under Vulkan.** The lockstep path
+  needs a CPU-side VRAM authority that only the software and OpenGL backends
+  provide; a netplay session started on Vulkan quietly uses software.
+
+
 ## 0.3.0 — every Silent patch, cheats on both discs, 60 FPS measured (2026-09-03)
 
 ### Enhancements

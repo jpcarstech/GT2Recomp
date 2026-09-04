@@ -1,0 +1,110 @@
+diff --git a/runtime/include/gpu_vk_renderer.h b/runtime/include/gpu_vk_renderer.h
+index 47820fa8..6c954f9f 100644
+--- a/runtime/include/gpu_vk_renderer.h
++++ b/runtime/include/gpu_vk_renderer.h
+@@ -19,6 +19,11 @@ struct SDL_Window;
+ extern "C" {
+ #endif
+ 
++/* 1 when a Vulkan loader, ICD and at least one physical device are present.
++ * Safe to call before any window exists; main.cpp falls back to OpenGL when
++ * it returns 0 (always 0 in a build without the backend). */
++int  vk_renderer_probe(void);
++
+ /* Create the Vulkan instance/device/swapchain on a window made with
+  * SDL_WINDOW_VULKAN.  Returns 1 on success, 0 to fall back to software. */
+ int  vk_renderer_init_context(struct SDL_Window *win);
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index aaac9c48..f2f2b2d1 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -36,6 +36,7 @@
+ /* Vulkan SDK headers/glslc were not found at configure time: compile an inert
+  * backend so the runtime still builds and simply falls back to software. */
+ int  vk_renderer_init_context(struct SDL_Window *win) { (void)win; return 0; }
++int  vk_renderer_probe(void) { return 0; }
+ void vk_renderer_shutdown(void) {}
+ int  vk_renderer_present_vram(int a,int b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+ int  vk_renderer_present_wide(int a,int b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+@@ -1363,6 +1364,60 @@ static inline uint16_t rgba8_to_rgb555(const uint8_t in[4]) {
+                       (in[3] >= 0x80 ? 0x8000 : 0));
+ }
+ 
++/* vk_renderer_probe: can this machine run the Vulkan backend at all? Called
++ * BEFORE the window exists, so a request for Vulkan on a machine with no
++ * loader, no ICD or no Vulkan-capable device (a VM, a remote desktop session,
++ * an old iGPU) is turned into an OpenGL window instead of a
++ * SDL_WINDOW_VULKAN window that SDL refuses to create - the player would
++ * otherwise be left with a game that exits at start until they change the
++ * launcher's Renderer row back. Loads the library, creates a throwaway
++ * instance with no extensions and counts physical devices; init_context
++ * does the real setup (surface, device, swapchain) afterwards. */
++static int vk_probe_inner(void) {
++#if defined(PSX_SDL3)
++    if (!SDL_Vulkan_LoadLibrary(NULL))
++#else
++    if (SDL_Vulkan_LoadLibrary(NULL) != 0)
++#endif
++        return 0;
++    PFN_vkGetInstanceProcAddr gipa =
++        (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
++    if (!gipa) return 0;
++    PFN_vkCreateInstance pci = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
++    if (!pci) return 0;
++    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
++    app.pApplicationName = "psxrecomp";
++    app.apiVersion = VK_API_VERSION_1_1;
++    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
++    ci.pApplicationInfo = &app;
++    VkInstance inst = VK_NULL_HANDLE;
++    if (pci(&ci, NULL, &inst) != VK_SUCCESS || !inst) return 0;
++    PFN_vkEnumeratePhysicalDevices penum =
++        (PFN_vkEnumeratePhysicalDevices)gipa(inst, "vkEnumeratePhysicalDevices");
++    PFN_vkDestroyInstance pdi = (PFN_vkDestroyInstance)gipa(inst, "vkDestroyInstance");
++    uint32_t n = 0;
++    int ok = penum && penum(inst, &n, NULL) == VK_SUCCESS && n > 0;
++    if (pdi) pdi(inst, NULL);
++    return ok;
++}
++
++int vk_renderer_probe(void) {
++    /* SDL_Vulkan_LoadLibrary needs the video subsystem; when the launcher
++     * was skipped it is not up yet at this point, so bring it up for the
++     * probe only (SDL refcounts subsystems - the real init follows). */
++    const int had_video = SDL_WasInit(SDL_INIT_VIDEO) != 0;
++    if (!had_video) {
++        /* psx_sdl.h gives SDL_InitSubSystem SDL2's 0-on-success on both SDLs. */
++        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) return 0;
++    }
++    const int ok = vk_probe_inner();
++    if (!had_video) {
++        SDL_Vulkan_UnloadLibrary();
++        SDL_QuitSubSystem(SDL_INIT_VIDEO);
++    }
++    return ok;
++}
++
+ int vk_renderer_init_context(SDL_Window *win) {
+     s_win = win;
+ #if defined(PSX_SDL3)
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 11c5e3d7..0688f5f0 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -15173,6 +15173,16 @@ session_reboot:
+         g_video_renderer = 1;
+     }
+ #endif
++    /* A Vulkan request on a machine that cannot run it (no loader / ICD /
++     * device: VMs, remote desktop, old iGPUs) becomes OpenGL here, before the
++     * backend is chosen and the window created - otherwise SDL refuses the
++     * SDL_WINDOW_VULKAN window and the game exits at start on every launch
++     * until the player finds the launcher's Renderer row. */
++    if (g_video_renderer == 2 && !vk_renderer_probe()) {
++        std::fprintf(stdout, "psxrecomp: Vulkan is not usable on this machine "
++                             "(no Vulkan driver or device); using OpenGL instead.\n");
++        g_video_renderer = 1;
++    }
+     /* Netplay: CPU VRAM is digest/snap authority. Prefer dual-raster OpenGL
+      * (SW@1× + GL@settings SSAA FBO present, never glReadPixels). Vulkan
+      * present not yet cpu-auth — fall back to a software window. */

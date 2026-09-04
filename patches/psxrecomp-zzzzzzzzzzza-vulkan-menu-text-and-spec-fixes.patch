@@ -1,0 +1,111 @@
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index 78ddd951..579ac8d1 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -1323,8 +1323,14 @@ static int create_render_targets(void) {
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, &s_raw_img, &s_raw_mem, &s_raw_view)) return 0;
+     s_ds_format = choose_ds_format();
++    /* TRANSFER_DST: the init clear below goes through vkCmdClearDepthStencilImage,
++     * which requires it (and so does the TRANSFER_DST layout transition). The
++     * wide surfaces already asked for it; this one did not, which validation
++     * flags as VUID-vkCmdClearDepthStencilImage-pRanges-02659 and
++     * VUID-VkImageMemoryBarrier-oldLayout-01213. */
+     if (!make_image(s_ds_format, VRAM_W * S, VRAM_H * S,
+-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_STENCIL_BIT,
++                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++                    VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_STENCIL_BIT,
+                     &s_ds_img, &s_ds_mem, &s_ds_view)) return 0;
+     if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, VRAM_W * S, VRAM_H * S,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+@@ -1346,12 +1352,12 @@ static int create_render_targets(void) {
+         db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         db.image = s_ds_img; db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+-        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+         db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
+         p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                0, 0, NULL, 0, NULL, 1, &db);
+         VkClearDepthStencilValue dsv = { 0.0f, 0 };
+-        VkImageSubresourceRange srng = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
++        VkImageSubresourceRange srng = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
+         p_vkCmdClearDepthStencilImage(cb, s_ds_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dsv, 1, &srng);
+         db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+@@ -2455,7 +2461,7 @@ static void begin_geo_pass(VkCommandBuffer cb) {
+     db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+     db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+     db.image = s_ds_img;
+-    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+     db.subresourceRange.levelCount = 1;
+     db.subresourceRange.layerCount = 1;
+     db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+@@ -2508,7 +2514,12 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem,
+     }
+ 
+     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-    bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    /* Staging goes BOTH ways: buffer->image for uploads and image->buffer
++     * for the readbacks (ensure_cpu, screenshots), and the cache hands the
++     * same buffer to either. TRANSFER_DST is what vkCmdCopyImageToBuffer
++     * requires of its destination (VUID-vkCmdCopyImageToBuffer-dstBuffer-00191). */
++    bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
++                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     if (p_vkCreateBuffer(s_dev, &bci, NULL, buf) != VK_SUCCESS) return 0;
+     VkMemoryRequirements req; p_vkGetBufferMemoryRequirements(s_dev, *buf, &req);
+@@ -2933,11 +2944,26 @@ static void depth24_clear_skipped_fb(void) {
+ static void depth24_upload_policy(void) {
+     int d24 = gpu_display_is_depth24();
+     if (d24 && !s_depth24_skip_up) {
+-        s_up_nrects = 0;
++        /* Entering 24-bit: from here the frame is presented from the CPU
++         * mirror and the MDEC only writes the movie's own rows, so the GPU
++         * image and the mirror must agree before the handover. Land the queued
++         * uploads FIRST - a readback would otherwise copy stale GPU content
++         * over CPU texture data that was written but not yet staged. */
++        flush_cpu_upload();
++        ensure_cpu();
+         rect_clear(&s_d24_skip_fb);
+     } else if (!d24 && s_depth24_skip_up) {
+-        s_up_nrects = 0;
++        /* Leaving 24-bit. Small texture uploads are still queued while the
++         * movie scans out of the CPU mirror, and GT2 uploads its menu font
++         * atlas near the end of the intro. DROPPING that queue here is what
++         * left the options and load-game menus drawing from stale VRAM -
++         * garbled text - because the pixels existed only in the CPU mirror and
++         * never reached the GPU image (the OpenGL backend had the identical
++         * bug; see patches/psxrecomp-z-gl-depth24-upload-queue.patch). Clear
++         * the skipped movie band first, then land the newer uploads, so a
++         * texture page overlapping that band wins in PS1 command order. */
+         depth24_clear_skipped_fb();
++        flush_cpu_upload();
+         gpu_depth24_upload_span_reset();
+     }
+     s_depth24_skip_up = d24;
+@@ -3080,12 +3106,12 @@ static int wide_surf_for(int base_x) {
+         db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         db.image = s_wide_ds_img[i]; db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+-        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+         db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
+         p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                0, 0, NULL, 0, NULL, 1, &db);
+         VkClearDepthStencilValue dsv = { 0.0f, 0 };
+-        VkImageSubresourceRange srng = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
++        VkImageSubresourceRange srng = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
+         p_vkCmdClearDepthStencilImage(cb, s_wide_ds_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dsv, 1, &srng);
+         db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+@@ -3116,7 +3142,7 @@ static void wide_pass_begin(VkCommandBuffer cb) {
+     db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+     db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+     db.image = s_wide_ds_img[i];
+-    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+     db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
+     db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+     db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |

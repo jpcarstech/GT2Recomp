@@ -1,0 +1,699 @@
+diff --git a/src/common/backends/imgui/runtime_ui_imgui.cpp b/src/common/backends/imgui/runtime_ui_imgui.cpp
+index 0a3df84..d405c8b 100644
+--- a/src/common/backends/imgui/runtime_ui_imgui.cpp
++++ b/src/common/backends/imgui/runtime_ui_imgui.cpp
+@@ -60,32 +60,42 @@ void value_text(RecompRuntimeUi *ui, const RecompRuntimeUiItem *item,
+     }
+ }
+ 
+-void draw_sections(RecompRuntimeUi *ui, const LauncherTheme &theme,
+-                   bool enter_on_click) {
+-    for (size_t index = 0; index < ui->section_count; ++index) {
+-        ImGui::PushID(static_cast<int>(index));
+-        const bool selected = index == ui->section_index;
+-        if (ImGui::Selectable(ui->sections[index], selected, 0,
+-                              ImVec2(0.0f, theme.row_height))) {
+-            ui->section_index = index;
+-            if (enter_on_click) recomp_runtime_ui_enter_section(ui, index);
++/* The child paths at the current level. A child that is a lone action row
++ * ("Resume game", "Quit") shows that item's label and fires in place; the rest
++ * open. `offset` is how many item rows precede them, so selection indices line
++ * up with the model's single row list. */
++void draw_children(RecompRuntimeUi *ui, const LauncherTheme &theme,
++                   size_t offset) {
++    const size_t count = recomp_runtime_ui_level_children(ui);
++    for (size_t index = 0; index < count; ++index) {
++        ImGui::PushID(static_cast<int>(1000 + index));
++        const size_t row = offset + index;
++        const bool selected = row == ui->row_index;
++        char name[96];
++        recomp_runtime_ui_child_label(ui, index, name, sizeof(name));
++        const RecompRuntimeUiItem *act = recomp_runtime_ui_child_action(ui, index);
++        char label[128];
++        std::snprintf(label, sizeof(label), "%s%s",
++                      (act && act->label) ? act->label : name,
++                      act ? "" : "  >");
++        if (ImGui::Selectable(label, selected, 0, ImVec2(0.0f, theme.row_height))) {
++            ui->row_index = row;
++            recomp_runtime_ui_activate_row(ui, row);
+         }
+-        if (ImGui::IsItemHovered()) ui->section_index = index;
++        if (ImGui::IsItemHovered()) ui->row_index = row;
+         ImGui::PopID();
+     }
+ }
+ 
+ void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
+                 bool touch_friendly) {
+-    const size_t count = recomp_runtime_ui_section_item_count(
+-        ui, ui->section_index);
++    const size_t count = recomp_runtime_ui_level_items(ui);
+     for (size_t index = 0; index < count; ++index) {
+-        const RecompRuntimeUiItem *item = recomp_runtime_ui_section_item(
+-            ui, ui->section_index, index);
++        const RecompRuntimeUiItem *item = recomp_runtime_ui_level_item(ui, index);
+         if (!item) continue;
+ 
+         const bool enabled = recomp_runtime_ui_item_enabled(ui, item) != 0;
+-        const bool selected = ui->in_section && index == ui->row_index;
++        const bool selected = index == ui->row_index;
+         char value[128];
+         value_text(ui, item, value, sizeof(value));
+ 
+@@ -112,14 +122,10 @@ void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
+         if (ImGui::Selectable("##setting", selected, row_flags,
+                               ImVec2(0.0f, row_h))) {
+             ui->row_index = index;
+-            ui->in_section = 1;
+             if (item->type != RECOMP_RUNTIME_UI_INT)
+                 recomp_runtime_ui_adjust_current(ui, 1, 1, 0);
+         }
+-        if (ImGui::IsItemHovered()) {
+-            ui->row_index = index;
+-            ui->in_section = 1;
+-        }
++        if (ImGui::IsItemHovered()) ui->row_index = index;
+ 
+         ImDrawList *draw = ImGui::GetWindowDrawList();
+         const ImVec2 end = ImGui::GetItemRectMax();
+@@ -188,13 +194,11 @@ void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
+                        start.y + (row_h - button_h) * 0.5f));
+             if (ImGui::Button("-", ImVec2(step_button_w, button_h))) {
+                 ui->row_index = index;
+-                ui->in_section = 1;
+                 recomp_runtime_ui_adjust_current(ui, -1, 1, 0);
+             }
+             ImGui::SameLine(0.0f, step_gap);
+             if (ImGui::Button("+", ImVec2(step_button_w, button_h))) {
+                 ui->row_index = index;
+-                ui->in_section = 1;
+                 recomp_runtime_ui_adjust_current(ui, 1, 1, 0);
+             }
+             ImGui::SetCursorScreenPos(next);
+@@ -278,7 +282,6 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+     const float height = display.y - margin * 2.0f < max_height
+                              ? display.y - margin * 2.0f
+                              : max_height;
+-    const bool wide = width >= (touch_friendly ? 900.0f : 640.0f);
+     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+@@ -319,33 +322,22 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
+             ? close_h + theme.spacing_sm * 2.0f
+             : ImGui::GetTextLineHeightWithSpacing() + theme.spacing_lg + 2.0f;
+         const float content_h = ImGui::GetContentRegionAvail().y - footer_h;
+-        if (wide) {
+-            const float sidebar_w = touch_friendly
+-                ? std::clamp(width * 0.20f, 280.0f, 520.0f)
+-                : 190.0f;
+-            ImGui::BeginChild("##sections", ImVec2(sidebar_w, content_h), true);
+-            draw_sections(ui, theme, false);
+-            ImGui::EndChild();
+-            ImGui::SameLine();
+-            ImGui::BeginChild("##items", ImVec2(0.0f, content_h), true);
+-            ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
+-            ImGui::TextUnformatted(ui->sections[ui->section_index]);
+-            ImGui::PopStyleColor();
+-            ImGui::Separator();
+-            draw_items(ui, theme, touch_friendly);
+-            ImGui::EndChild();
+-        } else {
++        /* One list per level - items, then the ways further in - with a Back
++         * row once there is somewhere to go back to. The old two-pane split
++         * cannot express a tree deeper than two. */
++        {
+             ImGui::BeginChild("##content", ImVec2(0.0f, content_h), true);
+-            if (ui->in_section) {
+-                if (ImGui::SmallButton("< Back"))
+-                    recomp_runtime_ui_leave_section(ui);
++            const bool nested = ui->path[0] != '\0';
++            if (nested) {
++                if (ImGui::SmallButton("< Back")) recomp_runtime_ui_go_up(ui);
+                 ImGui::SameLine();
+-                ImGui::TextUnformatted(ui->sections[ui->section_index]);
++                ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
++                ImGui::TextUnformatted(recomp_runtime_ui_level_label(ui));
++                ImGui::PopStyleColor();
+                 ImGui::Separator();
+-                draw_items(ui, theme, touch_friendly);
+-            } else {
+-                draw_sections(ui, theme, true);
+             }
++            draw_items(ui, theme, touch_friendly);
++            draw_children(ui, theme, recomp_runtime_ui_level_items(ui));
+             ImGui::EndChild();
+         }
+ 
+diff --git a/src/common/recomp_runtime_settings.c b/src/common/recomp_runtime_settings.c
+index f26e998..ab1360f 100644
+--- a/src/common/recomp_runtime_settings.c
++++ b/src/common/recomp_runtime_settings.c
+@@ -83,77 +83,80 @@ RecompRuntimeUi *recomp_runtime_ui_create_standard(
+     }
+ 
+     size_t count = 0;
++    /* Added first because groups are ordered by first appearance, and the
++     * resume row is the one a paused player reaches for most. */
++    if (has(f, RECOMP_RUNTIME_UI_STANDARD_RESUME))
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_RESUME, "Resume game", "Resume game",
++                 "Close settings and return to the game.", RECOMP_RUNTIME_UI_ACTION,
++                 0, 0, 0, NULL, 0, NULL);
++
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_FULLSCREEN, "Display",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_FULLSCREEN, "Settings/Display",
+                  "Fullscreen", "Choose windowed or fullscreen output.",
+                  RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, kFullscreenChoices, 3, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE, "Display",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE, "Settings/Display",
+                  "Window scale", "Resize the window in native-size steps.",
+                  RECOMP_RUNTIME_UI_INT, 1,
+                  standard->window_scale_max > 0 ? standard->window_scale_max : 8,
+                  1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_VIEW_MODE))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_VIEW_MODE, "Display",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_VIEW_MODE, "Settings/Display",
+                  "View mode", "Native, fixed widescreen, or live window aspect.",
+                  RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, view_choices, view_count,
+                  view_values);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_WIDESCREEN_HUD))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_WIDESCREEN_HUD, "Display",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_WIDESCREEN_HUD, "Settings/Display",
+                  "Edge HUD", "Anchor status groups to widescreen edges.",
+                  RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_INTEGER_SCALE))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE, "Settings/Graphics",
+                  "Integer scaling", "Snap output to whole native-pixel multiples.",
+                  RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_LINEAR_FILTER))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER, "Settings/Graphics",
+                  "Linear filter", "Smooth the final game image.",
+                  RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_TEXTURE_FILTER))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER, "Settings/Graphics",
+                  "Texture filtering", "How 3D textures are sampled when magnified.",
+                  RECOMP_RUNTIME_UI_CHOICE, 0, 9, 1, kTextureFilterChoices, 10, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_FMV_FILTER))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_FMV_FILTER, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_FMV_FILTER, "Settings/Graphics",
+                  "FMV filtering", "Choose how full-motion video is scaled up.",
+                  RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, kFmvFilterChoices, 4, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_RESOLUTION_SCALE))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE, "Settings/Graphics",
+                  "Resolution scale", "Set the internal rendering resolution.",
+                  RECOMP_RUNTIME_UI_INT, 1,
+                  standard->resolution_scale_max > 0 ? standard->resolution_scale_max : 8,
+                  1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_COLOR_CORRECTION))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_COLOR_CORRECTION, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_COLOR_CORRECTION, "Settings/Graphics",
+                  "Color correction", "Use display-aware handheld color correction.",
+                  RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_LCD_GHOSTING))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_LCD_GHOSTING, "Graphics",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_LCD_GHOSTING, "Settings/Graphics",
+                  "LCD ghosting", "Simulate the original LCD response.",
+                  RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_AUDIO))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_AUDIO, "Audio", "Audio",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_AUDIO, "Settings/Audio", "Audio",
+                  "Enable or mute game audio output.", RECOMP_RUNTIME_UI_BOOL,
+                  0, 1, 1, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_VOLUME))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_VOLUME, "Audio", "Volume",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_VOLUME, "Settings/Audio", "Volume",
+                  "Set the in-game mixer volume.", RECOMP_RUNTIME_UI_INT,
+                  0, 100, 5, NULL, 0, NULL);
+-    if (has(f, RECOMP_RUNTIME_UI_STANDARD_RESUME))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_RESUME, "System", "Resume game",
+-                 "Close settings and return to the game.", RECOMP_RUNTIME_UI_ACTION,
+-                 0, 0, 0, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_SAVE_STATE, "System", "Save state",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_SAVE_STATE, "Settings/System", "Save state",
+                  "Save the current state.", RECOMP_RUNTIME_UI_ACTION,
+                  0, 0, 0, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_LOAD_STATE, "System", "Load state",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_LOAD_STATE, "Settings/System", "Load state",
+                  "Load the current state slot.", RECOMP_RUNTIME_UI_ACTION,
+                  0, 0, 0, NULL, 0, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_RESET))
+-        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_RESET, "System", "Reset game",
++        add_item(items, &count, RECOMP_RUNTIME_UI_KEY_RESET, "Settings/System", "Reset game",
+                  "Reset the emulated machine.", RECOMP_RUNTIME_UI_ACTION,
+                  0, 0, 0, NULL, 0, NULL);
+ 
+diff --git a/src/common/recomp_runtime_ui.c b/src/common/recomp_runtime_ui.c
+index 7f6c7a5..b2457a3 100644
+--- a/src/common/recomp_runtime_ui.c
++++ b/src/common/recomp_runtime_ui.c
+@@ -17,30 +17,147 @@ int recomp_runtime_ui_item_enabled(const RecompRuntimeUi *ui,
+     return ui->config.callbacks.is_enabled(ui->config.callbacks.context, item) != 0;
+ }
+ 
+-size_t recomp_runtime_ui_section_item_count(const RecompRuntimeUi *ui,
+-                                            size_t section) {
+-    size_t count = 0;
+-    if (!ui || section >= ui->section_count) return 0;
++/* ---- section paths --------------------------------------------------------
++ * A section is a '/'-separated path ("Settings/Graphics/Advanced/PGXP"). The
++ * menu browses that tree one LEVEL at a time: the items whose section is
++ * exactly the current path, then a row per direct child path. Nothing here
++ * knows how deep a particular menu goes, so a host buries a setting simply by
++ * giving it a longer path. */
++
++/* Start and length of `path`'s segment at `depth` (0-based); NULL past the end. */
++static const char *path_segment(const char *path, size_t depth, size_t *len) {
++    const char *p = path;
++    for (size_t d = 0; d < depth; ++d) {
++        const char *slash = strchr(p, '/');
++        if (!slash) { *len = 0; return NULL; }
++        p = slash + 1;
++    }
++    const char *slash = strchr(p, '/');
++    *len = slash ? (size_t)(slash - p) : strlen(p);
++    return *len ? p : NULL;
++}
++
++static size_t path_depth(const char *path) {
++    if (!path || !*path) return 0;
++    size_t d = 1;
++    for (const char *p = path; *p; ++p) if (*p == '/') ++d;
++    return d;
++}
++
++/* Is `section` at or below `prefix`? ("" is above everything.) */
++static int path_under(const char *section, const char *prefix) {
++    if (!prefix || !*prefix) return 1;
++    size_t n = strlen(prefix);
++    if (strncmp(section, prefix, n) != 0) return 0;
++    return section[n] == '\0' || section[n] == '/';
++}
++
++static const char *item_section(const RecompRuntimeUiItem *item) {
++    const char *sec = item->section;
++    return (sec && *sec) ? sec : "Settings";
++}
++
++size_t recomp_runtime_ui_level_items(const RecompRuntimeUi *ui) {
++    size_t n = 0;
++    if (!ui) return 0;
+     for (size_t i = 0; i < ui->config.item_count; ++i)
+-        if (same_text(ui->config.items[i].section, ui->sections[section])) ++count;
+-    return count;
++        if (same_text(item_section(&ui->config.items[i]), ui->path)) ++n;
++    return n;
+ }
+ 
+-const RecompRuntimeUiItem *recomp_runtime_ui_section_item(
+-    const RecompRuntimeUi *ui, size_t section, size_t row) {
+-    size_t found = 0;
+-    if (!ui || section >= ui->section_count) return NULL;
++const RecompRuntimeUiItem *recomp_runtime_ui_level_item(const RecompRuntimeUi *ui,
++                                                        size_t row) {
++    size_t n = 0;
++    if (!ui) return NULL;
+     for (size_t i = 0; i < ui->config.item_count; ++i) {
+-        if (!same_text(ui->config.items[i].section, ui->sections[section])) continue;
+-        if (found++ == row) return &ui->config.items[i];
++        if (!same_text(item_section(&ui->config.items[i]), ui->path)) continue;
++        if (n++ == row) return &ui->config.items[i];
+     }
+     return NULL;
+ }
+ 
++/* The `index`-th distinct child segment under the current path, in the order
++ * the sections were declared. */
++static const char *level_child(const RecompRuntimeUi *ui, size_t index,
++                               size_t *out_len) {
++    const size_t depth = path_depth(ui->path);
++    size_t seen = 0;
++    for (size_t i = 0; i < ui->section_count; ++i) {
++        const char *sec = ui->sections[i];
++        if (!path_under(sec, ui->path)) continue;
++        size_t len = 0;
++        const char *seg = path_segment(sec, depth, &len);
++        if (!seg) continue;                 /* this section IS the level */
++        int known = 0;
++        for (size_t j = 0; j < i && !known; ++j) {
++            if (!path_under(ui->sections[j], ui->path)) continue;
++            size_t l2 = 0;
++            const char *s2 = path_segment(ui->sections[j], depth, &l2);
++            if (s2 && l2 == len && strncmp(s2, seg, len) == 0) known = 1;
++        }
++        if (known) continue;
++        if (seen++ == index) { *out_len = len; return seg; }
++    }
++    return NULL;
++}
++
++size_t recomp_runtime_ui_level_children(const RecompRuntimeUi *ui) {
++    size_t n = 0, len = 0;
++    if (!ui) return 0;
++    while (level_child(ui, n, &len)) ++n;
++    return n;
++}
++
++size_t recomp_runtime_ui_level_rows(const RecompRuntimeUi *ui) {
++    return recomp_runtime_ui_level_items(ui) + recomp_runtime_ui_level_children(ui);
++}
++
++const char *recomp_runtime_ui_child_label(const RecompRuntimeUi *ui, size_t index,
++                                          char *buf, size_t cap) {
++    size_t len = 0;
++    const char *seg = ui ? level_child(ui, index, &len) : NULL;
++    if (!cap) return buf;
++    if (!seg) { buf[0] = '\0'; return buf; }
++    if (len > cap - 1) len = cap - 1;
++    memcpy(buf, seg, len);
++    buf[len] = '\0';
++    return buf;
++}
++
++static void child_path(const RecompRuntimeUi *ui, size_t index,
++                       char *buf, size_t cap) {
++    char seg[96];
++    recomp_runtime_ui_child_label(ui, index, seg, sizeof seg);
++    if (ui->path[0]) snprintf(buf, cap, "%s/%s", ui->path, seg);
++    else             snprintf(buf, cap, "%s", seg);
++}
++
++const RecompRuntimeUiItem *recomp_runtime_ui_child_action(const RecompRuntimeUi *ui,
++                                                          size_t index) {
++    char full[192];
++    const RecompRuntimeUiItem *only = NULL;
++    if (!ui) return NULL;
++    child_path(ui, index, full, sizeof full);
++    for (size_t i = 0; i < ui->config.item_count; ++i) {
++        const char *sec = item_section(&ui->config.items[i]);
++        if (!path_under(sec, full)) continue;
++        if (!same_text(sec, full)) return NULL;   /* the child has children */
++        if (only) return NULL;                    /* more than one item */
++        only = &ui->config.items[i];
++    }
++    return (only && only->type == RECOMP_RUNTIME_UI_ACTION) ? only : NULL;
++}
++
++const char *recomp_runtime_ui_level_label(const RecompRuntimeUi *ui) {
++    if (!ui || !ui->path[0]) return "";
++    const char *slash = strrchr(ui->path, '/');
++    return slash ? slash + 1 : ui->path;
++}
++
+ static void visibility(RecompRuntimeUi *ui, int open) {
+     if (!ui || ui->open == open) return;
+     ui->open = open;
+-    if (!open) ui->in_section = 0;
++    if (!open) { ui->path[0] = '\0'; ui->row_index = 0; }
+     if (ui->config.callbacks.visibility_changed)
+         ui->config.callbacks.visibility_changed(ui->config.callbacks.context, open);
+ }
+@@ -63,12 +180,18 @@ RecompRuntimeUi *recomp_runtime_ui_create(const RecompRuntimeUiConfig *config) {
+             if (same_text(section, ui->sections[j])) known = 1;
+         if (!known) ui->sections[ui->section_count++] = section;
+     }
+-    if (config->first_section && *config->first_section) {
+-        for (size_t j = 1; j < ui->section_count; ++j) {
+-            if (!same_text(config->first_section, ui->sections[j])) continue;
++    /* first_section names a top-level entry to pull toward the front: the menu
++     * lists children in the order their sections were declared, so moving the
++     * sections moves the row. It stops SHORT of position 0 when the first
++     * entry is a plain action row ("Resume game") - the opening row is the one
++     * a paused player hits by reflex, and a hoist must not take it. */
++    if (config->first_section && *config->first_section && ui->section_count > 1) {
++        const size_t floor_index = recomp_runtime_ui_child_action(ui, 0) ? 1 : 0;
++        for (size_t j = floor_index + 1; j < ui->section_count; ++j) {
++            if (!path_under(ui->sections[j], config->first_section)) continue;
+             const char *hoist = ui->sections[j];
+-            for (size_t k = j; k > 0; --k) ui->sections[k] = ui->sections[k - 1];
+-            ui->sections[0] = hoist;
++            for (size_t k = j; k > floor_index; --k) ui->sections[k] = ui->sections[k - 1];
++            ui->sections[floor_index] = hoist;
+             break;
+         }
+     }
+@@ -92,7 +215,7 @@ int recomp_runtime_ui_is_open(const RecompRuntimeUi *ui) {
+ 
+ void recomp_runtime_ui_open(RecompRuntimeUi *ui) {
+     if (!ui) return;
+-    ui->in_section = 0;
++    ui->path[0] = '\0';       /* always opens at the top */
+     ui->row_index = 0;
+     visibility(ui, 1);
+ }
+@@ -132,8 +255,8 @@ static void accepted_action(RecompRuntimeUi *ui) {
+ 
+ void recomp_runtime_ui_adjust_current(RecompRuntimeUi *ui, int direction,
+                                       int activate, int repeat) {
+-    const RecompRuntimeUiItem *item = recomp_runtime_ui_section_item(
+-        ui, ui->section_index, ui->row_index);
++    const RecompRuntimeUiItem *item =
++        recomp_runtime_ui_level_item(ui, ui->row_index);
+     if (!item || !recomp_runtime_ui_item_enabled(ui, item)) return;
+     if (item->type == RECOMP_RUNTIME_UI_ACTION) {
+         if (!activate || repeat || !ui->config.callbacks.run_action) return;
+@@ -208,17 +331,36 @@ int recomp_runtime_ui_wants_text_input(const RecompRuntimeUi *ui) {
+     return (ui && ui->open && ui->editing_text) ? 1 : 0;
+ }
+ 
+-void recomp_runtime_ui_enter_section(RecompRuntimeUi *ui, size_t section) {
+-    if (!ui || section >= ui->section_count) return;
+-    ui->section_index = section;
++void recomp_runtime_ui_activate_row(RecompRuntimeUi *ui, size_t row) {
++    if (!ui) return;
++    const size_t items = recomp_runtime_ui_level_items(ui);
++    if (row < items) {
++        ui->row_index = row;
++        recomp_runtime_ui_adjust_current(ui, 1, 1, 0);
++        return;
++    }
++    const size_t child = row - items;
++    /* A child that is one lone action fires here instead of opening. */
++    const RecompRuntimeUiItem *act = recomp_runtime_ui_child_action(ui, child);
++    if (act) {
++        if (ui->config.callbacks.run_action &&
++            ui->config.callbacks.run_action(ui->config.callbacks.context, act))
++            accepted_action(ui);
++        return;
++    }
++    char full[192];
++    child_path(ui, child, full, sizeof full);
++    snprintf(ui->path, sizeof ui->path, "%s", full);
+     ui->row_index = 0;
+-    ui->in_section = 1;
+ }
+ 
+-void recomp_runtime_ui_leave_section(RecompRuntimeUi *ui) {
+-    if (!ui) return;
+-    ui->in_section = 0;
++int recomp_runtime_ui_go_up(RecompRuntimeUi *ui) {
++    if (!ui || !ui->path[0]) return 0;
++    char *slash = strrchr(ui->path, '/');
++    if (slash) *slash = '\0';
++    else        ui->path[0] = '\0';
+     ui->row_index = 0;
++    return 1;
+ }
+ 
+ int recomp_runtime_ui_handle_input(RecompRuntimeUi *ui,
+@@ -238,38 +380,27 @@ int recomp_runtime_ui_handle_input(RecompRuntimeUi *ui,
+         return 1;
+     }
+     if (input == RECOMP_RUNTIME_UI_INPUT_BACK) {
+-        if (!repeat) {
+-            if (ui->in_section) {
+-                ui->in_section = 0;
+-                ui->row_index = 0;
+-            } else {
+-                recomp_runtime_ui_close(ui);
+-            }
+-        }
++        if (!repeat && !recomp_runtime_ui_go_up(ui))
++            recomp_runtime_ui_close(ui);   /* already at the top */
+         return 1;
+     }
+     if (input == RECOMP_RUNTIME_UI_INPUT_UP ||
+         input == RECOMP_RUNTIME_UI_INPUT_DOWN) {
+         int delta = input == RECOMP_RUNTIME_UI_INPUT_UP ? -1 : 1;
+-        size_t count = ui->in_section ? recomp_runtime_ui_section_item_count(ui, ui->section_index)
+-                                      : ui->section_count;
+-        size_t *selection = ui->in_section ? &ui->row_index : &ui->section_index;
+-        *selection = wrap_index(*selection, delta, count);
++        ui->row_index = wrap_index(ui->row_index, delta,
++                                   recomp_runtime_ui_level_rows(ui));
+         return 1;
+     }
+     if (input == RECOMP_RUNTIME_UI_INPUT_ACCEPT) {
+-        if (!ui->in_section) {
+-            if (!repeat) {
+-                recomp_runtime_ui_enter_section(ui, ui->section_index);
+-            }
+-        } else {
++        if (ui->row_index < recomp_runtime_ui_level_items(ui))
+             recomp_runtime_ui_adjust_current(ui, 1, 1, repeat);
+-        }
++        else if (!repeat)
++            recomp_runtime_ui_activate_row(ui, ui->row_index);
+         return 1;
+     }
+     if (input == RECOMP_RUNTIME_UI_INPUT_LEFT ||
+         input == RECOMP_RUNTIME_UI_INPUT_RIGHT) {
+-        if (ui->in_section)
++        if (ui->row_index < recomp_runtime_ui_level_items(ui))
+             recomp_runtime_ui_adjust_current(ui,
+                            input == RECOMP_RUNTIME_UI_INPUT_LEFT ? -1 : 1,
+                            0, repeat);
+@@ -465,6 +596,17 @@ void recomp_runtime_ui_render_argb8888(RecompRuntimeUi *ui, void *pixels,
+             scale,accent);
+     const char *title = ui->config.title ? ui->config.title : "Settings";
+     const char *subtitle = ui->config.subtitle;
++    /* Inside a level the subtitle becomes the trail, so a player four levels
++     * down can see where they are (and that Back walks out one at a time). */
++    char trail[192];
++    if (ui->path[0]) {
++        size_t n = 0;
++        for (const char *p2 = ui->path; *p2 && n + 4 < sizeof trail; ++p2)
++            if (*p2 == '/') { trail[n++] = ' '; trail[n++] = '>'; trail[n++] = ' '; }
++            else trail[n++] = *p2;
++        trail[n] = '\0';
++        subtitle = trail;
++    }
+     const int title_w = text_width(title, scale);
+     const int subtitle_w = text_width(subtitle, scale);
+     const int header_inner_w = panel_w - pad * 2;
+@@ -490,9 +632,10 @@ void recomp_runtime_ui_render_argb8888(RecompRuntimeUi *ui, void *pixels,
+     int row_h = 15 * scale;
+     int visible = (footer_y - list_y) / row_h;
+     if (visible < 1) visible = 1;
+-    size_t count = ui->in_section ? recomp_runtime_ui_section_item_count(ui, ui->section_index)
+-                                  : ui->section_count;
+-    size_t selection = ui->in_section ? ui->row_index : ui->section_index;
++    /* One level: this path's items, then a row per child path. */
++    const size_t items = recomp_runtime_ui_level_items(ui);
++    const size_t count = items + recomp_runtime_ui_level_children(ui);
++    const size_t selection = ui->row_index;
+     size_t first = 0;
+     if (selection >= (size_t)visible) first = selection - (size_t)visible + 1;
+     for (int line = 0; line < visible && first + (size_t)line < count; ++line) {
+@@ -501,17 +644,23 @@ void recomp_runtime_ui_render_argb8888(RecompRuntimeUi *ui, void *pixels,
+         if (index == selection)
+             rect(pixels,width,height,pitch,panel_x+pad/2,y-3*scale,
+                  panel_w-pad,row_h,selected,255);
+-        if (!ui->in_section) {
+-            const char *name = ui->sections[index];
++        if (index >= items) {
++            /* A child: its own segment, with a chevron unless it is a lone
++             * action row (Resume game, the quit rows) that fires in place. */
++            const size_t child = index - items;
++            char name[64];
++            recomp_runtime_ui_child_label(ui, child, name, sizeof name);
++            const RecompRuntimeUiItem *act = recomp_runtime_ui_child_action(ui, child);
++            if (act && act->label) snprintf(name, sizeof name, "%s", act->label);
+             draw_text(pixels,width,height,pitch,panel_x+pad,y,scale,
+                       index == selection ? white : muted,name,
+                       panel_x+panel_w-pad-12*scale);
+-            draw_text(pixels,width,height,pitch,panel_x+panel_w-pad-5*scale,y,
+-                      scale,index == selection ? accent : muted,">",
+-                      panel_x+panel_w-pad);
++            if (!act)
++                draw_text(pixels,width,height,pitch,panel_x+panel_w-pad-5*scale,y,
++                          scale,index == selection ? accent : muted,">",
++                          panel_x+panel_w-pad);
+         } else {
+-            const RecompRuntimeUiItem *item = recomp_runtime_ui_section_item(
+-                ui, ui->section_index, index);
++            const RecompRuntimeUiItem *item = recomp_runtime_ui_level_item(ui, index);
+             int enabled = recomp_runtime_ui_item_enabled(ui, item);
+             uint32_t color = enabled ? (index == selection ? white : muted)
+                                      : disabled;
+@@ -527,9 +676,9 @@ void recomp_runtime_ui_render_argb8888(RecompRuntimeUi *ui, void *pixels,
+     }
+ 
+     const char *help = "UP/DOWN SELECT  LEFT/RIGHT CHANGE  ENTER ACCEPT";
+-    if (ui->in_section) {
+-        const RecompRuntimeUiItem *item = recomp_runtime_ui_section_item(
+-            ui, ui->section_index, ui->row_index);
++    if (ui->row_index < items) {
++        const RecompRuntimeUiItem *item =
++            recomp_runtime_ui_level_item(ui, ui->row_index);
+         if (item && item->description && *item->description) help = item->description;
+     }
+     rect(pixels,width,height,pitch,panel_x+pad,footer_y-4*scale,
+diff --git a/src/common/recomp_runtime_ui_internal.h b/src/common/recomp_runtime_ui_internal.h
+index 1f6991c..09f59c0 100644
+--- a/src/common/recomp_runtime_ui_internal.h
++++ b/src/common/recomp_runtime_ui_internal.h
+@@ -9,12 +9,19 @@ extern "C" {
+ 
+ struct RecompRuntimeUi {
+     RecompRuntimeUiConfig config;
++    /* An item's section is a PATH: "Settings/Graphics/Advanced/PGXP". The menu
++     * browses that tree one level at a time, so a host decides how deep to
++     * bury a setting purely by how long a path it gives it - which is how the
++     * PGXP block sits four levels down without the menu knowing what PGXP is.
++     * `sections` holds every distinct path in first-appearance order (the
++     * order rows appear in). */
+     const char **sections;
+     size_t section_count;
+-    size_t section_index;
++    /* The level being browsed: "" is the top. Rows at a level are the items
++     * whose section IS this path, followed by one row per direct child path. */
++    char path[192];
+     size_t row_index;
+     int open;
+-    int in_section;
+     unsigned status_frames;
+     char status[48];
+     RecompRuntimeUiItem *owned_items;
+@@ -32,17 +39,31 @@ struct RecompRuntimeUi {
+ 
+ int recomp_runtime_ui_item_enabled(const RecompRuntimeUi *ui,
+                                    const RecompRuntimeUiItem *item);
+-size_t recomp_runtime_ui_section_item_count(const RecompRuntimeUi *ui,
+-                                            size_t section);
+-const RecompRuntimeUiItem *recomp_runtime_ui_section_item(
+-    const RecompRuntimeUi *ui, size_t section, size_t row);
+ int recomp_runtime_ui_current_value(RecompRuntimeUi *ui,
+                                     const RecompRuntimeUiItem *item,
+                                     int *value);
+ void recomp_runtime_ui_adjust_current(RecompRuntimeUi *ui, int direction,
+                                       int activate, int repeat);
+-void recomp_runtime_ui_enter_section(RecompRuntimeUi *ui, size_t section);
+-void recomp_runtime_ui_leave_section(RecompRuntimeUi *ui);
++/* Rows at the current level: items first, then child paths. */
++size_t recomp_runtime_ui_level_items(const RecompRuntimeUi *ui);
++size_t recomp_runtime_ui_level_children(const RecompRuntimeUi *ui);
++size_t recomp_runtime_ui_level_rows(const RecompRuntimeUi *ui);
++const RecompRuntimeUiItem *recomp_runtime_ui_level_item(const RecompRuntimeUi *ui,
++                                                        size_t row);
++/* Name of child `index` (the one path segment, no separators), into `buf`. */
++const char *recomp_runtime_ui_child_label(const RecompRuntimeUi *ui, size_t index,
++                                          char *buf, size_t cap);
++/* A child that is a single ACTION and nothing else ("Resume game", "Quit"):
++ * the menu fires it in place instead of descending into it. */
++const RecompRuntimeUiItem *recomp_runtime_ui_child_action(const RecompRuntimeUi *ui,
++                                                          size_t index);
++/* Activate row `row` at this level: adjust an item, fire a lone action, or
++ * descend into a child. */
++void recomp_runtime_ui_activate_row(RecompRuntimeUi *ui, size_t row);
++/* Up one level; at the top this closes the menu. Returns 1 if it moved. */
++int recomp_runtime_ui_go_up(RecompRuntimeUi *ui);
++/* The label for the level being browsed (its last path segment; "" at top). */
++const char *recomp_runtime_ui_level_label(const RecompRuntimeUi *ui);
+ /* Reads a TEXT item's current value; writes "" when unavailable. */
+ void recomp_runtime_ui_current_text(RecompRuntimeUi *ui,
+                                     const RecompRuntimeUiItem *item, char *buf,
+@@ -51,7 +72,6 @@ void recomp_runtime_ui_current_text(RecompRuntimeUi *ui,
+ int recomp_runtime_ui_commit_text(RecompRuntimeUi *ui,
+                                   const RecompRuntimeUiItem *item,
+                                   const char *value);
+-
+ #ifdef __cplusplus
+ }
+ #endif

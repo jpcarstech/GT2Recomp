@@ -1,0 +1,247 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index f961804..86aa894 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -1073,13 +1073,16 @@ void draw_disc_selector(LauncherModel* m, const LauncherTheme& th, float availw)
+     ImGui::Dummy(ImVec2(0, px(10)));
+ }
+ 
+-// "Disc" dropdown for a multi-TITLE install (GameInfo.title_*): sibling
++// "Disc" row for a multi-TITLE install (GameInfo.title_*): sibling
+ // recompiled builds side by side, each its own exe (Arcade / Simulation /
+-// Combined). Picking another INSTALLED row commits the switch immediately —
+-// the launcher tears down and the host spawns that title's exe, landing the
+-// player back in this dashboard with the other disc active. Known but
+-// uninstalled titles draw disabled with a "not installed" tag so players
+-// learn the option exists. Draws nothing for single-title installs.
++// Combined). The row names the disc this dashboard is running and offers ONE
++// button, "Switch to <next installed disc>", which commits the switch
++// immediately — the launcher tears down and the host spawns that title's
++// exe, landing the player back here with the other disc active. With two
++// discs it is a plain toggle; with three it walks the installed ones in
++// order. A disc that is known but not installed is skipped and listed under
++// the row so players learn the option exists. Draws nothing for single-title
++// installs.
+ void draw_title_selector(LauncherModel* m, const LauncherTheme& th, float availw) {
+     const int count = m->num_titles;
+     if (count <= 1 || !m->title_labels) return;
+@@ -1088,28 +1091,40 @@ void draw_title_selector(LauncherModel* m, const LauncherTheme& th, float availw
+         (active >= 0 && active < count && m->title_labels[active])
+             ? m->title_labels[active] : "";
+ 
++    int next = -1;
++    for (int k = 1; k < count && next < 0; ++k) {
++        const int i = (active + k) % count;
++        if (launcher_model_title_installed(m, i)) next = i;
++    }
++
+     ImGui::TextColored(col(th.text_muted), "%s", ui_text("Disc"));
+     ImGui::Dummy(ImVec2(0, px(4)));
+-    ImGui::SetNextItemWidth(availw);
+-    if (ImGui::BeginCombo("##title_selection", ui_text(active_label))) {
++    ImGui::AlignTextToFramePadding();
++    ImGui::TextUnformatted(ui_text(active_label));
++    if (next >= 0) {
++        char btn[160];
++        snprintf(btn, sizeof(btn), "%s %s", ui_text("Switch to"),
++                 m->title_labels[next] ? m->title_labels[next] : "");
++        const float bw = ImGui::CalcTextSize(btn).x + px(24);
++        ImGui::SameLine(0.0f, px(th.spacing_md));
++        if (ImGui::Button(btn, ImVec2(bw, px(30))))
++            launcher_model_switch_title(m, next);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Restarts into the other disc's build. Your settings are kept.");
++    }
++    int missing = 0;
++    for (int i = 0; i < count; ++i)
++        if (i != active && !launcher_model_title_installed(m, i)) missing++;
++    if (missing > 0) {
++        char line[240]; line[0] = 0;
+         for (int i = 0; i < count; ++i) {
+-            const char* lab = m->title_labels[i] ? m->title_labels[i] : "";
+-            const bool installed = launcher_model_title_installed(m, i);
+-            if (!installed) {
+-                char row[160];
+-                snprintf(row, sizeof(row), "%s %s", lab,
+-                         ui_text("(not installed)"));
+-                ImGui::BeginDisabled(true);
+-                ImGui::Selectable(row, false);
+-                ImGui::EndDisabled();
+-                continue;
+-            }
+-            if (ImGui::Selectable(lab, i == active))
+-                launcher_model_switch_title(m, i);
+-            if (i == active) ImGui::SetItemDefaultFocus();
++            if (i == active || launcher_model_title_installed(m, i)) continue;
++            if (line[0]) strncat(line, ", ", sizeof(line) - strlen(line) - 1);
++            strncat(line, m->title_labels[i] ? m->title_labels[i] : "", sizeof(line) - strlen(line) - 1);
+         }
+-        ImGui::EndCombo();
++        ImGui::TextColored(col(th.text_muted), "%s: %s", ui_text("Not installed"), line);
+     }
++    (void)availw;
+     ImGui::Dummy(ImVec2(0, px(10)));
+ }
+ 
+@@ -2696,6 +2711,21 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         if (ImGui::Checkbox("##texfilter2d", &f2d))
+             launcher_model_toggle_texture_filter_2d(m);
+         ImGui::PopID();
++        row_label("Edge blending", th);
++        ImGui::PushID("texfilter_edge");
++        {
++            const bool no_filter = m->s.texture_filter == 0;
++            if (no_filter) ImGui::BeginDisabled();
++            bool eb = m->s.texture_edge_blend != 0;
++            if (ImGui::Checkbox("##texfilter_edge", &eb))
++                launcher_model_toggle_texture_edge_blend(m);
++            if (no_filter) ImGui::EndDisabled();
++            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
++                ImGui::SetTooltip("Soft edges on cut-out textures (trees, fences, crowds) "
++                                  "with a filtered mode, as DuckStation does. Off keeps the "
++                                  "hard texel outline.");
++        }
++        ImGui::PopID();
+     } else {
+         row_label("Linear filtering", th);
+         bool filter = m->s.linear_filter != 0;
+@@ -2772,6 +2802,19 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         ImGui::PopID();
+     }
+ 
++    if (m->has_fmv_crop) {
++        row_label("FMV chroma smoothing", th);
++        ImGui::PushID("fmv_chroma");
++        bool fc = m->s.fmv_chroma != 0;
++        if (ImGui::Checkbox("##fmv_chroma", &fc))
++            launcher_model_toggle_fmv_chroma(m);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Smooths the colour blocks in movies (the video codec stores "
++                              "colour at half resolution), as DuckStation's 24-bit chroma "
++                              "smoothing does. Detail is untouched.");
++        ImGui::PopID();
++    }
++
+     if (m->has_affine_filter) {
+         row_label("Affine background smoothing", th);
+         bool affine = m->s.affine_filter != 0;
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 6c13f85..d9000ce 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -621,8 +621,10 @@ void launcher_model_init(LauncherModel* m,
+                      ? sk_prof->screen_kind_count : 4;
+         m->s.screen_kind = clampi(m->s.screen_kind, 0, sk_n - 1);
+     }
+-    if (m->has_texture_filter) m->s.texture_filter = clampi(m->s.texture_filter, 0, 4);
++    if (m->has_texture_filter) m->s.texture_filter = clampi(m->s.texture_filter, 0, 10);
+     if (m->has_texture_filter) m->s.texture_filter_2d = m->s.texture_filter_2d ? 1 : 0;
++    if (m->has_texture_filter) m->s.texture_edge_blend = m->s.texture_edge_blend ? 1 : 0;
++    if (m->has_fmv_crop) m->s.fmv_chroma = m->s.fmv_chroma ? 1 : 0;
+     if (m->has_antialiasing) m->s.post_processing = (m->s.post_processing == 1) ? 1 : 0;
+     /* 0 = unset (a host predating the field): seed the default rather than
+      * letting a memset pin the least useful value. */
+@@ -1615,15 +1617,31 @@ const char* launcher_model_aa_label(const LauncherModel* m) {
+     }
+ }
+ 
++/* Renderer modes: 0 nearest, 1 bilinear, 2 3-point (N64), 3 trilinear,
++ * 4 JINC2, 5 xBR, 6 Scale2x, 7 Scale3x, 8 MMPX, 9 MMPX Enhanced, 10 MMPX
++ * Advanced - DuckStation's set. Trilinear is dropped from the cycle by user
++ * choice (on PS1 content it read as a blurrier bilinear); a settings file
++ * that carries it shows and cycles as Bilinear. */
++static int texfilter_cycle_index(int mode) {          /* mode -> 0..9 */
++    if (mode >= 4 && mode <= 10) return mode - 1;
++    return (mode >= 0 && mode <= 2) ? mode : 1;
++}
++static int texfilter_cycle_mode(int idx) {            /* 0..9 -> mode */
++    return (idx >= 3) ? idx + 1 : idx;
++}
+ void launcher_model_toggle_texture_filter(LauncherModel* m) {
+-    /* 0=nearest 1=bilinear 2=3-point(N64) 4=JINC2. (The renderer also
+-     * implements an approximate trilinear as mode 3, dropped from the cycle
+-     * by user choice — on PS1 content it read as a blurrier bilinear; a
+-     * settings file that carries it shows and cycles as Bilinear.) */
+-    int v = m->s.texture_filter;
+-    if (v == 4) v = 3; else if (v < 0 || v > 2) v = v ? 1 : 0;
+-    v = (v + 1) % 4;
+-    m->s.texture_filter = (v == 3) ? 4 : v;
++    m->s.texture_filter = texfilter_cycle_mode((texfilter_cycle_index(m->s.texture_filter) + 1) % 10);
++}
++
++void launcher_model_toggle_texture_edge_blend(LauncherModel* m) {
++    /* DuckStation's edge blending: with a filtered mode, a pixel's cutout
++     * coverage blends its edge instead of the texel outline deciding. */
++    m->s.texture_edge_blend = !m->s.texture_edge_blend;
++}
++
++void launcher_model_toggle_fmv_chroma(LauncherModel* m) {
++    if (!m || !m->has_fmv_crop) return;
++    m->s.fmv_chroma = !m->s.fmv_chroma;
+ }
+ 
+ void launcher_model_cycle_post_processing(LauncherModel* m) {
+@@ -1644,11 +1662,10 @@ void launcher_model_toggle_texture_filter_2d(LauncherModel* m) {
+ }
+ 
+ const char* launcher_model_texture_filter_label(const LauncherModel* m) {
+-    static const char* k_names[4] =
+-        { "Nearest", "Bilinear", "3-Point (N64)", "JINC2" };
+-    int v = m->s.texture_filter;
+-    if (v == 4) v = 3; else if (v < 0 || v > 2) v = v ? 1 : 0;
+-    return k_names[v];
++    static const char* k_names[10] =
++        { "Nearest", "Bilinear", "3-Point (N64)", "JINC2", "xBR", "Scale2x (EPX)",
++          "Scale3x", "MMPX", "MMPX Enhanced", "MMPX Advanced" };
++    return k_names[texfilter_cycle_index(m->s.texture_filter)];
+ }
+ 
+ void launcher_model_cycle_fmv_filter(LauncherModel* m) {
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 91d9806..10245e4 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -773,6 +773,8 @@ void launcher_model_cycle_aa(LauncherModel* m);            // Off/2x/4x/8x (MSAA
+ const char* launcher_model_aa_label(const LauncherModel* m);
+ void launcher_model_toggle_texture_filter(LauncherModel* m);   // Nearest/Bilinear
+ void launcher_model_toggle_texture_filter_2d(LauncherModel* m); // filter 2D sprites/UI
++void launcher_model_toggle_texture_edge_blend(LauncherModel* m); // DuckStation edge blending
++void launcher_model_toggle_fmv_chroma(LauncherModel* m);         // 24-bit chroma smoothing (FMV)
+ void launcher_model_cycle_post_processing(LauncherModel* m);    // Off/FXAA
+ const char* launcher_model_post_processing_label(const LauncherModel* m);
+ const char* launcher_model_texture_filter_label(const LauncherModel* m);
+diff --git a/src/common/recomp_runtime_settings.c b/src/common/recomp_runtime_settings.c
+index 075dc83..f26e998 100644
+--- a/src/common/recomp_runtime_settings.c
++++ b/src/common/recomp_runtime_settings.c
+@@ -6,7 +6,7 @@
+ static const char *const kFullscreenChoices[] = {
+     "Windowed", "Borderless", "Exclusive"
+ };
+-static const char *const kTextureFilterChoices[] = { "Nearest", "Bilinear", "3-Point (N64)", "JINC2" };
++static const char *const kTextureFilterChoices[] = { "Nearest", "Bilinear", "3-Point (N64)", "JINC2", "xBR", "Scale2x (EPX)", "Scale3x", "MMPX", "MMPX Enhanced", "MMPX Advanced" };
+ /* Order matches RECOMP_LAUNCHER_FMV_FILTER_* minus one (choice indices are
+  * 0-based), least -> most smoothing. */
+ static const char *const kFmvFilterChoices[] = {
+@@ -113,7 +113,7 @@ RecompRuntimeUi *recomp_runtime_ui_create_standard(
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_TEXTURE_FILTER))
+         add_item(items, &count, RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER, "Graphics",
+                  "Texture filtering", "How 3D textures are sampled when magnified.",
+-                 RECOMP_RUNTIME_UI_CHOICE, 0, 3, 1, kTextureFilterChoices, 4, NULL);
++                 RECOMP_RUNTIME_UI_CHOICE, 0, 9, 1, kTextureFilterChoices, 10, NULL);
+     if (has(f, RECOMP_RUNTIME_UI_STANDARD_FMV_FILTER))
+         add_item(items, &count, RECOMP_RUNTIME_UI_KEY_FMV_FILTER, "Graphics",
+                  "FMV filtering", "Choose how full-motion video is scaled up.",
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 195b3a5..91f1b49 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -551,6 +551,8 @@ struct RecompLauncherCSettings {
+                               // legacy on/off host may still write 0/1.)
+     int  texture_filter;      // 0 = nearest, 1 = bilinear (host may extend: 2 = 3-point, 3 = trilinear)
+     int  texture_filter_2d;   // bool: apply texture_filter to 2D elements (sprites/HUD); 0 keeps them nearest
++    int  texture_edge_blend;  // bool: DuckStation edge blending for the filtered modes (cutout coverage blends the edge)
++    int  fmv_chroma;          // bool: DuckStation 24-bit chroma smoothing on FMV frames
+     int  post_processing;     // present post-process: 0 = off, 1 = FXAA (host may extend)
+     int  screen_kind;         // 0 raw, 1 CRT, 2 composite, 3 trinitron
+     int  frame_interp;        // bool

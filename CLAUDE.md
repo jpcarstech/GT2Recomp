@@ -70,9 +70,19 @@ git -C psxrecomp worktree add -f --detach /tmp/stacktest afe9ab29
 cd /tmp/stacktest && for p in $(LC_ALL=C ls .../patches/upstream/*.patch \
     .../patches/psxrecomp-*.patch); do git apply "$p" || echo "FAIL $p"; done
 # `git diff | sort | md5sum` here must equal the same in the psxrecomp tree
+# (run `git add -N .` first on both sides: patches q/r ADD files, and an
+# untracked file is invisible to `git diff`)
 ```
 
 Every patch gets a row in `patches/README.md` saying what it does and why.
+
+## Editing local_build.sh
+
+The game folder keeps its own copy of `tools-win/local-build/local_build.sh`
+and Setup runs THAT copy; it only refreshes itself from the checkout when
+`GT2_LB_VERSION` at the top is higher. Every change to the script must bump
+it, or players (and John) keep running the old one — the git-clean fix and
+the title-art rip shipped once without the bump and never ran.
 
 ## Updating a released config
 
@@ -101,8 +111,16 @@ already GitHub's history, every release drifts and the tag ends up pointing
 at a commit that is not on main ("N commits since this release"). After a
 push: `fix_release_tag.cmd <tag>` (re-points the tag at origin/main and writes
 `release\github_main.bundle`), then fetch that bundle here and `update-ref
-refs/heads/release` to it. Done for 0.2.0; `release` == GitHub main
-`49e7523`.
+refs/heads/release` to it. Done for 0.3.0; `release` == GitHub main
+`51fe002` (the 0.2.0 release commit is `49e7523`). **0.4.0 is cut but not
+yet reconciled**: the local release commit is on `release` with tag
+`v0.4.0`, and after John's push it needs `fix_release_tag.cmd v0.4.0`
+followed by fetching `release\github_main.bundle` here and pointing
+`refs/heads/release` at GitHub's rewritten commit. `fix_release_tag.cmd`
+REQUIRES the tag name: run without one on 0.3.0 day, its old default moved
+`v0.2.0` onto the 0.3.0 commit and the tags had to be repaired
+(`repair_tags_0.3.0.cmd`). Also: the GitHub release form must only be
+published AFTER push_update.cmd, or GitHub creates the tag on the old main.
 
 Release checklist: CHANGELOG dated + Known issues → README → `tools/
 make_setup_zip.sh` (attach the zip) → release commit on `release` + tag →
@@ -118,7 +136,15 @@ executable you run: `ninja Gran_Turismo_2__Simulation__Recompiled_pgxp`
 (under a minute after a mod-source change). The build tree carries its own
 copy of `mods/packages/` and a `mods/state.toml`: copy the manifest over and
 write `[[feature]] package_id/id/enabled` entries there to enable features
-for a `PSX_NO_LAUNCHER=1` run.
+for a `PSX_NO_LAUNCHER=1` run. A rebuild also copies `titles/<t>/game.toml`
+over `build/game.toml`, which drops runtime-only keys the lab needs
+(`fmv_letterbox_rows`, `[widescreen]`, `offer_vulkan`) - re-add them after
+each rebuild (the lab keeps a script for it). The Vulkan backend needs
+`glslc` + Vulkan headers at configure time (apt: `glslc libvulkan-dev`) and a
+driver to run: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`
+(`mesa-vulkan-drivers`, software) with `renderer = "vulkan"` in
+`build/settings.toml`; point `VK_ICD_FILENAMES` at a missing file to test
+the no-driver fallback.
 
 ## Performance work
 
@@ -142,3 +168,17 @@ changed — the tool refuses a stale recompiler). Changing
 `runtime/include/debug_server.h` recompiles every generated file (it is
 reached through `psx_runtime.h`); declare new runtime-only symbols in the
 .cpp that needs them instead.
+
+## Shelved work
+
+- **Trackside Objects Behind Barriers** (2026-09-03): trees/poles/signs hidden
+  behind guardrails and chain-link fences by ground-contact rows — framework
+  patch p, GT2 mod feature, evidence clip and `docs/RENDERING_QUALITY.md`
+  §4d — was built, verified on John's Seattle replay, and then pulled the
+  same day (John: more important things to fix first). Everything lives in
+  GT2Recomp commit `71d75af` (reverted by the next commit) and psxrecomp dev
+  branch `shelved/trackside-behind-barriers` (`e335e572`, on top of the
+  `afe9ab29` stack). To bring it back: cherry-pick `71d75af`, restore the
+  patch as `psxrecomp-zzzzzzzzzzp-*.patch`, re-verify the stack. Its lab
+  tools `tools/lab_ab_frames.py` / `lab_ab_burst.py` (frame-matched A/B
+  against a savestate) were kept.

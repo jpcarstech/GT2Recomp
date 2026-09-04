@@ -1,0 +1,308 @@
+diff --git a/runtime/include/gpu_render.h b/runtime/include/gpu_render.h
+index 2d13799b..72ee71fa 100644
+--- a/runtime/include/gpu_render.h
++++ b/runtime/include/gpu_render.h
+@@ -220,8 +220,17 @@ typedef struct GpuRenderBackend {
+                            int base_x);
+ } GpuRenderBackend;
+ 
++/* DuckStation's "Chroma Smoothing for 24-Bit Display" as a CPU pass over an
++ * ARGB8888 frame (video_shadergen.cpp GenerateChromaSmoothingFragmentShader).
++ * Lives in gpu_gl_renderer.c but touches no GL: the Vulkan present uses it
++ * too, so a movie looks the same on either backend. Returns `px` unchanged
++ * when the frame is too small or scratch cannot be grown; the result is a
++ * shared static buffer, valid until the next call. */
++const uint32_t *psx_fmv_chroma_smooth(const uint32_t *px, int w, int h);
++
+ #ifdef __cplusplus
+ }
+ #endif
+ 
++
+ #endif /* PSX_GPU_RENDER_H */
+diff --git a/runtime/include/gpu_vk_renderer.h b/runtime/include/gpu_vk_renderer.h
+index 6c954f9f..8f710773 100644
+--- a/runtime/include/gpu_vk_renderer.h
++++ b/runtime/include/gpu_vk_renderer.h
+@@ -28,6 +28,24 @@ int  vk_renderer_probe(void);
+  * SDL_WINDOW_VULKAN.  Returns 1 on success, 0 to fall back to software. */
+ int  vk_renderer_init_context(struct SDL_Window *win);
+ 
++/* Present-side settings, mirroring the OpenGL backend's. Safe to call at any
++ * time, including in a build without the Vulkan backend (they are no-ops).
++ *   display_aspect     - the aspect the frame is letterboxed to (4:3, 16:10,
++ *                        the widescreen hack's). The blit was pinned to 4:3.
++ *   display_scaling    - 0 nearest, 1 bilinear, 2 sharp-bilinear (takes plain
++ *                        bilinear here), -1 follow the antialiasing setting.
++ *   fmv_crop           - overscan rows trimmed from a 24-bit movie frame.
++ *   fmv_letterbox      - the black band height baked into the movie
++ *                        ([video] fmv_letterbox_rows), removed with the crop.
++ *   fmv_filter         - 0 follow, 1 nearest, 2+ bilinear, for movies only.
++ *   fmv_chroma_smoothing - DuckStation's 24-bit chroma smoothing (CPU pass). */
++void vk_renderer_set_display_aspect(int num, int den);
++void vk_renderer_set_display_scaling(int mode);
++void vk_renderer_set_fmv_crop(int native_rows);
++void vk_renderer_set_fmv_letterbox(int native_rows);
++void vk_renderer_set_fmv_filter(int cfg_value);
++void vk_renderer_set_fmv_chroma_smoothing(int on);
++
+ /* Tear down all Vulkan objects (idempotent). */
+ void vk_renderer_shutdown(void);
+ 
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index f6b85925..8fa0fa14 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3983,7 +3983,10 @@ static inline void chroma_avg2x2(const uint32_t *px, int w, int h, int x, int y,
+     argb_to_f(px[y1 * w + x1], &tr, &tg, &tb); ar += tr; ag += tg; ab += tb;
+     *r = ar * 0.25f; *g = ag * 0.25f; *b = ab * 0.25f;
+ }
+-static const uint32_t *fmv_chroma_smooth(const uint32_t *px, int w, int h) {
++/* Shared with the Vulkan backend (declared in gpu_render.h): this is a pure
++ * CPU pass over an ARGB frame with no GL state, and only one backend is
++ * ever live, so both can use the one static scratch buffer above. */
++const uint32_t *psx_fmv_chroma_smooth(const uint32_t *px, int w, int h) {
+     if (!px || w < 2 || h < 2) return px;
+     size_t need = (size_t)w * (size_t)h;
+     if (need > s_chroma_cap) {
+@@ -4190,7 +4193,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
+                            : -1;          /* AA off: nearest, no shader work */
+     glViewport(lx, ly, lw, lh);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+-    upload_present_tex((is_fmv && s_fmv_chroma) ? fmv_chroma_smooth(pixels, src_w, src_h) : pixels,
++    upload_present_tex((is_fmv && s_fmv_chroma) ? psx_fmv_chroma_smooth(pixels, src_w, src_h) : pixels,
+                        src_w, src_h, filt_mode >= 0 ? 1 : 0);
+     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+     present_set_sharp(filt_mode, src_w, src_h, lw, lh);
+diff --git a/runtime/src/gpu_vk_renderer.c b/runtime/src/gpu_vk_renderer.c
+index f2f2b2d1..e33ac17f 100644
+--- a/runtime/src/gpu_vk_renderer.c
++++ b/runtime/src/gpu_vk_renderer.c
+@@ -45,6 +45,12 @@ void vk_renderer_present_blank(void){}
+ void vk_renderer_sync_cpu(void){}
+ void vk_renderer_restage_vram_after_savestate(void){}
+ void vk_renderer_set_present_mode(int m){(void)m;}
++void vk_renderer_set_display_aspect(int n,int d){(void)n;(void)d;}
++void vk_renderer_set_display_scaling(int m){(void)m;}
++void vk_renderer_set_fmv_crop(int r){(void)r;}
++void vk_renderer_set_fmv_letterbox(int r){(void)r;}
++void vk_renderer_set_fmv_filter(int c){(void)c;}
++void vk_renderer_set_fmv_chroma_smoothing(int o){(void)o;}
+ int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
+ const GpuRenderBackend *vk_backend_get(void) { return 0; }
+ 
+@@ -1718,14 +1724,52 @@ static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
+ 
+ /* Compute a letterbox rect for the swapchain given a source aspect. */
+ static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
+-    /* center-fit aw:ah inside sw x sh */
+-    int tw = sw, th = sw * ah / aw;
+-    if (th > sh) { th = sh; tw = sh * aw / ah; }
++    /* center-fit aw:ah inside sw x sh. 64-bit products: the FMV crop passes
++     * an aspect pre-multiplied by the source dimensions (see present_cpu). */
++    if (aw <= 0 || ah <= 0) { aw = 4; ah = 3; }
++    int tw = sw, th = (int)(((int64_t)sw * ah) / aw);
++    if (th > sh) { th = sh; tw = (int)(((int64_t)sh * aw) / ah); }
+     int x = (sw - tw) / 2, y = (sh - th) / 2;
+     off[0].x = x;       off[0].y = y;       off[0].z = 0;
+     off[1].x = x + tw;  off[1].y = y + th;  off[1].z = 1;
+ }
+ 
++/* ---- present-side settings, mirroring the OpenGL backend's -----------------
++ * The launcher's Display rows apply to whichever renderer is running, so the
++ * Vulkan present has to honour the same ones. What is here: the display
++ * aspect (the blit used to be pinned to 4:3, which stretched the picture
++ * whenever the aspect or the widescreen hack said otherwise), the display
++ * scaling choice, and the three FMV rows - crop, filtering and chroma
++ * smoothing. What is NOT here yet, because it needs shader passes rather than
++ * a blit: FXAA post-processing and sharp-bilinear, which fall back to plain
++ * bilinear (see docs/RENDERING_QUALITY.md). */
++static int s_aspect_num = 4, s_aspect_den = 3;
++static int s_display_scaling = -1;   /* -1 follow antialiasing, 0 nearest, 1/2 linear */
++static int s_fmv_crop = 0;           /* overscan rows trimmed from a movie frame */
++static int s_fmv_band_seed = 0;      /* [video] fmv_letterbox_rows */
++static int s_fmv_filter_cfg = 0;     /* 0 follow, 1 nearest, 2+ linear */
++static int s_fmv_chroma = 0;
++
++void vk_renderer_set_display_aspect(int num, int den) {
++    if (num <= 0 || den <= 0) { num = 4; den = 3; }
++    s_aspect_num = num; s_aspect_den = den;
++}
++void vk_renderer_set_display_scaling(int mode) { s_display_scaling = mode; }
++void vk_renderer_set_fmv_crop(int native_rows) { s_fmv_crop = native_rows < 0 ? 0 : native_rows; }
++void vk_renderer_set_fmv_letterbox(int native_rows) { s_fmv_band_seed = native_rows < 0 ? 0 : native_rows; }
++void vk_renderer_set_fmv_filter(int cfg_value) {
++    if (cfg_value >= 0 && cfg_value <= 3) s_fmv_filter_cfg = cfg_value;
++}
++void vk_renderer_set_fmv_chroma_smoothing(int on) { s_fmv_chroma = on ? 1 : 0; }
++
++/* Nearest or linear for the final blit. Sharp-bilinear (mode 2) has no
++ * blit-only form, so it takes plain linear until the present gains a shader. */
++static VkFilter present_filter(int linear) {
++    if (s_display_scaling == 0) linear = 0;
++    else if (s_display_scaling == 1 || s_display_scaling == 2) linear = 1;
++    return linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++}
++
+ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
+                              int linear, int force_4_3) {
+     if (!s_ctx_ok) return 0;
+@@ -1745,7 +1789,7 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
+ 
+     VkOffset3D dst[2];
+     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
+-              force_4_3 ? 4 : 4, force_4_3 ? 3 : 3, dst);
++              force_4_3 ? 4 : s_aspect_num, force_4_3 ? 3 : s_aspect_den, dst);
+ 
+     VkImageBlit blit = {0};
+     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+@@ -1760,7 +1804,7 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
+     /* VRAM image is parked in TRANSFER_SRC_OPTIMAL. */
+     p_vkCmdBlitImage(cb, s_vram_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-                     1, &blit, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
++                     1, &blit, present_filter(linear));
+ 
+     finish_present(cb, sc, idx, fr);
+     perf_snapshot_present();
+@@ -1814,10 +1858,46 @@ static void cpres_cache_free(void) {
+ 
+ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
+                              int linear, int force_4_3) {
+-    (void)force_4_3;
+     if (!s_ctx_ok || !pixels || src_w <= 0 || src_h <= 0) { vk_renderer_present_blank(); return; }
+     flush_tex_batch(); flush_geometry(); gpu_sync();
+ 
++    /* This entry point IS the 24-bit path - main.cpp routes a frame here only
++     * when the display is in 24-bit mode, which means a movie (or the
++     * display-disabled clear, where the FMV rows below are harmless). That is
++     * the same signal the OpenGL present uses for its FMV handling
++     * (gl_renderer_set_present_fmv(depth24_frame)). force_4_3 is a DIFFERENT
++     * question - whether to pin the picture to 4:3 inside a widescreen window -
++     * and is false during a movie whenever the widescreen layer is stretching
++     * stills, so using it here left the crop and the chroma pass switched off
++     * for exactly the frames they exist for. */
++    const int is_fmv = 1;
++    if (is_fmv && s_fmv_chroma)
++        pixels = psx_fmv_chroma_smooth(pixels, src_w, src_h);
++    /* [video] fmv_filter picks the movie's own reconstruction and takes
++     * precedence over the general display-scaling choice, as it does on GL. */
++    VkFilter fmv_filt = (s_fmv_filter_cfg > 0)
++                            ? ((s_fmv_filter_cfg > 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST)
++                            : present_filter(linear);
++
++    /* Crop FMVs: trim the CRT overscan border and the black letterbox bands
++     * baked into the movie, then fit what is left at the aspect that region
++     * has on a 4:3 frame, so the picture keeps its pixel aspect (this is what
++     * the OpenGL present does). The band height comes from the title config
++     * ([video] fmv_letterbox_rows) rather than being detected per frame the
++     * way the OpenGL path can also do - GT2's movies are a fixed 24 rows, and
++     * a constant is exactly what stops the crop popping in and out. */
++    int fx0 = 0, fy0 = 0, fx1 = src_w, fy1 = src_h, fmv_region = 0;
++    if (is_fmv && s_fmv_crop > 0 && src_h >= 192 && src_w > 0 &&
++        s_fmv_crop * 2 < src_h / 2) {
++        const int band = s_fmv_band_seed;
++        const int ocx = (s_fmv_crop * src_w) / src_h;   /* 4/3 of the rows at 320x240 */
++        fx0 = ocx; fx1 = src_w - ocx;
++        fy0 = band > s_fmv_crop ? band : s_fmv_crop;
++        fy1 = src_h - (band > s_fmv_crop ? band : s_fmv_crop);
++        if (fx1 - fx0 >= 16 && fy1 - fy0 >= 16) fmv_region = 1;
++        else { fx0 = 0; fy0 = 0; fx1 = src_w; fy1 = src_h; }
++    }
++
+     if (s_cpres_w != src_w || s_cpres_h != src_h) {
+         p_vkQueueWaitIdle(s_queue);      /* old resources may be in flight */
+         cpres_cache_free();
+@@ -1854,9 +1934,20 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
+     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+ 
+     VkOffset3D dst[2];
+-    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height, 4, 3, dst);
++    /* Base aspect: pinned 4:3 for a movie, the display aspect otherwise. A
++     * cropped region is fitted at the aspect it would have on a screen of the
++     * base aspect showing the whole frame. */
++    const int base_num = force_4_3 ? 4 : s_aspect_num;
++    const int base_den = force_4_3 ? 3 : s_aspect_den;
++    if (fmv_region)
++        letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
++                  base_num * (fx1 - fx0) * src_h,
++                  base_den * src_w * (fy1 - fy0), dst);
++    else
++        letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
++                  base_num, base_den, dst);
+     /* Short GP1(07h) bands: letterbox inside the 4:3 rect (see GL present). */
+-    if (src_h > 0 && src_h < 240) {
++    if (!fmv_region && src_h > 0 && src_h < 240) {
+         int box_h = dst[1].y - dst[0].y;
+         int content_h = (box_h * src_h) / 240;
+         if (content_h < 1) content_h = 1;
+@@ -1866,11 +1957,12 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
+     }
+     VkImageBlit blit = {0};
+     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; blit.srcSubresource.layerCount = 1;
+-    blit.srcOffsets[1].x = src_w; blit.srcOffsets[1].y = src_h; blit.srcOffsets[1].z = 1;
++    blit.srcOffsets[0].x = fx0;   blit.srcOffsets[0].y = fy0;
++    blit.srcOffsets[1].x = fx1;   blit.srcOffsets[1].y = fy1; blit.srcOffsets[1].z = 1;
+     blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; blit.dstSubresource.layerCount = 1;
+     blit.dstOffsets[0] = dst[0]; blit.dstOffsets[1] = dst[1];
+     p_vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-                     1, &blit, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
++                     1, &blit, fmv_filt);
+     finish_present(cb, sc, idx, fr);
+ 
+     /* Cached resources are rewritten next frame: wait for this frame's copy +
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 0688f5f0..7a95b9a6 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1201,6 +1201,10 @@ static void apply_display_scaling_settings(void) {
+     gl_renderer_set_display_scaling(g_video_display_scaling);
+     gl_renderer_set_fmv_crop(g_video_fmv_crop);
+     gl_renderer_set_fmv_letterbox(g_video_fmv_letterbox_rows);
++    /* The same rows on the Vulkan present (no-ops without that backend). */
++    vk_renderer_set_display_scaling(g_video_display_scaling);
++    vk_renderer_set_fmv_crop(g_video_fmv_crop);
++    vk_renderer_set_fmv_letterbox(g_video_fmv_letterbox_rows);
+ #endif
+ }
+ 
+@@ -1818,6 +1822,7 @@ static void update_adaptive_widescreen() {
+     g_video_aspect_num = num;
+     g_video_aspect_den = den;
+     gl_renderer_set_display_aspect(num, den);
++    vk_renderer_set_display_aspect(num, den);
+     if (sdl_renderer) {
+         g_logical_w = 480 * num * g_video_scale / den;
+         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
+@@ -9042,6 +9047,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+          * right-edge jump the old comment describes is 0 with filtering on.
+          * Set video AA off to get nearest back. */
+         gl_renderer_set_fmv_filter(g_video_fmv_filter);
++        vk_renderer_set_fmv_filter(g_video_fmv_filter);
+         gl_renderer_set_present_fmv(depth24_frame ? 1 : 0);
+         gl_renderer_present(sdl_pixel_buf, src_w, src_h,
+                             g_video_aa ? 1 : 0,
+@@ -15263,6 +15269,7 @@ session_reboot:
+     gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
+     gl_renderer_set_texture_edge_blend(g_video_texfilter_edge);
+     gl_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
++    vk_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+     gl_renderer_set_post_processing(g_video_postfx);
+     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
+      * with both off every setter below leaves the tracking caches disabled and
+@@ -15315,6 +15322,7 @@ session_reboot:
+      * this aspect; native-wide fills it with a genuinely wider frame (no
+      * stretch), squash mode stretches the 4:3 frame into it. */
+     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
++    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
+          * the per-frame present path engages it at game entry. */
+@@ -16818,6 +16826,7 @@ soft_return_lobby:
+             gl_renderer_set_texture_filter_2d(g_video_texfilter_2d);
+     gl_renderer_set_texture_edge_blend(g_video_texfilter_edge);
+     gl_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
++    vk_renderer_set_fmv_chroma_smoothing(g_video_fmv_chroma);
+             gl_renderer_set_post_processing(g_video_postfx);
+             g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING

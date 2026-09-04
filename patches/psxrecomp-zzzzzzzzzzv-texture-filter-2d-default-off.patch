@@ -1,0 +1,42 @@
+From cce7faf3e7b8ee44c03a192e580e3de942031c4e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 4 Sep 2026 02:24:08 +0000
+Subject: [PATCH] Filter 2D elements defaults off
+
+The HUD, fonts and menu art are pixel art; filtering them was the legacy
+default only because the texture filter once had no 2D exclusion. A
+settings.toml that says true keeps it.
+---
+ recompiler/src/config_loader.h | 2 +-
+ runtime/src/main.cpp           | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 9d1b73da..a8d17e41 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1310,7 +1310,7 @@ struct UserSettings {
+     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
+     bool has_antialiasing   = false; bool antialiasing   = true;
+     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear,2=3point,3=trilinear,4=jinc2
+-    bool has_texture_filter_2d = false; bool texture_filter_2d = true; // filter 2D sprites/UI too
++    bool has_texture_filter_2d = false; bool texture_filter_2d = false; // filter 2D sprites/UI too (default off: HUD and fonts stay pixel-exact)
+     // texture_edge_blending: DuckStation's edge blending for the filtered
+     // modes (cutout coverage blends the edge). fmv_chroma_smoothing:
+     // DuckStation's 24-bit chroma smoothing on FMV frames.
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 1f85c4d1..11c5e3d7 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1224,7 +1224,7 @@ static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
+     return cfg_value + 1;
+ }
+ static int           g_video_texfilter = 0;
+-static int           g_video_texfilter_2d = 1;  /* filter 2D sprites/UI too (legacy on) */
++static int           g_video_texfilter_2d = 0;  /* filter 2D sprites/UI too; off unless settings.toml says so */
+ static int           g_video_texfilter_edge = 0;  /* [video] texture_edge_blending */
+ static int           g_video_fmv_chroma = 0;      /* [video] fmv_chroma_smoothing */
+ /* [video] hide_cursor_fullscreen: the mouse pointer is hidden while the window
+-- 
+2.43.0
+

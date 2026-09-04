@@ -1,0 +1,406 @@
+From 0c57bc7d528b03d3c9d3d642bf4c08a6c1f66ecc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 4 Sep 2026 02:18:17 +0000
+Subject: [PATCH] Hotkeys read from the shared config.ini; five controller
+ hotkeys; ui_scale gone
+
+The launcher writes [KeyMap] to shared_config_dir()/config.ini (the
+install root on a multi-disc install) while the runtime read the exe-dir
+copy first, so every hotkey edit on a multi-disc install was dead - the
+Switch disc key included. The shared file is read first now.
+Controller hotkeys beyond rewind / save states: Switch disc, F1 menu,
+Fullscreen, Fast-forward (hold), FPS readout - [hotkeys] switch_disc_pad
+etc., same encoding as rewind_pad, unbound by default; the Switch disc
+label is blanked on single-disc installs. The launcher ui_scale setting
+is removed (the launcher scales from the desktop height instead).
+---
+ recompiler/src/config_loader.cpp |  26 ++++---
+ recompiler/src/config_loader.h   |   7 +-
+ runtime/src/main.cpp             | 116 +++++++++++++++++++++++++++----
+ 3 files changed, 125 insertions(+), 24 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 1a83abf4..02223747 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2647,13 +2647,18 @@ UserSettings load_user_settings(const fs::path& path) {
+                 s.has_hotkey_pad_save_state_menu = true;
+             }
+         });
++        static const char* const k_extra_pad_keys[5] =
++            { "switch_disc_pad", "runtime_menu_pad", "fullscreen_pad", "turbo_pad", "display_perf_pad" };
++        for (int i = 0; i < 5; i++) {
++            if (!h.contains(k_extra_pad_keys[i])) continue;
++            try_get([&]{
++                const auto n = toml::find<int64_t>(h, k_extra_pad_keys[i]);
++                if (n == 0 || pad_bind_value_ok(n)) { s.hotkey_pad_extra[i] = (int)n; s.has_hotkey_pad_extra[i] = true; }
++            });
++        }
+     }
+     if (doc.contains("launcher")) {
+         const toml::value& l = toml::find(doc, "launcher");
+-        if (l.contains("ui_scale")) try_get([&]{
+-            const int v = toml::find<int>(l, "ui_scale");
+-            if (v >= 75 && v <= 200) { s.ui_scale = v; s.has_ui_scale = true; }
+-        });
+         if (l.contains("skip_launcher")) try_get([&]{
+             s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
+         });
+@@ -2918,13 +2923,20 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+         f << "frequency = " << s.audio_freq << "\n";
+     if (s.has_spu_hq)
+         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
+-    if (s.has_hotkey_pad_rewind || s.has_hotkey_pad_save_state_menu) {
++    bool any_extra = false;
++    for (int i = 0; i < 5; i++) any_extra = any_extra || s.has_hotkey_pad_extra[i];
++    if (s.has_hotkey_pad_rewind || s.has_hotkey_pad_save_state_menu || any_extra) {
+         f << "\n[hotkeys]\n";
+         if (s.has_hotkey_pad_rewind)
+             f << "rewind_pad = " << s.hotkey_pad_rewind << "\n";
+         if (s.has_hotkey_pad_save_state_menu)
+             f << "save_state_menu_pad = "
+               << s.hotkey_pad_save_state_menu << "\n";
++        static const char* const k_extra_pad_keys[5] =
++            { "switch_disc_pad", "runtime_menu_pad", "fullscreen_pad", "turbo_pad", "display_perf_pad" };
++        for (int i = 0; i < 5; i++)
++            if (s.has_hotkey_pad_extra[i])
++                f << k_extra_pad_keys[i] << " = " << s.hotkey_pad_extra[i] << "\n";
+     }
+     if (s.has_pgxp) {
+         f << "\n# PGXP knobs changed in the F1 menu (Advanced). Delete this section, or\n"
+@@ -2938,12 +2950,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+         b("depth", s.pgxp_depth);                 b("transparent_depth", s.pgxp_transparent_depth);
+         f << "tolerance = " << s.pgxp_tolerance << "\n";
+     }
+-    if (s.has_skip_launcher || s.has_ui_scale || (s.has_active_title && !s.active_title.empty())) {
++    if (s.has_skip_launcher || (s.has_active_title && !s.active_title.empty())) {
+         f << "\n[launcher]\n";
+         if (s.has_skip_launcher)
+             f << "skip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
+-        if (s.has_ui_scale)
+-            f << "ui_scale = " << s.ui_scale << "\n";
+         if (s.has_active_title && !s.active_title.empty())
+             f << "active_title = \"" << s.active_title << "\"\n";
+     }
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index b8a074eb..9d1b73da 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1371,8 +1371,6 @@ struct UserSettings {
+     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
+     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
+     bool has_skip_launcher  = false; bool skip_launcher  = false;
+-    // [launcher] ui_scale: launcher UI size in percent (75..200; 100 default).
+-    bool has_ui_scale       = false; int  ui_scale       = 100;
+     // [launcher] active_title — folder name of the sibling title the player
+     // last switched to in a multi-title install (titles/<name>/). Read by the
+     // root stub exe to decide which title to spawn; written by the runtime
+@@ -1409,6 +1407,11 @@ struct UserSettings {
+     float pgxp_tolerance = -1.0f;
+     bool has_hotkey_pad_rewind = false; int hotkey_pad_rewind = 1272; /* select+r3 */
+     bool has_hotkey_pad_save_state_menu = false; int hotkey_pad_save_state_menu = 2040; /* select+r1 */
++    // Further controller hotkeys ([hotkeys] *_pad, same encoding as rewind_pad:
++    // 1+button = Select + button, 1000+mask = chord, 0 = unbound). Order:
++    // switch_disc, runtime_menu, fullscreen, turbo, display_perf.
++    bool has_hotkey_pad_extra[5] = { false, false, false, false, false };
++    int  hotkey_pad_extra[5] = { 0, 0, 0, 0, 0 };
+     // [audio]
+     bool has_volume         = false; int  volume         = 100; // host mixer, 0..100
+     bool has_spu_hq         = false; bool spu_hq         = false;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index e783c87b..1f85c4d1 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1233,7 +1233,6 @@ static int           g_video_fmv_chroma = 0;      /* [video] fmv_chroma_smoothin
+  * from the main loop so every way of entering fullscreen - config, launcher,
+  * hotkey, F1 - is covered without each site having to remember. */
+ static int           g_hide_cursor_fullscreen = 1;
+-static int           g_launcher_ui_scale = 100;   /* [launcher] ui_scale, percent */
+ static void cursor_visibility_tick(SDL_Window* win, int menu_open) {
+     static int s_shown = -1;
+     if (!win) return;
+@@ -6418,8 +6417,17 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
+ enum {
+     PSX_ASSIST_BIND_REWIND = 0,
+     PSX_ASSIST_BIND_SAVE_STATE_MENU,
++    /* [hotkeys] *_pad extras, in UserSettings::hotkey_pad_extra order. */
++    PSX_ASSIST_BIND_SWITCH_DISC,
++    PSX_ASSIST_BIND_RUNTIME_MENU,
++    PSX_ASSIST_BIND_FULLSCREEN,
++    PSX_ASSIST_BIND_TURBO,
++    PSX_ASSIST_BIND_DISPLAY_PERF,
+     PSX_ASSIST_BIND_COUNT
+ };
++#define PSX_ASSIST_EXTRA_FIRST PSX_ASSIST_BIND_SWITCH_DISC
++#define PSX_ASSIST_EXTRA_COUNT 5
++static int g_hotkey_pad_extra[PSX_ASSIST_EXTRA_COUNT] = { 0, 0, 0, 0, 0 };   /* unbound */
+ 
+ #define PSX_HOTKEY_PAD_BUTTON(code) (1 + (int)(code))
+ #define PSX_HOTKEY_PAD_BUTTON_COMBO(mask) (1000 + (int)(mask))
+@@ -7713,6 +7721,52 @@ static void savestate_menu_poll_toggle_buttons(void) {
+     was_down = down;
+ }
+ 
++/* Controller hotkeys beyond rewind / save states: edge-triggered, same
++ * actions as the keyboard [KeyMap] rows. Fast-forward is a hold and is read
++ * where the keyboard turbo is (pad_turbo_hotkey_down). */
++static int  sibling_next_installed(void);
++static void fps_telemetry_toggle(void);
++static int pad_turbo_hotkey_down(void) {
++    return hotkey_pad_binding_down(g_hotkey_pad_extra[PSX_ASSIST_BIND_TURBO - PSX_ASSIST_EXTRA_FIRST]);
++}
++static void extra_pad_hotkeys_poll(void) {
++    static int was_down[PSX_ASSIST_EXTRA_COUNT];
++    for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++) {
++        const int down = hotkey_pad_binding_down(g_hotkey_pad_extra[i]);
++        const int edge = down && !was_down[i];
++        was_down[i] = down;
++        if (!edge) continue;
++        switch (PSX_ASSIST_EXTRA_FIRST + i) {
++        case PSX_ASSIST_BIND_SWITCH_DISC: {
++            const int t = sibling_next_installed();
++            if (t >= 0 && !psx_netplay_active() && g_f1_title_switch_target < 0) {
++                g_f1_title_switch_target = t;
++                host_osd_push("Switching disc...", 1800);
++            }
++            break;
++        }
++        case PSX_ASSIST_BIND_RUNTIME_MENU:
++            if (!psx_rewind_is_open() && !savestate_menu_open) runtime_settings_menu_toggle(0);
++            break;
++        case PSX_ASSIST_BIND_FULLSCREEN:
++            if (sdl_window) {
++                const Uint32 is_fs = SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN;
++                if (is_fs) { SDL_SetWindowFullscreen(sdl_window, 0); host_osd_push("Windowed", 1500); }
++                else {
++                    Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
++                    if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
++                    SDL_SetWindowFullscreen(sdl_window, target); host_osd_push("Fullscreen", 1500);
++                }
++            }
++            break;
++        case PSX_ASSIST_BIND_DISPLAY_PERF:
++            fps_telemetry_toggle();
++            break;
++        default: break;
++        }
++    }
++}
++
+ static void rewind_poll_nav(uint32_t now_ms) {
+     const Uint8 *keys = SDL_GetKeyboardState(NULL);
+     int left = keys[SDL_SCANCODE_LEFT] ? 1 : 0;
+@@ -8243,6 +8297,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         }
+         savestate_menu_poll_toggle_buttons();
+         rewind_poll_toggle_buttons();
++        extra_pad_hotkeys_poll();
+         cursor_visibility_tick(sdl_window, runtime_settings_menu_open);
+         psx_rewind_note_frame();
+         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
+@@ -8447,8 +8502,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         const Uint8* keys = SDL_GetKeyboardState(NULL);
+         static int turbo_skip = 0;
+         static int turbo_was_down = 0;
+-        if (host_hotkey_input_focused() &&
+-            host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {
++        if ((host_hotkey_input_focused() &&
++             host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) ||
++            pad_turbo_hotkey_down()) {
+             const int mult = manual_fast_forward_multiplier();
+             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
+             manual_turbo_active = true;
+@@ -12464,9 +12520,16 @@ namespace {
+         "OpenGL (Recommended)",
+         "Vulkan",
+     };
+-    static const char* const kPsxHostShortcutLabels[] = {
++    /* Controller hotkey labels (PSX_ASSIST_BIND_* order). "Switch disc" is
++     * blanked on single-disc installs; the launcher skips NULL labels. */
++    static const char* kPsxHostShortcutLabels[] = {
+         "Rewind",
+         "Save states",
++        "Switch disc",
++        "F1 menu",
++        "Fullscreen",
++        "Fast-forward",
++        "FPS readout",
+     };
+ 
+     void ae_rui_set_sidecar_paths(const char* argv0) {
+@@ -12518,6 +12581,8 @@ namespace {
+         gi->renderer_labels = kPsxRendererLabels;
+         gi->num_renderers = vulkan_offered_b ? 3 : 2;
+         gi->settings_bindings = 1;
++        kPsxHostShortcutLabels[PSX_ASSIST_BIND_SWITCH_DISC] =
++            (g_sibling_active >= 0 && g_sibling_titles.size() > 1) ? "Switch disc" : nullptr;
+         gi->assist_binding_labels = kPsxHostShortcutLabels;
+         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
+         gi->has_skip_fmv = skip_fmv_offered_b ? 1 : 0;
+@@ -13467,7 +13532,6 @@ int main(int argc, char** argv) {
+         if (us.has_texture_edge_blending) g_video_texfilter_edge = us.texture_edge_blending ? 1 : 0;
+         if (us.has_fmv_chroma_smoothing)  g_video_fmv_chroma = us.fmv_chroma_smoothing ? 1 : 0;
+         if (us.has_hide_cursor_fullscreen) g_hide_cursor_fullscreen = us.hide_cursor_fullscreen ? 1 : 0;
+-        if (us.has_ui_scale) g_launcher_ui_scale = us.ui_scale;
+         if (us.has_pgxp) g_pgxp_user = us;   /* the [pgxp] block; applied after mod activation */
+         if (us.has_post_processing) g_video_postfx = us.post_processing;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+@@ -13514,6 +13578,9 @@ int main(int argc, char** argv) {
+             g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
+                 us.hotkey_pad_save_state_menu,
+                 PSX_HOTKEY_PAD_SELECT_R1);
++        for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++)
++            if (us.has_hotkey_pad_extra[i])
++                g_hotkey_pad_extra[i] = normalize_hotkey_pad_binding(us.hotkey_pad_extra[i], 0);
+         if (us.has_bios_path && !bios_from_cli && !us.bios_path.empty()) {
+             settings_bios_storage = us.bios_path.string();
+             bios_path = settings_bios_storage.c_str();
+@@ -13993,7 +14060,6 @@ int main(int argc, char** argv) {
+             seed.texture_edge_blending = (g_video_texfilter_edge != 0); seed.has_texture_edge_blending = true;
+             seed.fmv_chroma_smoothing  = (g_video_fmv_chroma != 0);     seed.has_fmv_chroma_smoothing = true;
+             seed.hide_cursor_fullscreen = (g_hide_cursor_fullscreen != 0); seed.has_hide_cursor_fullscreen = true;
+-            seed.ui_scale = g_launcher_ui_scale; seed.has_ui_scale = true;
+             pgxp_user_stamp(seed);
+             seed.post_processing = g_video_postfx;        seed.has_post_processing = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
+@@ -14028,6 +14094,9 @@ int main(int argc, char** argv) {
+             seed.has_hotkey_pad_rewind = true;
+             seed.hotkey_pad_save_state_menu = g_hotkey_pad_save_state_menu;
+             seed.has_hotkey_pad_save_state_menu = true;
++            for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++) {
++                seed.hotkey_pad_extra[i] = g_hotkey_pad_extra[i]; seed.has_hotkey_pad_extra[i] = true;
++            }
+             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
+             if (has_netplay_player_name) {
+                 seed.netplay_player_name = netplay_player_name;
+@@ -14198,7 +14267,6 @@ int main(int argc, char** argv) {
+             ls.texture_edge_blend = seed.texture_edge_blending ? 1 : 0;
+             ls.fmv_chroma         = seed.fmv_chroma_smoothing ? 1 : 0;
+             ls.hide_cursor_fs     = seed.hide_cursor_fullscreen ? 1 : 0;
+-            ls.ui_scale           = seed.has_ui_scale ? seed.ui_scale : 100;
+             ls.post_processing    = seed.post_processing;
+             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+@@ -14220,6 +14288,9 @@ int main(int argc, char** argv) {
+             ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU] =
+                 normalize_hotkey_pad_binding(seed.hotkey_pad_save_state_menu,
+                     PSX_HOTKEY_PAD_SELECT_R1);
++            for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++)
++                ls.assist_pad_bind[PSX_ASSIST_EXTRA_FIRST + i] =
++                    normalize_hotkey_pad_binding(seed.hotkey_pad_extra[i], 0);
+             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
+             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
+             /* Localization: index of resolved_language within lang_menu_options
+@@ -14471,7 +14542,6 @@ int main(int argc, char** argv) {
+                 seed.has_fmv_chroma_smoothing = true;
+                 seed.hide_cursor_fullscreen = ls.hide_cursor_fs != 0;
+                 seed.has_hide_cursor_fullscreen = true;
+-                if (ls.ui_scale >= 75 && ls.ui_scale <= 200) { seed.ui_scale = ls.ui_scale; seed.has_ui_scale = true; }
+                 seed.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                 seed.has_post_processing = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -14551,6 +14621,11 @@ int main(int argc, char** argv) {
+                     ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
+                     PSX_HOTKEY_PAD_SELECT_R1);
+                 seed.has_hotkey_pad_save_state_menu = true;
++                for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++) {
++                    seed.hotkey_pad_extra[i] = normalize_hotkey_pad_binding(
++                        ls.assist_pad_bind[PSX_ASSIST_EXTRA_FIRST + i], 0);
++                    seed.has_hotkey_pad_extra[i] = true;
++                }
+                 seed.auto_skip_fmv = ls.auto_skip_fmv != 0;
+                 seed.has_auto_skip_fmv = skip_fmv_offered;
+                 seed.turbo_loads = ls.turbo_loads != 0;
+@@ -14701,7 +14776,6 @@ int main(int argc, char** argv) {
+                         qs.has_fmv_chroma_smoothing = true;
+                         qs.hide_cursor_fullscreen = ls.hide_cursor_fs != 0;
+                         qs.has_hide_cursor_fullscreen = true;
+-                        if (ls.ui_scale >= 75 && ls.ui_scale <= 200) { qs.ui_scale = ls.ui_scale; qs.has_ui_scale = true; }
+                         qs.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                         qs.has_post_processing = true;
+                         qs.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -14803,7 +14877,6 @@ int main(int argc, char** argv) {
+                 if (seed.has_texture_edge_blending) g_video_texfilter_edge = seed.texture_edge_blending ? 1 : 0;
+                 if (seed.has_fmv_chroma_smoothing)  g_video_fmv_chroma = seed.fmv_chroma_smoothing ? 1 : 0;
+                 if (seed.has_hide_cursor_fullscreen) g_hide_cursor_fullscreen = seed.hide_cursor_fullscreen ? 1 : 0;
+-                if (seed.has_ui_scale) g_launcher_ui_scale = seed.ui_scale;
+                 g_video_postfx = seed.post_processing;
+                 g_video_fmv_filter = seed.fmv_filter;
+                 if (seed.has_display_scaling) g_video_display_scaling = seed.display_scaling;
+@@ -14834,6 +14907,8 @@ int main(int argc, char** argv) {
+                 g_hotkey_pad_save_state_menu = seed.has_hotkey_pad_save_state_menu
+                     ? seed.hotkey_pad_save_state_menu
+                     : PSX_HOTKEY_PAD_SELECT_R1;
++                for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++)
++                    if (seed.has_hotkey_pad_extra[i]) g_hotkey_pad_extra[i] = seed.hotkey_pad_extra[i];
+                 skip_launcher_setting = seed.skip_launcher;
+                 if (seed.has_bios_path) {
+                     settings_bios_storage = seed.bios_path.string();
+@@ -15959,9 +16034,17 @@ session_reboot:
+      * launcher edit made before config_path was wired still applies. */
+     {
+         namespace fs = std::filesystem;
++        /* The launcher edits [KeyMap] in shared_config_dir()/config.ini (the
++         * install root on a multi-disc install, where settings.toml lives);
++         * read THAT first - the exe-dir copy is only a single-build fallback.
++         * Reading the exe dir first left every hotkey edit on a multi-disc
++         * install dead (the rows saved fine and nothing changed in-game). */
++        const fs::path shared_cfg = shared_config_dir(argv[0]) / "config.ini";
+         const fs::path exe_cfg = exe_dir_from_argv(argv[0]) / "config.ini";
+         std::error_code ec;
+-        if (fs::is_regular_file(exe_cfg, ec)) {
++        if (fs::is_regular_file(shared_cfg, ec)) {
++            host_keymap_load(shared_cfg.string().c_str());
++        } else if (fs::is_regular_file(exe_cfg, ec)) {
+             host_keymap_load(exe_cfg.string().c_str());
+         } else if (fs::is_regular_file(fs::path("config.ini"), ec)) {
+             host_keymap_load("config.ini");
+@@ -16339,7 +16422,6 @@ soft_return_lobby:
+         ls.texture_edge_blend = g_video_texfilter_edge;
+         ls.fmv_chroma = g_video_fmv_chroma;
+         ls.hide_cursor_fs = g_hide_cursor_fullscreen;
+-        ls.ui_scale = g_launcher_ui_scale;
+         ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+         ls.display_scaling = g_video_display_scaling >= 0 ? cfg_display_scaling_to_launcher(g_video_display_scaling) : 0;
+@@ -16364,6 +16446,9 @@ soft_return_lobby:
+             normalize_hotkey_pad_binding(
+                 g_hotkey_pad_save_state_menu,
+                 PSX_HOTKEY_PAD_SELECT_R1);
++        for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++)
++            ls.assist_pad_bind[PSX_ASSIST_EXTRA_FIRST + i] =
++                normalize_hotkey_pad_binding(g_hotkey_pad_extra[i], 0);
+         ls.aspect_index = (g_video_aspect_num * 9 == g_video_aspect_den * 21) ? 2
+             : (g_video_aspect_num == 16 && g_video_aspect_den == 9) ? 1 : 0;
+         ls.language_index = 0;
+@@ -16637,7 +16722,6 @@ soft_return_lobby:
+                 us.has_fmv_chroma_smoothing = true;
+                 us.hide_cursor_fullscreen = ls.hide_cursor_fs != 0;
+                 us.has_hide_cursor_fullscreen = true;
+-                if (ls.ui_scale >= 75 && ls.ui_scale <= 200) { us.ui_scale = ls.ui_scale; us.has_ui_scale = true; }
+                 us.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                 us.has_post_processing = true;
+                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -16674,6 +16758,11 @@ soft_return_lobby:
+                     ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
+                     PSX_HOTKEY_PAD_SELECT_R1);
+                 us.has_hotkey_pad_save_state_menu = true;
++                for (int i = 0; i < PSX_ASSIST_EXTRA_COUNT; i++) {
++                    us.hotkey_pad_extra[i] = normalize_hotkey_pad_binding(
++                        ls.assist_pad_bind[PSX_ASSIST_EXTRA_FIRST + i], 0);
++                    us.has_hotkey_pad_extra[i] = true;
++                }
+                 us.auto_skip_fmv = ls.auto_skip_fmv != 0;
+                 us.has_auto_skip_fmv = skip_fmv_offered;
+                 us.turbo_loads = ls.turbo_loads != 0;
+@@ -16709,7 +16798,6 @@ soft_return_lobby:
+             g_video_texfilter_edge = ls.texture_edge_blend ? 1 : 0;
+             g_video_fmv_chroma = ls.fmv_chroma ? 1 : 0;
+             g_hide_cursor_fullscreen = ls.hide_cursor_fs ? 1 : 0;
+-            if (ls.ui_scale >= 75 && ls.ui_scale <= 200) g_launcher_ui_scale = ls.ui_scale;
+             g_video_postfx = (ls.post_processing == 1) ? 1 : 0;
+             /* Re-apply live: the boot-time renderer apply already ran, so an
+              * in-game Apply must push the filter family down itself or the
+-- 
+2.43.0
+

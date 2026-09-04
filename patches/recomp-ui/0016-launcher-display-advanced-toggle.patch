@@ -1,0 +1,318 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 41b21d5..98c27d6 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -2530,6 +2530,17 @@ void draw_shader_row(LauncherModel* m, const LauncherTheme& th, float col_w = 0.
+     ImGui::EndDisabled();
+ }
+ 
++// Sub-heading inside a card body: groups the advanced Display rows (PICTURE /
++// MOVIES / WINDOW & PRESENTATION / REWIND) so the expanded list reads as four
++// short sections instead of one wall of rows. Lighter than eyebrow() on
++// purpose — no accent tick, no letter-spacing — because the card already has
++// an eyebrow and a second one at the same weight would compete with it.
++void adv_group(const char* s, const LauncherTheme& th) {
++    ImGui::Dummy(ImVec2(0, px(7)));
++    ImGui::TextColored(col(th.accent2), "%s", ui_text(s));
++    ImGui::Dummy(ImVec2(0, px(1)));
++}
++
+ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+     eyebrow("DISPLAY");
+     /* Settings presets - every row below in one click. Not the Mods page's
+@@ -2641,10 +2652,16 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+     }
+ 
+     // ---- deeper PSX-style surface, capability-gated per control -----------
+-    // Order matches the original PSX launcher: Window size, Renderer,
+-    // Supersampling, Aspect ratio, Texture filtering, Antialiasing, Screen
+-    // model, Frame interpolation (+Presentation target), Skip FMVs, Turbo
+-    // loads, Fullscreen.
++    // Two tiers. The simple view is what a player who picked a preset should
++    // ever need: the window, how much of the GPU to spend (Supersampling) and
++    // whether textures are filtered. Everything else — the renderer included,
++    // since the fallback makes a wrong pick harmless and the right pick is
++    // platform-specific — sits behind "Show advanced settings", grouped so the
++    // full list reads as four short sections rather than eighteen loose rows.
++    // The toggle is session-only UI state: it is not a game setting and is not
++    // persisted, so the launcher always opens in the calm view.
++    const bool adv = m->show_advanced_display;
++
+     if (m->has_window_size) {
+         row_label("Window size", th);
+         if (ImGui::Button(ui_text(launcher_model_window_size_label(m)), ImVec2(px(150), px(30))))
+@@ -2657,6 +2674,15 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         ImGui::PopID();
+     }
+ 
++    // Universal fullscreen row (every console — no longer gated on the
++    // vestigial has_fullscreen_toggle). Tri-state cycle replaces the old
++    // binary checkbox so Exclusive mode is reachable again.
++    row_label("Fullscreen", th);
++    ImGui::PushID("fullscreen");
++    if (ImGui::Button(ui_text(launcher_model_fullscreen_label(m)), ImVec2(px(120), px(30))))
++        launcher_model_cycle_fullscreen(m);
++    ImGui::PopID();
++
+     // NES module rows can appear on this branch too (has_renderer puts NES
+     // on the deep surface): integer scaling right under the window row,
+     // mirroring the legacy branch's ordering.
+@@ -2666,12 +2692,6 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         if (ImGui::Checkbox("##intscale", &is)) launcher_model_toggle_integer_scale(m);
+     }
+ 
+-    if (m->has_renderer) {
+-        row_label("Renderer", th);
+-        if (ImGui::Button(ui_text(launcher_model_renderer_label(m)), ImVec2(px(220), px(30))))
+-            launcher_model_toggle_renderer(m);
+-    }
+-
+     // Promoted mod-feature rows (GameInfo.featured_mod_rows): the headline
+     // enhancement toggles ("Frame rate") as plain settings rows, backed by
+     // the same provider as the Mods page. Unavailable rows (wrong disc /
+@@ -2707,34 +2727,9 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         }
+     }
+ 
+-    // Universal fullscreen row (every console — no longer gated on the
+-    // vestigial has_fullscreen_toggle). Tri-state cycle replaces the old
+-    // binary checkbox so Exclusive mode is reachable again.
+-    row_label("Fullscreen", th);
+-    ImGui::PushID("fullscreen");
+-        if (ImGui::Button(ui_text(launcher_model_fullscreen_label(m)), ImVec2(px(120), px(30))))
+-        launcher_model_cycle_fullscreen(m);
+-    ImGui::PopID();
+-    row_label("Hide cursor in fullscreen", th);
+-    ImGui::PushID("hide_cursor_fs");
+-    {
+-        bool hc = m->s.hide_cursor_fs != 0;
+-        if (ImGui::Checkbox("##hide_cursor_fs", &hc))
+-            launcher_model_toggle_hide_cursor_fs(m);
+-        if (ImGui::IsItemHovered())
+-            ImGui::SetTooltip("%s", ui_text("Hides the mouse pointer while the game is fullscreen "
+-                                            "(borderless or exclusive). The F1 menu shows it again."));
+-    }
+-    ImGui::PopID();
+-    if (m->num_display_layouts > 0) {
+-        row_label("Screen layout", th);
+-        ImGui::PushID("screen_layout");
+-        if (ImGui::Button(ui_text(launcher_model_display_layout_label(m)),
+-                          ImVec2(px(180), px(30))))
+-            launcher_model_cycle_display_layout(m);
+-        ImGui::PopID();
+-    }
+-
++    /* Texture filtering is the one picture row a player is likely to want
++     * without leaving the preset behind, so it stays simple; its two
++     * refinements (2D elements, edge blending) are advanced. */
+     if (m->has_sharp_filter) {
+         row_label("Scaling filter", th);
+         if (ImGui::Button(ui_text(launcher_model_scaling_filter_label(m)),
+@@ -2744,6 +2739,40 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         row_label("Texture filtering", th);
+         if (ImGui::Button(ui_text(launcher_model_texture_filter_label(m)), ImVec2(px(120), px(30))))
+             launcher_model_toggle_texture_filter(m);
++    } else {
++        row_label("Linear filtering", th);
++        bool filter = m->s.linear_filter != 0;
++        if (ImGui::Checkbox("##filter", &filter)) launcher_model_toggle_filter(m);
++    }
++
++    // ---- the gate -------------------------------------------------------
++    ImGui::Dummy(ImVec2(0, px(4)));
++    {
++        bool show_adv = m->show_advanced_display;
++        if (ImGui::Checkbox(ui_text("Show advanced settings"), &show_adv))
++            m->show_advanced_display = show_adv;
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("%s", ui_text("The rest of the renderer's controls. The Original and "
++                                            "Enhanced presets already set these; open them only if "
++                                            "you want to tune something yourself."));
++    }
++    if (!adv) return;
++
++    // ---- advanced ---------------------------------------------------------
++    adv_group("PICTURE", th);
++
++    if (m->has_renderer) {
++        row_label("Renderer", th);
++        if (ImGui::Button(ui_text(launcher_model_renderer_label(m)), ImVec2(px(220), px(30))))
++            launcher_model_toggle_renderer(m);
++        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
++            ImGui::SetTooltip("%s", ui_text("Which graphics API draws the game. OpenGL is the "
++                                            "default everywhere; Vulkan is the better path on a "
++                                            "Steam Deck. A machine with no driver for the pick "
++                                            "falls back to OpenGL by itself."));
++    }
++
++    if (m->has_texture_filter && !m->has_sharp_filter) {
+         row_label("Filter 2D elements", th);
+         ImGui::PushID("texfilter2d");
+         bool f2d = m->s.texture_filter_2d != 0;
+@@ -2765,10 +2794,6 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+                                   "hard texel outline.");
+         }
+         ImGui::PopID();
+-    } else {
+-        row_label("Linear filtering", th);
+-        bool filter = m->s.linear_filter != 0;
+-        if (ImGui::Checkbox("##filter", &filter)) launcher_model_toggle_filter(m);
+     }
+ 
+     if (m->has_antialiasing) {
+@@ -2802,6 +2827,54 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         ImGui::PopID();
+     }
+ 
++    if (m->has_affine_filter) {
++        row_label("Affine background smoothing", th);
++        bool affine = m->s.affine_filter != 0;
++        if (ImGui::Checkbox("##affine_filter", &affine))
++            launcher_model_toggle_affine_filter(m);
++    }
++
++    draw_shader_row(m, th);
++
++    if (m->has_geometry_precision) {
++        // Geometry correction deliberately draws NO row. It moves vertices, and
++        // the runtime can only recover the sub-pixel original for ~5% of them
++        // (93% of lookups are ambiguous), so a corrected triangle meets an
++        // uncorrected neighbour and their shared edge splits open. Measured on
++        // Ape Escape; see psxrecomp ENHANCEMENTS.md G1.8/G1.9. The setting stays
++        // in the ABI and remains readable from game.toml/settings.toml so the
++        // work is still testable, exactly as has_turbo_loads/Settings.turbo_loads
++        // stayed after their row was dropped — it simply has no control.
++        //
++        // Perspective textures are unaffected by that problem: they only change
++        // UV interpolation inside a polygon whose provenance is already proven,
++        // so no vertex moves and adjacent polygons cannot disagree about an edge.
++        row_label("Perspective textures", th);
++        bool persp = m->s.perspective_texturing != 0;
++        if (ImGui::Checkbox("##persptex", &persp))
++            launcher_model_toggle_perspective_texturing(m);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Interpolates textures with perspective, which "
++                              "stops large floors and walls from warping as the "
++                              "camera moves.\n\nApplied only to polygons the "
++                              "runtime can prove came from the 3D pipeline, so "
++                              "2D art and menus are left alone.");
++    }
++
++    if (m->has_screen_kind) {
++        row_label("Screen model", th);
++        // Wide enough for the longest label ("Super Game Boy (No Border)");
++        // shorter models (e.g. "DMG") center within the same fixed box.
++        if (ImGui::Button(ui_text(launcher_model_screen_kind_label(m)), ImVec2(px(220), px(30))))
++            launcher_model_cycle_screen_kind(m);
++    }
++
++    /* ---- movies ---------------------------------------------------------
++     * The three rows that only touch decoded video: distinct from the
++     * rasterizer's own filtering above, and the right answer differs. */
++    if (m->has_fmv_crop || m->has_fmv_filter || m->has_skip_fmv)
++        adv_group("MOVIES", th);
++
+     /* Crop FMVs: drop the letterbox rows inside the movie frame + CRT overscan. */
+     if (m->has_fmv_crop) {
+         row_label("Crop FMVs", th);
+@@ -2854,46 +2927,34 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         ImGui::PopID();
+     }
+ 
+-    if (m->has_affine_filter) {
+-        row_label("Affine background smoothing", th);
+-        bool affine = m->s.affine_filter != 0;
+-        if (ImGui::Checkbox("##affine_filter", &affine))
+-            launcher_model_toggle_affine_filter(m);
++    if (m->has_skip_fmv) {
++        row_label("Skip FMVs", th);
++        bool sk = m->s.auto_skip_fmv != 0;
++        if (ImGui::Checkbox("##skipfmv", &sk)) launcher_model_toggle_skip_fmv(m);
+     }
+ 
+-    draw_shader_row(m, th);
++    /* ---- window & presentation ------------------------------------------ */
++    adv_group("WINDOW & PRESENTATION", th);
+ 
+-    if (m->has_geometry_precision) {
+-        // Geometry correction deliberately draws NO row. It moves vertices, and
+-        // the runtime can only recover the sub-pixel original for ~5% of them
+-        // (93% of lookups are ambiguous), so a corrected triangle meets an
+-        // uncorrected neighbour and their shared edge splits open. Measured on
+-        // Ape Escape; see psxrecomp ENHANCEMENTS.md G1.8/G1.9. The setting stays
+-        // in the ABI and remains readable from game.toml/settings.toml so the
+-        // work is still testable, exactly as has_turbo_loads/Settings.turbo_loads
+-        // stayed after their row was dropped — it simply has no control.
+-        //
+-        // Perspective textures are unaffected by that problem: they only change
+-        // UV interpolation inside a polygon whose provenance is already proven,
+-        // so no vertex moves and adjacent polygons cannot disagree about an edge.
+-        row_label("Perspective textures", th);
+-        bool persp = m->s.perspective_texturing != 0;
+-        if (ImGui::Checkbox("##persptex", &persp))
+-            launcher_model_toggle_perspective_texturing(m);
++    row_label("Hide cursor in fullscreen", th);
++    ImGui::PushID("hide_cursor_fs");
++    {
++        bool hc = m->s.hide_cursor_fs != 0;
++        if (ImGui::Checkbox("##hide_cursor_fs", &hc))
++            launcher_model_toggle_hide_cursor_fs(m);
+         if (ImGui::IsItemHovered())
+-            ImGui::SetTooltip("Interpolates textures with perspective, which "
+-                              "stops large floors and walls from warping as the "
+-                              "camera moves.\n\nApplied only to polygons the "
+-                              "runtime can prove came from the 3D pipeline, so "
+-                              "2D art and menus are left alone.");
++            ImGui::SetTooltip("%s", ui_text("Hides the mouse pointer while the game is fullscreen "
++                                            "(borderless or exclusive). The F1 menu shows it again."));
+     }
++    ImGui::PopID();
+ 
+-    if (m->has_screen_kind) {
+-        row_label("Screen model", th);
+-        // Wide enough for the longest label ("Super Game Boy (No Border)");
+-        // shorter models (e.g. "DMG") center within the same fixed box.
+-        if (ImGui::Button(ui_text(launcher_model_screen_kind_label(m)), ImVec2(px(220), px(30))))
+-            launcher_model_cycle_screen_kind(m);
++    if (m->num_display_layouts > 0) {
++        row_label("Screen layout", th);
++        ImGui::PushID("screen_layout");
++        if (ImGui::Button(ui_text(launcher_model_display_layout_label(m)),
++                          ImVec2(px(180), px(30))))
++            launcher_model_cycle_display_layout(m);
++        ImGui::PopID();
+     }
+ 
+     // Frame interpolation is only meaningful under OpenGL (Software has no
+@@ -2927,13 +2988,8 @@ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+         }
+     }
+ 
+-    if (m->has_skip_fmv) {
+-        row_label("Skip FMVs", th);
+-        bool sk = m->s.auto_skip_fmv != 0;
+-        if (ImGui::Checkbox("##skipfmv", &sk)) launcher_model_toggle_skip_fmv(m);
+-    }
+-
+     if (m->has_rewind_depth) {
++        adv_group("REWIND", th);
+         row_label("Rewind", th);
+         bool rewind_on = m->s.rewind_enabled != 0;
+         if (ImGui::Checkbox("##rewind_enabled", &rewind_on))
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 57e243f..2a460a7 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -479,6 +479,12 @@ typedef struct {
+     bool      has_default_settings;
+ 
+     // ---- transient UI state ----
++    /* Display settings: "Show advanced settings". Session-only by design —
++     * it is a view state, not a game setting, so it is absent from
++     * RecompLauncherCSettings and never persisted. The launcher always opens
++     * on the calm six-row view; a player who went digging last run is not
++     * dropped back into eighteen rows. */
++    bool      show_advanced_display;
+     LngView   view;
+     LngAction action;
+     int       cfg_player;            // 0..LNG_MAX_PLAYERS-1 — which player the Controller view edits

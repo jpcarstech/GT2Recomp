@@ -1,0 +1,156 @@
+From a6c6357bca57492bc119fb58ad5477cf8a41d7e4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:12:05 +0000
+Subject: [PATCH] [video] fmv_letterbox_rows: per-title seed for fmv_crop's
+ letterbox-band removal
+
+The band estimate starts empty at every movie start and after every fade
+to black (15 rejected frames clear the history), so a movie that opens on
+a small logo over black is presented uncropped until its first accepted
+frame and drops back to uncropped through each fade: the present rect
+pops between 4:3-minus-overscan and the band-cropped picture (GT2: 138
+frames at boot and 22 in the logo-to-intro gap). With a title-supplied
+seed the band is the seed whenever the history is empty and never rises
+above it; accepted frames can only lower it. GT2 (24 rows) presents one
+rect from the first FMV frame through the intro.
+---
+ recompiler/src/config_loader.cpp  |  7 +++++++
+ recompiler/src/config_loader.h    |  8 ++++++++
+ runtime/include/gpu_gl_renderer.h |  4 ++++
+ runtime/src/gpu_gl_renderer.c     | 23 +++++++++++++++++++----
+ runtime/src/main.cpp              |  5 +++++
+ 5 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 209cd70a..d9fe3b3c 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -726,6 +726,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+                     "[video] fmv_filter must be \"nearest\", \"bilinear\", "
+                     "\"sharp\" or \"bicubic\": {}", mode));
+         }
++        if (video.contains("fmv_letterbox_rows")) {
++            const auto rows = toml::find<int>(video, "fmv_letterbox_rows");
++            if (rows < 0 || rows > 59)
++                throw std::runtime_error(fmt::format(
++                    "[video] fmv_letterbox_rows must be 0..59 (native rows per side): {}", rows));
++            rt.video_fmv_letterbox_rows = rows;
++        }
+         if (video.contains("renderer")) {
+             const auto mode = toml::find<std::string>(video, "renderer");
+             if (mode == "software")     rt.video_renderer = 0;
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 901b8bf9..46528285 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -493,6 +493,14 @@ struct RuntimeConfig {
+     //               overall sharpness at the nearest level
+     int                   video_fmv_filter = VIDEO_FMV_FILTER_DEFAULT;
+ 
++    // fmv_letterbox_rows: native black rows at the top and bottom of the
++    // title's movies (0 = none known). With the user's fmv_crop on, the
++    // renderer removes letterbox bands it detects per frame; this seeds that
++    // estimate so the crop is in place from the first frame and holds through
++    // fades to black, instead of switching on after the first bright frame and
++    // dropping out after every fade. Detected bands can only lower it.
++    int                   video_fmv_letterbox_rows = 0;
++
+     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
+     // rasterizer/present backend. The software rasterizer remains the explicit
+     // fallback. Stored as VIDEO_RENDERER_*.
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 2b5ed1b7..31004a8e 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -125,6 +125,10 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
+ void gl_renderer_set_display_scaling(int mode);
+ /* [video] fmv_crop: native rows trimmed top/bottom of an FMV frame (0 = off). */
+ void gl_renderer_set_fmv_crop(int native_rows);
++/* Title [video] fmv_letterbox_rows: known letterbox band (native rows per side)
++ * seeding fmv_crop's band removal so the crop is static across fades (0 = detect only). */
++void gl_renderer_set_fmv_letterbox(int native_rows);
++int  gl_renderer_get_fmv_letterbox(void);
+ /* Marks the next CPU present as a 24-bit (FMV) frame; fmv_crop applies only
+  * to those, pinned or not. Cleared after each gl_renderer_present. */
+ void gl_renderer_set_present_fmv(int is_fmv);
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index c2d04778..b3a82a80 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3749,7 +3749,7 @@ void gl_renderer_set_present_fmv(int is_fmv) { s_present_is_fmv = is_fmv ? 1 : 0
+ 
+ /* Letterbox-band removal (part of fmv_crop). Many PS1 movies are authored
+  * wider than 4:3 and padded to the 240-line frame with pure-black rows (GT2:
+- * the Polyphony logo has 24 black rows top and bottom, the intro 28). Those
++ * the Polyphony logo and the intro both have 24 black rows top and bottom). Those
+  * rows are part of the picture data, so a fixed overscan trim never reaches
+  * them and the movie kept a black band above and below in the window.
+  * Detect them per frame - a row is black when every channel of every pixel
+@@ -3771,8 +3771,21 @@ void gl_renderer_set_present_fmv(int is_fmv) { s_present_is_fmv = is_fmv ? 1 : 0
+  *     within a second, while a cut to a taller picture applies immediately;
+  *   - 15 consecutive rejected frames (a fade to black between movies) or a
+  *     gap in FMV presents clear the history, so the next movie starts fresh
+- *     instead of inheriting the previous one's bands. */
++ *     instead of inheriting the previous one's bands.
++ *
++ * [video] fmv_letterbox_rows (per title, 0 = off): a known band height that
++ * seeds the estimate. Without it the first accepted frame of a movie - and
++ * the first after every fade to black clears the history - is what switches
++ * the band on, so a movie that opens on a small logo over black (GT2) is
++ * presented uncropped for a second and then jumps, and does so again after
++ * each fade. With a seed the band is the seed whenever the history is empty
++ * and never exceeds it; accepted frames can only lower it (a movie with less
++ * band than the seed still keeps all of its picture). The rect is therefore
++ * static from the first FMV frame, through fades and into the next movie. */
+ #define FMV_BAND_HIST 60
++static int      s_fmv_band_seed = 0;
++void gl_renderer_set_fmv_letterbox(int native_rows) { s_fmv_band_seed = native_rows < 0 ? 0 : native_rows; }
++int  gl_renderer_get_fmv_letterbox(void)            { return s_fmv_band_seed; }
+ static int      s_fmv_band_hist[FMV_BAND_HIST];
+ static int      s_fmv_band_n = 0, s_fmv_band_idx = 0, s_fmv_band_rejects = 0;
+ static uint64_t s_fmv_band_last_frame = 0;
+@@ -3802,8 +3815,10 @@ static void fmv_letterbox_bands(const uint32_t *px, int w, int h, int *top, int
+     } else if (++s_fmv_band_rejects >= 15) {
+         s_fmv_band_n = 0; s_fmv_band_idx = 0;      /* between movies */
+     }
+-    if (s_fmv_band_n == 0) return;
+-    int m = h;
++    int seed = s_fmv_band_seed;
++    if (seed >= lim) seed = lim - 1;              /* a seed must leave a picture */
++    if (s_fmv_band_n == 0 && seed <= 0) return;
++    int m = seed > 0 ? seed : h;
+     for (int i = 0; i < s_fmv_band_n; i++)
+         if (s_fmv_band_hist[i] < m) m = s_fmv_band_hist[i];
+     *top = m; *bot = m;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index d85af2b0..82d899e7 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1191,12 +1191,16 @@ static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
+  * 2 sharp) and fmv_crop (native rows trimmed top/bottom of an FMV frame). */
+ static int           g_video_display_scaling = -1;
+ static int           g_video_fmv_crop = 0;
++/* Title config [video] fmv_letterbox_rows: known letterbox band of the
++ * title's movies, seeding fmv_crop's band removal (0 = detect only). */
++static int           g_video_fmv_letterbox_rows = 0;
+ static void apply_display_scaling_settings(void) {
+ #ifndef PSX_SDL_NO_RENDER
+     if (g_video_display_scaling >= 0)
+         g_video_aa = (g_video_display_scaling != 0);
+     gl_renderer_set_display_scaling(g_video_display_scaling);
+     gl_renderer_set_fmv_crop(g_video_fmv_crop);
++    gl_renderer_set_fmv_letterbox(g_video_fmv_letterbox_rows);
+ #endif
+ }
+ 
+@@ -12921,6 +12925,7 @@ int main(int argc, char** argv) {
+             g_video_aa         = gc.runtime.video_antialiasing;
+             g_video_texfilter  = gc.runtime.video_texture_filter;
+             g_video_fmv_filter = gc.runtime.video_fmv_filter;
++            g_video_fmv_letterbox_rows = gc.runtime.video_fmv_letterbox_rows;
+             g_video_geometry_correction   =
+                 gc.runtime.video_geometry_correction ? 1 : 0;
+             g_video_perspective_texturing =
+-- 
+2.43.0
+

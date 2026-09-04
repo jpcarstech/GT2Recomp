@@ -17,7 +17,7 @@ set -euo pipefail
 # GitHub checkout (a release being prepared, a stale clone) downgraded itself
 # to the older script on the first run and then failed in that script's terms,
 # with no exe and no hint that the newer script had ever been there.
-GT2_LB_VERSION=4
+GT2_LB_VERSION=5
 GAME_DIR="${1:?usage: local_build.sh <game folder> [source checkout]}"
 GITHUB_URL="${GT2RECOMP_GIT_URL:-https://github.com/jpcarstech/GT2Recomp.git}"
 
@@ -99,6 +99,12 @@ fi
 echo "== 2/8 framework patches =="
 cd "$SRC/psxrecomp"
 git checkout -q . 2>/dev/null || true
+# Patches that ADD files (the ported texture-filter shaders, a tool) leave
+# those files untracked after a previous run; `git checkout .` does not
+# remove them and the next run's `git apply --check` then refuses the patch
+# ("already exists in working directory"). Drop untracked files before
+# applying - ignored ones (recompiler/build, generated/) are untouched.
+git clean -fdq 2>/dev/null || true
 # ORDER MATTERS: upstream/ first, then the carried psxrecomp-* set in byte
 # (LC_ALL=C) order - the order the stack is generated and tested in. A failed
 # apply is fatal: a build silently missing a patch is indistinguishable from
@@ -133,6 +139,7 @@ if [ "$_patch_fail" != "0" ]; then
 fi
 cd "$SRC/recomp-ui"
 git checkout -q . 2>/dev/null || true
+git clean -fdq 2>/dev/null || true
 _apply_sorted "$SRC"/patches/recomp-ui/*.patch
 if [ "$_patch_fail" != "0" ]; then
     echo "*** The launcher patch did NOT apply; stopping." >&2
@@ -381,6 +388,14 @@ for _t in "${TITLES[@]}"; do
     cp -f "$_built" "$D/GT2 $_label.exe"
     rm -rf "$D/assets"
     cp -rf "$TDIR/build/assets" "$D/"
+    # Launcher box art: the disc's own title screen (GT2.VOL, arcade/
+    # title_*.tim), ripped from the player's dump - never shipped with the
+    # project. Missing art just leaves the launcher's placeholder card.
+    if "$PY" "$SRC/tools/rip_gt2_title_art.py" "${DISC_BIN[$_t]}" "$D/assets/img/boxart.tga" >/dev/null 2>&1; then
+        echo "  $_t: launcher art ripped from $(basename "${DISC_BIN[$_t]}")"
+    else
+        echo "  $_t: no launcher art (could not read the title screen from the disc)"
+    fi
     # Runtime config. Never overwrite a player's tuned copy; leave the fresh
     # one beside it instead. __DISC_CUE__ becomes the player's own cue name.
     _cue_base=$(basename "${DISC_CUE[$_t]}")

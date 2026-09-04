@@ -1,0 +1,250 @@
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 51e5633..1c20b04 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -173,10 +173,7 @@ namespace {
+ // controls), so keep all layout tokens in logical units. Fonts are logical-
+ // sized as well; the renderer scales their atlas with the framebuffer.
+ // (Ported from launcher_ng's "Fix launcher DPI layout and text alignment".)
+-// User UI scale (Settings: "UI scale"): multiplies every layout token; the
+-// fonts and ImGui style are rebuilt at the same factor (apply_scale).
+-float g_ui_scale = 1.0f;
+-float  px(float logical) { return logical * g_ui_scale; }
++float  px(float logical) { return logical; }
+ ImVec4 col(const LngColor& c) { return ImVec4(c.r, c.g, c.b, c.a); }
+ // g_th moved to external linkage above the anonymous namespace (see note).
+ 
+@@ -601,7 +598,7 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
+     io.Fonts->Clear();
+     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 2;
+     (void)scale;   // DPI is handled by the framebuffer scale, not by re-scaling layout/fonts
+-    const float body = th.font_body * g_ui_scale;   // user UI scale does apply
++    const float body = th.font_body;
+     // Cover Basic Latin + Latin-1 AND General Punctuation so em/en dashes and
+     // curly quotes used in the game notes render as glyphs, not "?" tofu.
+     static const ImWchar kRanges[] = {
+@@ -700,7 +697,6 @@ void apply_scale(const LauncherTheme& th, float scale, const char* font_path,
+ #else
+     style.Colors[ImGuiCol_NavHighlight]    = col(th.focus_ring);
+ #endif
+-    if (g_ui_scale != 1.0f) style.ScaleAllSizes(g_ui_scale);
+     ImGui::GetStyle() = style;
+ }
+ 
+@@ -2529,6 +2525,27 @@ void draw_shader_row(LauncherModel* m, const LauncherTheme& th, float col_w = 0.
+ 
+ void draw_display_controls(LauncherModel* m, const LauncherTheme& th) {
+     eyebrow("DISPLAY");
++    /* Settings presets - every row below in one click. Not the Mods page's
++     * presets: these are picture settings only (resolution, filtering, FMV
++     * treatment), the PlayStation's own look or a modern one. */
++    if (any_deep_display(m)) {
++        row_label("Presets", th);
++        ImGui::PushID("display_presets");
++        if (ImGui::Button(ui_text("Original"), ImVec2(px(110), px(30))))
++            launcher_model_apply_display_preset(m, 0);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("%s", ui_text("How the PlayStation drew it: native resolution, no texture "
++                                            "filtering, raw pixels, movies as decoded."));
++        ImGui::SameLine(0.0f, px(8.0f));
++        if (ImGui::Button(ui_text("Enhanced"), ImVec2(px(110), px(30))))
++            launcher_model_apply_display_preset(m, 1);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("%s", ui_text("A modern setup: 4x supersampling, JINC2 texture filtering "
++                                            "with edge blending, FXAA, bilinear scaling, cropped and "
++                                            "bicubic-scaled movies with chroma smoothing."));
++        ImGui::PopID();
++        ImGui::Dummy(ImVec2(0, px(4)));
++    }
+ 
+     if (!any_deep_display(m)) {
+         // ---- legacy minimal surface (SNES/NES etc.) — aligned label grid -------
+@@ -3676,6 +3693,7 @@ void draw_assist_binding_editor(LauncherModel* m, const LauncherTheme& th,
+         int count = m->assist_binding_count;
+         if (action_limit > 0 && count > action_limit) count = action_limit;
+         for (int action = 0; action < count; ++action) {
++            if (!m->assist_binding_labels[action]) continue;   /* blanked by the host */
+             ImGui::PushID(action);
+             ImGui::TableNextRow();
+             ImGui::TableSetColumnIndex(0);
+@@ -3713,17 +3731,19 @@ void draw_assist_binding_editor(LauncherModel* m, const LauncherTheme& th,
+ void draw_controller_assist_shortcuts(LauncherModel* m,
+                                       const LauncherTheme& th) {
+     ImGui::PushStyleColor(ImGuiCol_Text, col(th.accent2));
+-    ImGui::TextUnformatted(m->has_assist_tools ? "ASSIST SHORTCUTS" : "HOST SHORTCUTS");
++    ImGui::TextUnformatted(m->has_assist_tools ? "ASSIST SHORTCUTS" : "CONTROLLER HOTKEYS");
+     ImGui::PopStyleColor();
+     ImGui::SameLine();
+     ImGui::TextColored(col(th.text_muted),
+                        m->has_assist_tools
+                            ? "(global; requires Assist Tools)"
+-                           : "(button chords supported)");
++                           : "(a single button means Select + that button; chords supported)");
+     if (ImGui::BeginTable("controller_assist_binds", 2,
+                           ImGuiTableFlags_SizingStretchSame)) {
+-        for (int action = 0;
+-             action < m->assist_binding_count && action < 2; ++action) {
++        for (int action = 0; action < m->assist_binding_count; ++action) {
++            /* A NULL label is a hotkey this install has no use for (the host
++             * blanks "Switch disc" on single-disc installs). */
++            if (!m->assist_binding_labels[action]) continue;
+             ImGui::TableNextColumn();
+             ImGui::PushID(action);
+             ImGui::AlignTextToFramePadding();
+@@ -7838,18 +7858,6 @@ void draw_footer(LauncherModel* m, const LauncherTheme& th, float footer_h) {
+         ImGui::SetCursorScreenPos(ImVec2(origin.x, cta_y + (play_h - ImGui::GetFrameHeight()) * 0.5f));
+         if (ImGui::Checkbox(ui_text("Skip launcher on boot"), &skip))
+             launcher_model_request_skip_toggle(m);
+-        // UI scale: the whole launcher (layout tokens, fonts, style) scales
+-        // by this percentage; applied live, persisted with the settings.
+-        ImGui::SameLine(0.0f, px(24.0f));
+-        ImGui::AlignTextToFramePadding();
+-        ImGui::TextColored(col(th.text_muted), "%s", ui_text("UI scale"));
+-        ImGui::SameLine(0.0f, px(8.0f));
+-        ImGui::SetNextItemWidth(px(160.0f));
+-        int pct = m->s.ui_scale > 0 ? m->s.ui_scale : 100;
+-        if (ImGui::SliderInt("##ui_scale", &pct, 75, 200, "%d%%"))
+-            launcher_model_set_ui_scale(m, pct);
+-        if (ImGui::IsItemHovered())
+-            ImGui::SetTooltip("%s", ui_text("Drag to make the launcher larger or smaller."));
+     } else if (m->view == LNG_VIEW_SETTINGS &&
+                launcher_model_can_restore_defaults(m)) {
+         ImGui::SetCursorScreenPos(
+@@ -9791,10 +9799,6 @@ extern "C" LngAction launcher_backend_run(LauncherPlatform* p,
+         } while (SDL_PollEvent(&ev));
+ 
+         launcher_platform_refresh_metrics(p);
+-        {
+-            const float want_ui = (m->s.ui_scale > 0 ? (float)m->s.ui_scale : 100.0f) / 100.0f;
+-            if (want_ui != g_ui_scale) { g_ui_scale = want_ui; applied_scale = 0.0f; }
+-        }
+         if (applied_scale != p->display_scale) {
+             apply_scale(*th, p->display_scale, font_path.c_str(),
+                         jp_font_path.c_str(), symbols_font_path.c_str(),
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index f81d4b3..5dcf0d8 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -626,7 +626,6 @@ void launcher_model_init(LauncherModel* m,
+     if (m->has_texture_filter) m->s.texture_edge_blend = m->s.texture_edge_blend ? 1 : 0;
+     if (m->has_fmv_crop) m->s.fmv_chroma = m->s.fmv_chroma ? 1 : 0;
+     m->s.hide_cursor_fs = m->s.hide_cursor_fs ? 1 : 0;
+-    if (m->s.ui_scale != 0) m->s.ui_scale = clampi((m->s.ui_scale / 5) * 5, 75, 200);
+     if (m->has_antialiasing) m->s.post_processing = (m->s.post_processing == 1) ? 1 : 0;
+     /* 0 = unset (a host predating the field): seed the default rather than
+      * letting a memset pin the least useful value. */
+@@ -1646,18 +1645,38 @@ void launcher_model_toggle_fmv_chroma(LauncherModel* m) {
+     m->s.fmv_chroma = !m->s.fmv_chroma;
+ }
+ 
+-void launcher_model_toggle_hide_cursor_fs(LauncherModel* m) {
++/* Settings presets (not mod presets): every Display row set to how the
++ * PlayStation drew the game (Original) or to a modern setup (Enhanced).
++ * Mod-owned rows (PGXP, widescreen) are left to the Mods page. */
++void launcher_model_apply_display_preset(LauncherModel* m, int enhanced) {
+     if (!m) return;
+-    m->s.hide_cursor_fs = !m->s.hide_cursor_fs;
++    if (m->has_supersampling)   m->s.supersampling   = enhanced ? 4 : 1;
++    if (m->has_antialiasing)    m->s.antialiasing    = enhanced ? 1 : 0;
++    if (m->has_texture_filter) {
++        m->s.texture_filter     = enhanced ? 4 : 0;          /* JINC2 / nearest */
++        m->s.texture_filter_2d  = 0;
++        m->s.texture_edge_blend = enhanced ? 1 : 0;
++        m->s.post_processing    = enhanced ? 1 : 0;          /* FXAA */
++    }
++    if (m->has_display_scaling)
++        m->s.display_scaling = enhanced ? RECOMP_LAUNCHER_DISPLAY_SCALING_BILINEAR
++                                        : RECOMP_LAUNCHER_DISPLAY_SCALING_NEAREST;
++    if (m->has_fmv_crop) {
++        m->s.fmv_crop   = enhanced ? 2 : 1;                   /* 2 on, 1 off */
++        m->s.fmv_chroma = enhanced ? 1 : 0;
++    }
++    if (m->has_fmv_filter)
++        m->s.fmv_filter = enhanced ? RECOMP_LAUNCHER_FMV_FILTER_BICUBIC
++                                   : RECOMP_LAUNCHER_FMV_FILTER_NEAREST;
++    if (m->has_screen_kind)     m->s.screen_kind = 0;         /* raw pixels either way */
+ }
+ 
+-void launcher_model_set_ui_scale(LauncherModel* m, int percent) {
++void launcher_model_toggle_hide_cursor_fs(LauncherModel* m) {
+     if (!m) return;
+-    if (percent < 75) percent = 75;
+-    if (percent > 200) percent = 200;
+-    m->s.ui_scale = (percent / 5) * 5;
++    m->s.hide_cursor_fs = !m->s.hide_cursor_fs;
+ }
+ 
++
+ void launcher_model_cycle_post_processing(LauncherModel* m) {
+     /* Present-time post-process AA: far cheaper than MSAA (one shader pass
+      * over the final frame). Off <-> FXAA. */
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 6542a48..57e243f 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -778,7 +778,7 @@ void launcher_model_toggle_texture_filter_2d(LauncherModel* m); // filter 2D spr
+ void launcher_model_toggle_texture_edge_blend(LauncherModel* m); // DuckStation edge blending
+ void launcher_model_toggle_fmv_chroma(LauncherModel* m);         // 24-bit chroma smoothing (FMV)
+ void launcher_model_toggle_hide_cursor_fs(LauncherModel* m);     // hide pointer in fullscreen
+-void launcher_model_set_ui_scale(LauncherModel* m, int percent);  // 75..200, step 5
++void launcher_model_apply_display_preset(LauncherModel* m, int enhanced); // Settings: Original / Enhanced
+ void launcher_model_cycle_post_processing(LauncherModel* m);    // Off/FXAA
+ const char* launcher_model_post_processing_label(const LauncherModel* m);
+ const char* launcher_model_texture_filter_label(const LauncherModel* m);
+diff --git a/src/common/launcher_platform_sdl2.c b/src/common/launcher_platform_sdl2.c
+index 9f8980f..5dbd046 100644
+--- a/src/common/launcher_platform_sdl2.c
++++ b/src/common/launcher_platform_sdl2.c
+@@ -228,14 +228,13 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+             if (dpi_scale > s) s = dpi_scale;
+         }
+     }
+-    // Resolution fallback: a 4K/5K desktop at 100% OS scaling reports 96 dpi
+-    // and renders the UI unreadably small. Derive a scale from the desktop
+-    // height instead (1080p == 1.0), capped at 3.
++    // Resolution-derived scale at 100% OS scaling: designed for a 1080p
++    // desktop; 1440p gets 1.33x, 4K 2x (capped at 3) - see the SDL3 platform.
+     if (s <= 1.001f) {
+         int rdisp = SDL_GetWindowDisplayIndex(p->window);
+         SDL_DisplayMode dm;
+         if (rdisp >= 0 && SDL_GetDesktopDisplayMode(rdisp, &dm) == 0 &&
+-            dm.h >= 1600) {
++            dm.h > 1100) {
+             s = (float)dm.h / 1080.0f;
+             if (s > 3.0f) s = 3.0f;
+         }
+diff --git a/src/common/launcher_platform_sdl3.c b/src/common/launcher_platform_sdl3.c
+index f0a2a13..851d4ca 100644
+--- a/src/common/launcher_platform_sdl3.c
++++ b/src/common/launcher_platform_sdl3.c
+@@ -153,13 +153,14 @@ void launcher_platform_refresh_metrics(LauncherPlatform* p) {
+     float s = SDL_GetWindowDisplayScale(p->window);
+     if (s <= 0.0f) s = 1.0f;
+ 
+-    // Resolution fallback: a 4K/5K desktop at 100% OS scaling reports scale
+-    // 1.0 and renders the UI unreadably small. Derive a scale from the
+-    // desktop height instead (1080p == 1.0), capped at 3.
++    // Resolution-derived scale at 100% OS scaling: the launcher is designed
++    // for a 1080p desktop; a 1440p desktop gets 1.33x, 4K 2x (capped at 3),
++    // so it takes the same share of the screen everywhere instead of
++    // shrinking as monitors grow. OS scaling above 100% already grows it.
+     if (s <= 1.001f) {
+         const SDL_DisplayMode* dm =
+             SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(p->window));
+-        if (dm && dm->h >= 1600) {
++        if (dm && dm->h > 1100) {
+             s = (float)dm->h / 1080.0f;
+             if (s > 3.0f) s = 3.0f;
+         }
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 0d30413..76d1687 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -554,7 +554,6 @@ struct RecompLauncherCSettings {
+     int  texture_edge_blend;  // bool: DuckStation edge blending for the filtered modes (cutout coverage blends the edge)
+     int  fmv_chroma;          // bool: DuckStation 24-bit chroma smoothing on FMV frames
+     int  hide_cursor_fs;      // bool: hide the mouse pointer while the game window is fullscreen
+-    int  ui_scale;            // launcher UI scale in percent (0 = unset = 100); 75..200
+     int  post_processing;     // present post-process: 0 = off, 1 = FXAA (host may extend)
+     int  screen_kind;         // 0 raw, 1 CRT, 2 composite, 3 trinitron
+     int  frame_interp;        // bool

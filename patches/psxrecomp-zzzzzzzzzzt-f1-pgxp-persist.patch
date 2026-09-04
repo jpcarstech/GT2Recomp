@@ -1,0 +1,232 @@
+From 06b5d5788f8546402c603d5e1ef552f0c4221642 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 4 Sep 2026 01:28:46 +0000
+Subject: [PATCH] F1 PGXP rows persist (settings.toml [pgxp]); Reset row last
+ and forgets them
+
+The Advanced rows used to be session-only: the PGXP mod's activation put
+the shipped defaults back at every boot. Now any change is written to a
+[pgxp] section of settings.toml and applied at boot after the mod's
+activation, so it wins; every settings write (F1 save, launcher launch,
+launcher quit) stamps the section back in. "Reset PGXP to GT2 defaults"
+moves to the bottom of the section, restores the shipped values, and
+drops the section so the title follows the mod again (actions do not
+auto-save, so it saves explicitly).
+---
+ recompiler/src/config_loader.cpp | 26 +++++++++++++
+ recompiler/src/config_loader.h   |  9 +++++
+ runtime/src/main.cpp             | 64 ++++++++++++++++++++++++++++++--
+ 3 files changed, 96 insertions(+), 3 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 9012a187..1a83abf4 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -2617,6 +2617,20 @@ UserSettings load_user_settings(const fs::path& path) {
+             s.spu_hq = toml::find<bool>(a, "spu_hq"); s.has_spu_hq = true;
+         });
+     }
++    if (doc.contains("pgxp")) {
++        const toml::value& g = toml::find(doc, "pgxp");
++        auto b = [&](const char* k, bool& dst) {
++            if (g.contains(k)) try_get([&]{ dst = toml::find<bool>(g, k); s.has_pgxp = true; });
++        };
++        b("geometry", s.pgxp_geometry);       b("texture", s.pgxp_texture);
++        b("culling", s.pgxp_culling);         b("preserve", s.pgxp_preserve);
++        b("color", s.pgxp_color);             b("disable_2d", s.pgxp_disable_2d);
++        b("vertex_cache", s.pgxp_vertex_cache); b("cpu_mode", s.pgxp_cpu_mode);
++        b("depth", s.pgxp_depth);             b("transparent_depth", s.pgxp_transparent_depth);
++        if (g.contains("tolerance")) try_get([&]{
++            s.pgxp_tolerance = (float)toml::find<double>(g, "tolerance"); s.has_pgxp = true;
++        });
++    }
+     if (doc.contains("hotkeys")) {
+         const toml::value& h = toml::find(doc, "hotkeys");
+         if (h.contains("rewind_pad")) try_get([&]{
+@@ -2912,6 +2926,18 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+             f << "save_state_menu_pad = "
+               << s.hotkey_pad_save_state_menu << "\n";
+     }
++    if (s.has_pgxp) {
++        f << "\n# PGXP knobs changed in the F1 menu (Advanced). Delete this section, or\n"
++             "# use \"Reset PGXP to GT2 defaults\" there, to follow the PGXP mod again.\n"
++             "[pgxp]\n";
++        auto b = [&](const char* k, bool v) { f << k << " = " << (v ? "true" : "false") << "\n"; };
++        b("geometry", s.pgxp_geometry);           b("texture", s.pgxp_texture);
++        b("culling", s.pgxp_culling);             b("preserve", s.pgxp_preserve);
++        b("color", s.pgxp_color);                 b("disable_2d", s.pgxp_disable_2d);
++        b("vertex_cache", s.pgxp_vertex_cache);   b("cpu_mode", s.pgxp_cpu_mode);
++        b("depth", s.pgxp_depth);                 b("transparent_depth", s.pgxp_transparent_depth);
++        f << "tolerance = " << s.pgxp_tolerance << "\n";
++    }
+     if (s.has_skip_launcher || s.has_ui_scale || (s.has_active_title && !s.active_title.empty())) {
+         f << "\n[launcher]\n";
+         if (s.has_skip_launcher)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index ea5f7812..b8a074eb 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1398,6 +1398,15 @@ struct UserSettings {
+     bool has_rewind_interval = false; int rewind_interval = 15;
+     // [hotkeys] controller-only host shortcuts. Values use recomp-ui's
+     // RECOMP_LAUNCHER_PAD_* encoding (0 = unbound, 1+button, 100+axis).
++    // [pgxp]: the F1 menu's Advanced rows, persisted. Present only after the
++    // player changed one; applied after the PGXP mod's activation so it
++    // overrides the mod's shipped defaults, and dropped again by "Reset PGXP
++    // to GT2 defaults" so the title follows the mod once more.
++    bool  has_pgxp = false;
++    bool  pgxp_geometry = true, pgxp_texture = true, pgxp_culling = true, pgxp_preserve = true;
++    bool  pgxp_color = false, pgxp_disable_2d = false, pgxp_vertex_cache = false, pgxp_cpu_mode = false;
++    bool  pgxp_depth = false, pgxp_transparent_depth = false;
++    float pgxp_tolerance = -1.0f;
+     bool has_hotkey_pad_rewind = false; int hotkey_pad_rewind = 1272; /* select+r3 */
+     bool has_hotkey_pad_save_state_menu = false; int hotkey_pad_save_state_menu = 2040; /* select+r1 */
+     // [audio]
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 0581a827..e783c87b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -6636,6 +6636,50 @@ static int pgxp_tolerance_index(void) {
+     }
+     return best;
+ }
++/* Persistence of the Advanced rows: the [pgxp] section of settings.toml.
++ * g_pgxp_user holds what the file said (or, after an edit, what the engine
++ * now runs); g_pgxp_user.has_pgxp false = no section = the PGXP mod's shipped
++ * defaults rule. Applied at boot AFTER the mod's activation so it wins, and
++ * every settings write stamps it back in so the launcher's saves keep it. */
++static PSXRecompV4::UserSettings g_pgxp_user;
++static void pgxp_user_capture_engine(void) {
++    g_pgxp_user.has_pgxp = true;
++    g_pgxp_user.pgxp_geometry = gte_geometry_correction_enabled() != 0;
++    g_pgxp_user.pgxp_texture = gpu_texture_correction_enabled() != 0;
++    g_pgxp_user.pgxp_culling = gte_pgxp_culling_enabled() != 0;
++    g_pgxp_user.pgxp_preserve = gte_preserve_proj_enabled() != 0;
++    g_pgxp_user.pgxp_color = gpu_pgxp_color_correction() != 0;
++    g_pgxp_user.pgxp_tolerance = pgxp_tolerance();
++    g_pgxp_user.pgxp_disable_2d = gpu_pgxp_disable_2d() != 0;
++    g_pgxp_user.pgxp_vertex_cache = pgxp_vertex_cache() != 0;
++    g_pgxp_user.pgxp_cpu_mode = pgxp_cpu_mode() != 0;
++    g_pgxp_user.pgxp_depth = gpu_pgxp_depth_enabled() != 0;
++    g_pgxp_user.pgxp_transparent_depth = gpu_pgxp_depth_transparent() != 0;
++}
++static void pgxp_user_apply_engine(void) {
++    if (!g_pgxp_user.has_pgxp) return;
++    gte_geometry_correction_set(g_pgxp_user.pgxp_geometry);
++    gpu_texture_correction_set(g_pgxp_user.pgxp_texture);
++    gte_pgxp_culling_set(g_pgxp_user.pgxp_culling);
++    gte_preserve_proj_set(g_pgxp_user.pgxp_preserve);
++    gpu_pgxp_color_correction_set(g_pgxp_user.pgxp_color);
++    pgxp_set_tolerance(g_pgxp_user.pgxp_tolerance);
++    gpu_pgxp_disable_2d_set(g_pgxp_user.pgxp_disable_2d);
++    pgxp_set_vertex_cache(g_pgxp_user.pgxp_vertex_cache);
++    pgxp_set_cpu_mode(g_pgxp_user.pgxp_cpu_mode);
++    gpu_pgxp_depth_set(g_pgxp_user.pgxp_depth);
++    gpu_pgxp_depth_transparent_set(g_pgxp_user.pgxp_transparent_depth);
++}
++static void pgxp_user_stamp(PSXRecompV4::UserSettings& s) {
++    s.has_pgxp = g_pgxp_user.has_pgxp;
++    if (!s.has_pgxp) return;
++    s.pgxp_geometry = g_pgxp_user.pgxp_geometry;   s.pgxp_texture = g_pgxp_user.pgxp_texture;
++    s.pgxp_culling = g_pgxp_user.pgxp_culling;     s.pgxp_preserve = g_pgxp_user.pgxp_preserve;
++    s.pgxp_color = g_pgxp_user.pgxp_color;         s.pgxp_tolerance = g_pgxp_user.pgxp_tolerance;
++    s.pgxp_disable_2d = g_pgxp_user.pgxp_disable_2d; s.pgxp_vertex_cache = g_pgxp_user.pgxp_vertex_cache;
++    s.pgxp_cpu_mode = g_pgxp_user.pgxp_cpu_mode;   s.pgxp_depth = g_pgxp_user.pgxp_depth;
++    s.pgxp_transparent_depth = g_pgxp_user.pgxp_transparent_depth;
++}
+ static int pgxp_ui_get(const char *key, int *out) {
+     if (std::strcmp(key, kPgxpGeometry) == 0)    *out = gte_geometry_correction_enabled() ? 1 : 0;
+     else if (std::strcmp(key, kPgxpTexture) == 0)     *out = gpu_texture_correction_enabled() ? 1 : 0;
+@@ -6666,6 +6710,7 @@ static void pgxp_ui_reset_to_gt2_defaults(void) {
+     pgxp_set_cpu_mode(0);
+     gpu_pgxp_depth_set(0);
+     gpu_pgxp_depth_transparent_set(0);
++    g_pgxp_user.has_pgxp = false;   /* no [pgxp] section: the mod's defaults rule again */
+ }
+ static int pgxp_ui_set(const char *key, int v) {
+     if (std::strcmp(key, kPgxpGeometry) == 0) {
+@@ -6686,6 +6731,7 @@ static int pgxp_ui_set(const char *key, int v) {
+     else if (std::strcmp(key, kPgxpDepth) == 0)       gpu_pgxp_depth_set(v != 0);
+     else if (std::strcmp(key, kPgxpTransDepth) == 0)  gpu_pgxp_depth_transparent_set(v != 0);
+     else return 0;
++    pgxp_user_capture_engine();
+     return 1;
+ }
+ 
+@@ -6811,6 +6857,7 @@ static void runtime_ui_save(void*) {
+     }
+     settings.fmv_crop = g_video_fmv_crop;
+     settings.has_fmv_crop = true;
++    pgxp_user_stamp(settings);
+     if (!PSXRecompV4::save_user_settings(g_runtime_settings_path, settings))
+         host_osd_push("Settings changed live but could not be saved", 2200);
+ }
+@@ -7024,6 +7071,8 @@ static int runtime_ui_run_action(void *opaque,
+     }
+     if (std::strcmp(item->key, kPgxpReset) == 0) {
+         pgxp_ui_reset_to_gt2_defaults();
++        runtime_ui_save(nullptr);   /* actions do not auto-save; drop [pgxp] now */
++        host_osd_push("PGXP back to GT2 defaults", 1500);
+         return 1;
+     }
+     if (std::strcmp(item->key, kRuntimeDiscTitleSwitch) == 0) {
+@@ -7146,9 +7195,6 @@ static void runtime_settings_ui_ensure_created(void) {
+          * mod_builtin_pgxp.c) so nobody needs this page; it exists for
+          * people who want to see what each knob does, and the reset row
+          * below puts everything back. */
+-        { kPgxpReset, "Advanced", "Reset PGXP to GT2 defaults",
+-          "Back to the shipped, lab-verified configuration",
+-          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
+         { kPgxpGeometry, "Advanced", "PGXP: geometry correction",
+           "Sub-pixel vertices from the GTE shadow. GT2 default: on",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+@@ -7182,6 +7228,12 @@ static void runtime_settings_ui_ensure_created(void) {
+         { kPgxpTransDepth, "Advanced", "PGXP: depth buffer, transparent",
+           "Also Z-test semi-transparent polys. GT2 default: off",
+           RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
++        /* Last on purpose: the rows above persist across launches
++         * (settings.toml [pgxp]); this one puts them back and stops
++         * persisting them. */
++        { kPgxpReset, "Advanced", "Reset PGXP to GT2 defaults",
++          "Back to the shipped, lab-verified configuration (and forget these edits)",
++          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr },
+     };
+ 
+     /* Multi-title installs: append the disc-switch rows after the static
+@@ -13416,6 +13468,7 @@ int main(int argc, char** argv) {
+         if (us.has_fmv_chroma_smoothing)  g_video_fmv_chroma = us.fmv_chroma_smoothing ? 1 : 0;
+         if (us.has_hide_cursor_fullscreen) g_hide_cursor_fullscreen = us.hide_cursor_fullscreen ? 1 : 0;
+         if (us.has_ui_scale) g_launcher_ui_scale = us.ui_scale;
++        if (us.has_pgxp) g_pgxp_user = us;   /* the [pgxp] block; applied after mod activation */
+         if (us.has_post_processing) g_video_postfx = us.post_processing;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+         if (us.has_display_scaling) g_video_display_scaling = us.display_scaling;
+@@ -13941,6 +13994,7 @@ int main(int argc, char** argv) {
+             seed.fmv_chroma_smoothing  = (g_video_fmv_chroma != 0);     seed.has_fmv_chroma_smoothing = true;
+             seed.hide_cursor_fullscreen = (g_hide_cursor_fullscreen != 0); seed.has_hide_cursor_fullscreen = true;
+             seed.ui_scale = g_launcher_ui_scale; seed.has_ui_scale = true;
++            pgxp_user_stamp(seed);
+             seed.post_processing = g_video_postfx;        seed.has_post_processing = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
+             if (g_video_display_scaling >= 0) { seed.display_scaling = g_video_display_scaling; seed.has_display_scaling = true; }
+@@ -14669,6 +14723,7 @@ int main(int argc, char** argv) {
+                         qs.skip_launcher = ls.skip_launcher != 0;
+                         qs.has_skip_launcher = true;
+                         stamp_active_title(qs);
++                        pgxp_user_stamp(qs);
+                         if (!PSXRecompV4::save_user_settings(sp, qs))
+                             std::fprintf(stderr,
+                                 "psxrecomp: WARNING: settings.toml save failed on "
+@@ -15160,6 +15215,9 @@ session_reboot:
+         if (!g_mod_owns_pgxp_tolerance)
+             pgxp_set_tolerance(g_video_pgxp_tolerance);
+     }
++    /* The player's own F1 Advanced choices, saved in settings.toml [pgxp],
++     * override the mod's shipped defaults until "Reset PGXP to GT2 defaults". */
++    pgxp_user_apply_engine();
+     if (g_video_geometry_correction || g_video_perspective_texturing) {
+         std::fprintf(stdout,
+                      "psxrecomp: geometry correction %s, perspective texturing %s%s\n",
+-- 
+2.43.0
+

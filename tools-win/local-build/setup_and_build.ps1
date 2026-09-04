@@ -136,7 +136,7 @@ if (-not (Test-Path "$msys\usr\bin\bash.exe")) {
 }
 if (-not (Test-Path "$msys\usr\bin\bash.exe")) { Write-Host "MSYS2 not found at C:\msys64 - install it from msys2.org and re-run."; Read-Host "Enter to exit"; exit 1 }
 Write-Host "Installing build toolchain (one-time)..."
-& "$msys\usr\bin\bash.exe" -lc "pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-ccache git python unzip curl"
+& "$msys\usr\bin\bash.exe" -lc "pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-ccache mingw-w64-x86_64-vulkan-headers mingw-w64-x86_64-shaderc git python unzip curl"
 
 # ---- 4. build ------------------------------------------------------------------
 function To-Unix([string]$p) { return '/' + $p.Substring(0,1).ToLower() + ($p.Substring(2) -replace '\\','/') }

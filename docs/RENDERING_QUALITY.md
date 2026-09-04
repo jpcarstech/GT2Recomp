@@ -179,6 +179,70 @@ Two other things are worth separating before touching the renderer:
 Not a bug: the beige strip across the bottom of the chase view on the
 grid is the painted grid box under the car.
 
+## 4c. John's own replay — is any vertex jitter left with PGXP on? (measured)
+
+John saved a savestate on his PC: Seattle Circuit, race replay, chase
+camera, RUF CTR 2, starting 3 s into lap 1. It loads in the lab unchanged
+(same codegen/ABI tag), and a replay is deterministic input, so the same
+guest frames can be captured as often as needed. `tools/wobble_census.py`
+turns the runtime's triangle ring into a jitter measurement:
+
+- every textured 3D triangle is tracked across three consecutive guest
+  frames (same command word, nearest centroid, same shape; GT2's alternate
+  frames sit 240 px lower in VRAM and are normalised);
+- for each corner the second difference of its screen path,
+  `d2 = (p[n+1]−p[n]) − (p[n]−p[n−1])`, is taken twice: on the integer
+  coordinates the GPU received (what the console / PGXP-off draws) and on
+  the PGXP-resolved coordinates (what we and DuckStation draw);
+- the real camera motion is removed by subtracting the median `d2` of the
+  corner's 24-px screen cell, so what is left is per-vertex jitter;
+- corners whose *integer* path accelerates by more than 3 px in one frame
+  are tracker mismatches (a fence post matched to its neighbour) and are
+  dropped from both sides alike.
+
+Two windows, 60 FPS, 4× GL, PGXP on: the opening straight (245 frames) and
+the first corner with the camera swinging (218 frames). Corners of triangles
+at least 16 px across — the geometry anyone looks at:
+
+| local jitter residual, native px | straight: integer | straight: PGXP | corner: integer | corner: PGXP |
+|---|---|---|---|---|
+| median | 0.00 | **0.008** | 1.00 | **0.021** |
+| 90th percentile | 1.00 | **0.08** | 1.41 | **0.22** |
+| 99th percentile | 2.00 | 0.33 | 2.24 | 0.74 |
+| corners moving > 0.5 px off their smooth path | 44% | **0.3%** | 52% | **2.5%** |
+
+So: on the console (and with PGXP off) half of all visible vertices hop by
+a pixel or more every frame — the wobble. With PGXP on, on John's own
+replay, in the chase camera, through the corner, the residual is a fiftieth
+of a pixel typically and a fifth of a pixel at the 90th percentile — and
+the worst remaining cases are real motion (an AI car decelerating past the
+camera), not snapping. The camera also moves *every* frame at 60 FPS
+(median vertex velocity 1.5–2.9 px/frame with no alternate-frame stalls),
+so the 60 FPS patch is not stepping the chase camera at 30 Hz.
+
+That closes the geometry question for this scene: whatever John sees
+wobbling in the chase view is not vertex position jitter in our renderer.
+The candidates that remain are the ones in section 4 (texture-side
+sampling: tile seams, magnified texels crawling under nearest filtering at
+16×, minification aliasing) and frame delivery on his display (section 4b).
+`docs/evidence/seattle-chase-ab/` holds a frame-matched PGXP on/off clip
+(`seattle-chase-pgxp-ab-halfspeed.mp4`, 77 guest frames at 4×, the
+approach to the underpass corner, aligned by the HUD timer) and a still,
+for anyone who wants to look rather than read.
+
+**The utility poles over the left guardrail at the replay's start** (John's
+second pointer) are not a draw-order fault of ours. From the triangle ring
+on that frame: the pole quad (`0x2C434347`, 39×57 px, GTE depth 7588) is
+*nearer* than the fence/guardrail polygons it overlaps (depth 8600 at the
+pole's column, 10200–16266 along the segment), so the console's ordering
+table draws it last too. Switching the PGXP depth buffer on — a true
+per-pixel depth test — leaves the pole exactly where it is
+(`left-poles-depthbuffer-off-on.jpg`); only the "Loaded slot" OSD and a
+few far pixels change. The pole model stands on the shoulder in front of
+the rail in the track data; DuckStation and the PlayStation draw it there
+as well. A DuckStation side-by-side of the same spot would be the
+confirmation.
+
 ## 5. The course of action — ranked, no brute force
 
 | # | Action | What it fixes | Cost | Risk | Verdict |

@@ -19,6 +19,7 @@ build/
 build-win/
 build-dbg/
 release/
+!tools-win/dev/release/
 
 # Runtime debris
 psx_last_run_report.json

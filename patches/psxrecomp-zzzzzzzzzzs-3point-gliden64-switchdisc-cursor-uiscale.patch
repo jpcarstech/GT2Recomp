@@ -1,0 +1,418 @@
+From dc861cc5a4980aecef4aa59b09070150cdb88848 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 4 Sep 2026 01:12:14 +0000
+Subject: [PATCH] 3-point as mupen64plus/GLideN64; SwitchDisc hotkey; hide
+ cursor in fullscreen; launcher ui_scale plumbing
+
+3-Point (N64) is now the float formulation mupen64plus renders through
+GLideN64 (glsl_CombinerProgramBuilderAccurate.cpp, ArthurCarvalho /
+twinaphex for mupen64plus-libretro): c0 = c00 + s(c10-c00) + t(c01-c00),
+c1 = c11 + (1-s)(c01-c11) + (1-t)(c10-c11), c0 + step(1, s+t)(c1-c0),
+with premultiplied-alpha colour bleeding handling; the RDP integer
+datapath is gone. [KeyMap] SwitchDisc restarts into the next installed
+sibling disc (the launcher's Switch button as a hotkey). [video]
+hide_cursor_fullscreen (default on) hides the pointer while fullscreen,
+polled per frame so every entry path counts; the F1 menu shows it.
+[launcher] ui_scale (75..200 %) carried for the launcher's scale slider.
+---
+ recompiler/src/config_loader.cpp | 16 +++++-
+ recompiler/src/config_loader.h   |  7 +++
+ runtime/include/host_keymap.h    |  2 +
+ runtime/src/gpu_gl_renderer.c    | 83 ++++++++++++++------------------
+ runtime/src/host_keymap.c        |  1 +
+ runtime/src/main.cpp             | 69 ++++++++++++++++++++++++++
+ 6 files changed, 131 insertions(+), 47 deletions(-)
+
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 8d2fc487..9012a187 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -734,6 +734,8 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+             rt.video_texture_edge_blending = toml::find<bool>(video, "texture_edge_blending");
+         if (video.contains("fmv_chroma_smoothing"))
+             rt.video_fmv_chroma_smoothing = toml::find<bool>(video, "fmv_chroma_smoothing");
++        if (video.contains("hide_cursor_fullscreen"))
++            rt.video_hide_cursor_fullscreen = toml::find<bool>(video, "hide_cursor_fullscreen");
+         if (video.contains("fmv_filter")) {
+             const auto mode = toml::find<std::string>(video, "fmv_filter");
+             if (!video_fmv_filter_parse(mode, &rt.video_fmv_filter))
+@@ -2462,6 +2464,10 @@ UserSettings load_user_settings(const fs::path& path) {
+             s.fmv_chroma_smoothing = toml::find<bool>(v, "fmv_chroma_smoothing");
+             s.has_fmv_chroma_smoothing = true;
+         });
++        if (v.contains("hide_cursor_fullscreen")) try_get([&]{
++            s.hide_cursor_fullscreen = toml::find<bool>(v, "hide_cursor_fullscreen");
++            s.has_hide_cursor_fullscreen = true;
++        });
+         if (v.contains("texture_filtering_2d")) try_get([&]{
+             s.texture_filter_2d = toml::find<bool>(v, "texture_filtering_2d");
+             s.has_texture_filter_2d = true;
+@@ -2630,6 +2636,10 @@ UserSettings load_user_settings(const fs::path& path) {
+     }
+     if (doc.contains("launcher")) {
+         const toml::value& l = toml::find(doc, "launcher");
++        if (l.contains("ui_scale")) try_get([&]{
++            const int v = toml::find<int>(l, "ui_scale");
++            if (v >= 75 && v <= 200) { s.ui_scale = v; s.has_ui_scale = true; }
++        });
+         if (l.contains("skip_launcher")) try_get([&]{
+             s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
+         });
+@@ -2835,6 +2845,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+         f << "texture_edge_blending = " << (s.texture_edge_blending ? "true" : "false") << "\n";
+     if (s.has_fmv_chroma_smoothing)
+         f << "fmv_chroma_smoothing = " << (s.fmv_chroma_smoothing ? "true" : "false") << "\n";
++    if (s.has_hide_cursor_fullscreen)
++        f << "hide_cursor_fullscreen = " << (s.hide_cursor_fullscreen ? "true" : "false") << "\n";
+     if (s.has_post_processing)
+         f << "post_processing = \"" << (s.post_processing == 1 ? "fxaa" : "off") << "\"\n";
+     if (s.has_display_scaling)
+@@ -2900,10 +2912,12 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
+             f << "save_state_menu_pad = "
+               << s.hotkey_pad_save_state_menu << "\n";
+     }
+-    if (s.has_skip_launcher || (s.has_active_title && !s.active_title.empty())) {
++    if (s.has_skip_launcher || s.has_ui_scale || (s.has_active_title && !s.active_title.empty())) {
+         f << "\n[launcher]\n";
+         if (s.has_skip_launcher)
+             f << "skip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
++        if (s.has_ui_scale)
++            f << "ui_scale = " << s.ui_scale << "\n";
+         if (s.has_active_title && !s.active_title.empty())
+             f << "active_title = \"" << s.active_title << "\"\n";
+     }
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index d805cac6..ea5f7812 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -490,6 +490,9 @@ struct RuntimeConfig {
+     // Display" - bilinear reconstruction of the MDEC's 4:2:0 chroma on FMV
+     // frames, luma untouched; removes the colour blockiness of movies.
+     bool                  video_fmv_chroma_smoothing = false;
++    // hide_cursor_fullscreen: hide the mouse pointer while the window is
++    // fullscreen (borderless or exclusive); the F1 menu shows it again.
++    bool                  video_hide_cursor_fullscreen = true;
+ 
+     // fmv_filter: how the 24-bit FMV present reconstructs its low-res source
+     // (a 320x192-class movie blown up to the window). Only consulted when
+@@ -1313,6 +1316,8 @@ struct UserSettings {
+     // DuckStation's 24-bit chroma smoothing on FMV frames.
+     bool has_texture_edge_blending = false; bool texture_edge_blending = false;
+     bool has_fmv_chroma_smoothing  = false; bool fmv_chroma_smoothing  = false;
++    // hide_cursor_fullscreen: mouse pointer hidden while fullscreen (default on).
++    bool has_hide_cursor_fullscreen = false; bool hide_cursor_fullscreen = true;
+     bool has_post_processing = false; int post_processing = 0; // 0=off,1=fxaa
+     // display_scaling: how the finished frame is scaled to the window.
+     // 0 nearest (true nearest at integer ratios, sharp-bilinear at a non-integer
+@@ -1366,6 +1371,8 @@ struct UserSettings {
+     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
+     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
+     bool has_skip_launcher  = false; bool skip_launcher  = false;
++    // [launcher] ui_scale: launcher UI size in percent (75..200; 100 default).
++    bool has_ui_scale       = false; int  ui_scale       = 100;
+     // [launcher] active_title — folder name of the sibling title the player
+     // last switched to in a multi-title install (titles/<name>/). Read by the
+     // root stub exe to decide which title to spawn; written by the runtime
+diff --git a/runtime/include/host_keymap.h b/runtime/include/host_keymap.h
+index 2c2babde..57c10922 100644
+--- a/runtime/include/host_keymap.h
++++ b/runtime/include/host_keymap.h
+@@ -24,6 +24,8 @@ typedef enum HostKeymapAction {
+     HOST_KEYMAP_RUNTIME_MENU,     /* default F1 */
+     HOST_KEYMAP_SWAP_CONTROLLER_PORTS, /* default F6 */
+     HOST_KEYMAP_QUIT,             /* default Escape; DOUBLE-press to exit */
++    HOST_KEYMAP_SWITCH_DISC,      /* multi-title installs: restart into the next
++                                     installed disc's build; no default */
+     HOST_KEYMAP_ACTION_COUNT
+ } HostKeymapAction;
+ 
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 149aefb2..f6b85925 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -1308,26 +1308,6 @@ static const char *TEX_FS_BODY =
+     "vec3 col5(int raw){\n"
+     "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
+     "}\n"
+-    "/* N64 RDP texel: 16-bit RGBA5551 channels expand 5->8 by bit replication\n"
+-    " * (c<<3 | c>>2). The PS1 has no alpha channel - a 0000h texel is the\n"
+-    " * cutout - so coverage rides the alpha slot (255 opaque / 0 cutout) and\n"
+-    " * the STP bit (0/255) is filtered beside it. */\n"
+-    "ivec4 rdp_texel(int raw){\n"
+-    "  if (raw == 0) return ivec4(0);\n"
+-    "  int r = raw & 31, g = (raw >> 5) & 31, b = (raw >> 10) & 31;\n"
+-    "  return ivec4((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), 255);\n"
+-    "}\n"
+-    "/* angrylion-rdp-plus tex.c texture_pipeline_cycle(), TF_BILERP, convert off:\n"
+-    " *   upper = (sfrac + tfrac) & 0x20\n"
+-    " *   lower: t0 + ((sfrac*(t1-t0) + tfrac*(t2-t0) + 0x10) >> 5)\n"
+-    " *   upper: t3 + (((0x20-sfrac)*(t2-t3) + (0x20-tfrac)*(t1-t3) + 0x10) >> 5)\n"
+-    " * t0=(s,t) t1=(s+1,t) t2=(s,t+1) t3=(s+1,t+1); 5-bit fractions of a 10.5\n"
+-    " * coordinate; arithmetic shift on the signed products, as the RDP. */\n"
+-    "ivec4 rdp_bilerp(ivec4 t0, ivec4 t1, ivec4 t2, ivec4 t3, int sfrac, int tfrac){\n"
+-    "  if (((sfrac + tfrac) & 0x20) == 0)\n"
+-    "    return t0 + ((sfrac * (t1 - t0) + tfrac * (t2 - t0) + ivec4(0x10)) >> 5);\n"
+-    "  return t3 + (((0x20 - sfrac) * (t2 - t3) + (0x20 - tfrac) * (t1 - t3) + ivec4(0x10)) >> 5);\n"
+-    "}\n"
+     "/* Hyllian's windowed-jinc 2-lobe sharper kernel (wa = pi*0.44, wb = pi*0.82,\n"
+     " * the constants DuckStation ships): sin(x*wa)*sin(x*wb)/x^2, wa*wb at 0. */\n"
+     "float jinc2_w(float x){\n"
+@@ -1386,35 +1366,46 @@ static const char *TEX_FS_MAIN =
+     "    if (ia < 0.5) discard;\n"
+     "    cov = ia; rgb = clamp(tcol.rgb, 0.0, 1.0); stp = tcol.a >= 0.5 ? 1 : 0;\n"
+     "#elif PSX_TEXFILTER == 2\n"
+-    "    /* N64 three-point, the RDP datapath (see rdp_bilerp): the texel\n"
+-    "     * cell splits on its diagonal and the sample blends the three corners\n"
+-    "     * of the triangle it falls in, with 5-bit fractions and the RDP's\n"
+-    "     * integer rounding. N64 coordinates put a texel's centre AT the\n"
+-    "     * integer; a PS1 texel is point-sampled over [u,u+1), so s = u - 0.5\n"
+-    "     * keeps the filter centred on the same texels nearest would show.\n"
+-    "     * The RDP filters alpha as a channel and has no cutouts; here the\n"
+-    "     * coverage channel (rdp_texel) is filtered the same way and the colour\n"
+-    "     * renormalised by it - cutout texels are 0000h, black, so this is the\n"
+-    "     * premultiplied division DuckStation applies to every filter and\n"
+-    "     * keeps cutout borders from darkening. Cutout authority stays with the\n"
+-    "     * CONTAINING texel, one of the four, as in the bilinear path. The\n"
+-    "     * RDP's opt-in mid_texel mode (exact-centre 4-tap average) is off:\n"
+-    "     * nothing on a PS1 asks for it. */\n"
++    "    /* N64 three-point as mupen64plus / GLideN64 render it (glsl_Combiner-\n"
++    "     * ProgramBuilderAccurate.cpp, BILINEAR_3POINT_WITH_COLOR_BLEEDING;\n"
++    "     * original author ArthurCarvalho, GLSL by twinaphex for\n"
++    "     * mupen64plus-libretro): the texel cell splits on its diagonal,\n"
++    "     *   c0 = c00 + s*(c10-c00) + t*(c01-c00)            (lower-left triangle)\n"
++    "     *   c1 = c11 + (1-s)*(c01-c11) + (1-t)*(c10-c11)    (upper-right)\n"
++    "     *   result = c0 + step(1, s+t)*(c1-c0)\n"
++    "     * in float, no RDP integer rounding. GLideN64's texture engine takes\n"
++    "     * intPart = floor(tileCoord) with the N64's centre-at-integer texel;\n"
++    "     * a PS1 texel is point-sampled over [u,u+1), so tileCoord = u - 0.5\n"
++    "     * keeps the filter centred on the texels nearest would show. Colour\n"
++    "     * bleeding handled as GLideN64 does with alpha test on: texels are\n"
++    "     * premultiplied by their alpha - here coverage, 1 opaque / 0 for the\n"
++    "     * 0000h cutout - and the result divided by the filtered alpha, so a\n"
++    "     * cutout neighbour never darkens the edge. Cutout authority stays with\n"
++    "     * the containing texel, as in the bilinear path. */\n"
+     "    uv += vec2(u_shift);\n"
+     "    int cA = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+     "    if (u_edge == 0 && cA == 0) discard;\n"
+-    "    vec2 st = (uv - vec2(0.5)) * 32.0;              /* 10.5 fixed point */\n"
+-    "    int si = int(floor(st.x)), ti = int(floor(st.y));\n"
+-    "    int sfrac = si & 31, tfrac = ti & 31;\n"
+-    "    int s0 = si >> 5, t0 = ti >> 5;\n"
+-    "    int r0 = fetch_texel(s0, t0),     r1 = fetch_texel(s0 + 1, t0);\n"
+-    "    int r2 = fetch_texel(s0, t0 + 1), r3 = fetch_texel(s0 + 1, t0 + 1);\n"
+-    "    ivec4 c = rdp_bilerp(rdp_texel(r0), rdp_texel(r1), rdp_texel(r2), rdp_texel(r3), sfrac, tfrac);\n"
+-    "    ivec4 sv = rdp_bilerp(ivec4(((r0 >> 15) & 1) * 255), ivec4(((r1 >> 15) & 1) * 255),\n"
+-    "                          ivec4(((r2 >> 15) & 1) * 255), ivec4(((r3 >> 15) & 1) * 255), sfrac, tfrac);\n"
+-    "    cov = float(c.a) / 255.0;\n"
+-    "    if (c.a <= 0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
+-    "    else { rgb = clamp(vec3(c.rgb) / float(c.a), 0.0, 1.0); stp = (sv.x * 2 >= c.a) ? 1 : 0; }\n"
++    "    vec2 tile = uv - vec2(0.5);\n"
++    "    ivec2 ip = ivec2(floor(tile));\n"
++    "    vec2 fr = tile - vec2(ip);                     /* tcData[4]: s, t */\n"
++    "    int r00 = fetch_texel(ip.x, ip.y),     r10 = fetch_texel(ip.x + 1, ip.y);\n"
++    "    int r01 = fetch_texel(ip.x, ip.y + 1), r11 = fetch_texel(ip.x + 1, ip.y + 1);\n"
++    "    vec4 c00 = (r00 == 0) ? vec4(0.0) : vec4(col5(r00), 1.0);   /* premultiplied */\n"
++    "    vec4 c10 = (r10 == 0) ? vec4(0.0) : vec4(col5(r10), 1.0);\n"
++    "    vec4 c01 = (r01 == 0) ? vec4(0.0) : vec4(col5(r01), 1.0);\n"
++    "    vec4 c11 = (r11 == 0) ? vec4(0.0) : vec4(col5(r11), 1.0);\n"
++    "    float s00 = float((r00 >> 15) & 1) * c00.a, s10 = float((r10 >> 15) & 1) * c10.a;\n"
++    "    float s01 = float((r01 >> 15) & 1) * c01.a, s11 = float((r11 >> 15) & 1) * c11.a;\n"
++    "    float bottomRightTri = step(1.0, fr.s + fr.t);\n"
++    "    vec4 c0 = c00 + fr.s * (c10 - c00) + fr.t * (c01 - c00);\n"
++    "    vec4 c1 = c11 + (1.0 - fr.s) * (c01 - c11) + (1.0 - fr.t) * (c10 - c11);\n"
++    "    vec4 res = c0 + bottomRightTri * (c1 - c0);\n"
++    "    float sp0 = s00 + fr.s * (s10 - s00) + fr.t * (s01 - s00);\n"
++    "    float sp1 = s11 + (1.0 - fr.s) * (s01 - s11) + (1.0 - fr.t) * (s10 - s11);\n"
++    "    float sres = sp0 + bottomRightTri * (sp1 - sp0);\n"
++    "    cov = res.a;\n"
++    "    if (res.a <= 0.0) { rgb = col5(cA); stp = (cA >> 15) & 1; }\n"
++    "    else { rgb = clamp(res.rgb / res.a, 0.0, 1.0); stp = (sres >= 0.5 * res.a) ? 1 : 0; }\n"
+     "#elif PSX_TEXFILTER == 4\n"
+     "    /* JINC2 - Hyllian's windowed-jinc 2-lobe sharper with anti-ringing,\n"
+     "     * the port DuckStation carries (gpu_hw_shadergen.cpp, from Beetle\n"
+diff --git a/runtime/src/host_keymap.c b/runtime/src/host_keymap.c
+index c9772685..10c55707 100644
+--- a/runtime/src/host_keymap.c
++++ b/runtime/src/host_keymap.c
+@@ -167,6 +167,7 @@ static HostKeymapAction action_for_key(const char *name) {
+     if (ieq(name, "SwapControllerPorts"))
+         return HOST_KEYMAP_SWAP_CONTROLLER_PORTS;
+     if (ieq(name, "Quit")) return HOST_KEYMAP_QUIT;
++    if (ieq(name, "SwitchDisc")) return HOST_KEYMAP_SWITCH_DISC;
+     return HOST_KEYMAP_ACTION_COUNT;
+ }
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 0ce99241..0581a827 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1227,6 +1227,26 @@ static int           g_video_texfilter = 0;
+ static int           g_video_texfilter_2d = 1;  /* filter 2D sprites/UI too (legacy on) */
+ static int           g_video_texfilter_edge = 0;  /* [video] texture_edge_blending */
+ static int           g_video_fmv_chroma = 0;      /* [video] fmv_chroma_smoothing */
++/* [video] hide_cursor_fullscreen: the mouse pointer is hidden while the window
++ * is fullscreen (borderless or exclusive) and nothing on screen wants it (the
++ * F1 menu shows it again); windowed keeps the pointer. Polled once per frame
++ * from the main loop so every way of entering fullscreen - config, launcher,
++ * hotkey, F1 - is covered without each site having to remember. */
++static int           g_hide_cursor_fullscreen = 1;
++static int           g_launcher_ui_scale = 100;   /* [launcher] ui_scale, percent */
++static void cursor_visibility_tick(SDL_Window* win, int menu_open) {
++    static int s_shown = -1;
++    if (!win) return;
++    const int fs = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
++    const int want = !(g_hide_cursor_fullscreen && fs && !menu_open);
++    if (want == s_shown) return;
++    s_shown = want;
++#if defined(PSX_SDL3)
++    if (want) SDL_ShowCursor(); else SDL_HideCursor();
++#else
++    SDL_ShowCursor(want ? SDL_ENABLE : SDL_DISABLE);
++#endif
++}
+ /* F1 "Texture filtering" choice index <-> renderer mode. The choice list is
+  * the launcher's order (Nearest, Bilinear, 3-Point, JINC2, xBR, Scale2x,
+  * Scale3x, MMPX, MMPX Enhanced, MMPX Advanced); renderer mode 3 (trilinear)
+@@ -6898,6 +6918,19 @@ static int f1_title_switch_ready(void) {
+            g_f1_title_map[g_f1_title_pending] != g_sibling_active;
+ }
+ 
++/* [KeyMap] SwitchDisc: the launcher's "Switch to <next disc>" button as a
++ * hotkey - the next INSTALLED sibling after the active one, wrapping, so
++ * two discs toggle and three cycle. -1 when there is nothing to switch to. */
++static int sibling_next_installed(void) {
++    const int n = (int)g_sibling_titles.size();
++    if (g_sibling_active < 0 || n < 2) return -1;
++    for (int k = 1; k < n; ++k) {
++        const int i = (g_sibling_active + k) % n;
++        if (!g_sibling_titles[(size_t)i].exe.empty()) return i;
++    }
++    return -1;
++}
++
+ static void stamp_active_title(PSXRecompV4::UserSettings& s) {
+     if (g_sibling_active < 0 ||
+         g_sibling_active >= (int)g_sibling_titles.size())
+@@ -8092,6 +8125,19 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                                            (int)key, (int)mod)) {
+                     controller_port_route_toggle();
+                 }
++                else if (!key_repeat &&
++                         host_keymap_match_event(HOST_KEYMAP_SWITCH_DISC,
++                                                 (int)key, (int)scancode,
++                                                 (int)mod)) {
++                    /* Same deferred shutdown + relaunch as F1 -> Switch disc
++                     * (g_f1_title_switch_target, applied by the main loop). */
++                    const int t = sibling_next_installed();
++                    if (t >= 0 && !psx_netplay_active() &&
++                        g_f1_title_switch_target < 0) {
++                        g_f1_title_switch_target = t;
++                        host_osd_push("Switching disc...", 1800);
++                    }
++                }
+                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
+                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
+                     debug_force_cd_reinsert();
+@@ -8145,6 +8191,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+         }
+         savestate_menu_poll_toggle_buttons();
+         rewind_poll_toggle_buttons();
++        cursor_visibility_tick(sdl_window, runtime_settings_menu_open);
+         psx_rewind_note_frame();
+         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
+         if (savestate_menu_open)
+@@ -12942,6 +12989,7 @@ int main(int argc, char** argv) {
+             g_video_texfilter  = gc.runtime.video_texture_filter;
+             g_video_texfilter_edge = gc.runtime.video_texture_edge_blending ? 1 : 0;
+             g_video_fmv_chroma = gc.runtime.video_fmv_chroma_smoothing ? 1 : 0;
++            g_hide_cursor_fullscreen = gc.runtime.video_hide_cursor_fullscreen ? 1 : 0;
+             g_video_fmv_filter = gc.runtime.video_fmv_filter;
+             g_video_fmv_letterbox_rows = gc.runtime.video_fmv_letterbox_rows;
+             g_video_geometry_correction   =
+@@ -13366,6 +13414,8 @@ int main(int argc, char** argv) {
+         if (us.has_texture_filter_2d) g_video_texfilter_2d = us.texture_filter_2d ? 1 : 0;
+         if (us.has_texture_edge_blending) g_video_texfilter_edge = us.texture_edge_blending ? 1 : 0;
+         if (us.has_fmv_chroma_smoothing)  g_video_fmv_chroma = us.fmv_chroma_smoothing ? 1 : 0;
++        if (us.has_hide_cursor_fullscreen) g_hide_cursor_fullscreen = us.hide_cursor_fullscreen ? 1 : 0;
++        if (us.has_ui_scale) g_launcher_ui_scale = us.ui_scale;
+         if (us.has_post_processing) g_video_postfx = us.post_processing;
+         if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
+         if (us.has_display_scaling) g_video_display_scaling = us.display_scaling;
+@@ -13889,6 +13939,8 @@ int main(int argc, char** argv) {
+             seed.texture_filter_2d = (g_video_texfilter_2d != 0); seed.has_texture_filter_2d = true;
+             seed.texture_edge_blending = (g_video_texfilter_edge != 0); seed.has_texture_edge_blending = true;
+             seed.fmv_chroma_smoothing  = (g_video_fmv_chroma != 0);     seed.has_fmv_chroma_smoothing = true;
++            seed.hide_cursor_fullscreen = (g_hide_cursor_fullscreen != 0); seed.has_hide_cursor_fullscreen = true;
++            seed.ui_scale = g_launcher_ui_scale; seed.has_ui_scale = true;
+             seed.post_processing = g_video_postfx;        seed.has_post_processing = true;
+             seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
+             if (g_video_display_scaling >= 0) { seed.display_scaling = g_video_display_scaling; seed.has_display_scaling = true; }
+@@ -14091,6 +14143,8 @@ int main(int argc, char** argv) {
+             ls.texture_filter_2d  = seed.texture_filter_2d ? 1 : 0;
+             ls.texture_edge_blend = seed.texture_edge_blending ? 1 : 0;
+             ls.fmv_chroma         = seed.fmv_chroma_smoothing ? 1 : 0;
++            ls.hide_cursor_fs     = seed.hide_cursor_fullscreen ? 1 : 0;
++            ls.ui_scale           = seed.has_ui_scale ? seed.ui_scale : 100;
+             ls.post_processing    = seed.post_processing;
+             ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+@@ -14361,6 +14415,9 @@ int main(int argc, char** argv) {
+                 seed.has_texture_edge_blending = true;
+                 seed.fmv_chroma_smoothing = ls.fmv_chroma != 0;
+                 seed.has_fmv_chroma_smoothing = true;
++                seed.hide_cursor_fullscreen = ls.hide_cursor_fs != 0;
++                seed.has_hide_cursor_fullscreen = true;
++                if (ls.ui_scale >= 75 && ls.ui_scale <= 200) { seed.ui_scale = ls.ui_scale; seed.has_ui_scale = true; }
+                 seed.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                 seed.has_post_processing = true;
+                 seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -14588,6 +14645,9 @@ int main(int argc, char** argv) {
+                         qs.has_texture_edge_blending = true;
+                         qs.fmv_chroma_smoothing = ls.fmv_chroma != 0;
+                         qs.has_fmv_chroma_smoothing = true;
++                        qs.hide_cursor_fullscreen = ls.hide_cursor_fs != 0;
++                        qs.has_hide_cursor_fullscreen = true;
++                        if (ls.ui_scale >= 75 && ls.ui_scale <= 200) { qs.ui_scale = ls.ui_scale; qs.has_ui_scale = true; }
+                         qs.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                         qs.has_post_processing = true;
+                         qs.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -14687,6 +14747,8 @@ int main(int argc, char** argv) {
+                 g_video_texfilter_2d = seed.texture_filter_2d ? 1 : 0;
+                 if (seed.has_texture_edge_blending) g_video_texfilter_edge = seed.texture_edge_blending ? 1 : 0;
+                 if (seed.has_fmv_chroma_smoothing)  g_video_fmv_chroma = seed.fmv_chroma_smoothing ? 1 : 0;
++                if (seed.has_hide_cursor_fullscreen) g_hide_cursor_fullscreen = seed.hide_cursor_fullscreen ? 1 : 0;
++                if (seed.has_ui_scale) g_launcher_ui_scale = seed.ui_scale;
+                 g_video_postfx = seed.post_processing;
+                 g_video_fmv_filter = seed.fmv_filter;
+                 if (seed.has_display_scaling) g_video_display_scaling = seed.display_scaling;
+@@ -16218,6 +16280,8 @@ soft_return_lobby:
+         ls.texture_filter = g_video_texfilter;
+         ls.texture_edge_blend = g_video_texfilter_edge;
+         ls.fmv_chroma = g_video_fmv_chroma;
++        ls.hide_cursor_fs = g_hide_cursor_fullscreen;
++        ls.ui_scale = g_launcher_ui_scale;
+         ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
+ #ifdef RECOMP_LAUNCHER_HAS_DISPLAY_SCALING
+         ls.display_scaling = g_video_display_scaling >= 0 ? cfg_display_scaling_to_launcher(g_video_display_scaling) : 0;
+@@ -16513,6 +16577,9 @@ soft_return_lobby:
+                 us.has_texture_edge_blending = true;
+                 us.fmv_chroma_smoothing = ls.fmv_chroma != 0;
+                 us.has_fmv_chroma_smoothing = true;
++                us.hide_cursor_fullscreen = ls.hide_cursor_fs != 0;
++                us.has_hide_cursor_fullscreen = true;
++                if (ls.ui_scale >= 75 && ls.ui_scale <= 200) { us.ui_scale = ls.ui_scale; us.has_ui_scale = true; }
+                 us.post_processing = (ls.post_processing == 1) ? 1 : 0;
+                 us.has_post_processing = true;
+                 us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
+@@ -16583,6 +16650,8 @@ soft_return_lobby:
+             g_video_texfilter_2d = ls.texture_filter_2d ? 1 : 0;
+             g_video_texfilter_edge = ls.texture_edge_blend ? 1 : 0;
+             g_video_fmv_chroma = ls.fmv_chroma ? 1 : 0;
++            g_hide_cursor_fullscreen = ls.hide_cursor_fs ? 1 : 0;
++            if (ls.ui_scale >= 75 && ls.ui_scale <= 200) g_launcher_ui_scale = ls.ui_scale;
+             g_video_postfx = (ls.post_processing == 1) ? 1 : 0;
+             /* Re-apply live: the boot-time renderer apply already ran, so an
+              * in-game Apply must push the filter family down itself or the
+-- 
+2.43.0
+

@@ -64,7 +64,12 @@ Runs inside MSYS2 MinGW64; `bash local_build.sh "<game folder>" [<source dir>]`.
    patch is off.
 6. **Install into the game folder** — per disc, into `titles\<name>\`: the
    exe (`GT2 Arcade.exe` / `GT2 Simulation.exe` / `GT2 Combined.exe`),
-   `assets\`, the runtime `game.toml` (only if absent; otherwise a fresh
+   `assets\` — including the launcher's artwork ripped from your disc at
+   this point: the box art (`tools/rip_gt2_title_art.py`) and, under
+   `assets\img\gt2\`, the GT mark and wordmark, licence badges, course
+   maps, one nameplate per car and the car-name table
+   (`tools/rip_gt2_launcher_art.py`; pure standard-library Python, run by
+   the embedded interpreter) — the runtime `game.toml` (only if absent; otherwise a fresh
    copy is left as `game.toml.new` — the disc line points at your own cue),
    `seeds\`, `bios\`, the enhancement packages into `patches\`. Shared, at
    the game root: `saves\` (memory cards — all discs read the same garage),
@@ -79,6 +84,21 @@ Runs inside MSYS2 MinGW64; `bash local_build.sh "<game folder>" [<source dir>]`.
    BIOS profiles, plus an embedded Python (downloaded from python.org once)
    and TinyCC 0.9.27 (fallback compiler when no gcc is on the game's PATH;
    `Play GT2.cmd` puts the MSYS2 gcc on it, which produces faster code).
+8. **Native-code cache, built up front** — GT2 keeps its menu and race code
+   in overlays (`GT2.OVL`) that the static recompile of the boot EXE does
+   not cover; the runtime compiles them to native shards from "captures" it
+   records while you play. Setup now produces those captures without
+   playing: `tools/gt2_extract_overlays.py` reads `GT2.OVL` straight from
+   your disc (a table of six gzip streams, every one loaded at
+   `0x80010000`), hands each to the recompiler's own function discovery,
+   and `compile_overlays.py` builds every shard into `titles\<name>\cache\`
+   - the same cache the game keeps adding to. A first launch therefore runs
+   native from the start instead of after a few sessions. This step is
+   about ten minutes per disc with gcc and is skipped for shards already
+   built; logs are `titles\<name>\aot_extract.txt` and `compile_cache.txt`.
+   Three of the six overlays always fail their whole-image audit (discovery
+   walks into data) and are built from per-function fragments instead, so
+   `PSX_SHARD_RESULT ... failed=3` is the normal outcome.
 
 Rebuilds are incremental: ccache and Ninja skip what did not change, so a
 `git pull` + `setup_and_build.ps1` is minutes.
@@ -171,9 +191,13 @@ resulting exe imports only Windows system DLLs.
   BIOS is selected; re-run the build's install step (or copy it from
   `GT2Recomp-src\psxrecomp\bios\`).
 - **Game runs slowly / stutters in races after a fresh build** — the native
-  cache is empty. Play a few sessions or run `tools\compile_cache.ps1` once
-  with the game closed; the runtime reports interpreted vs native dispatch
-  shares in `diagnostics\psx_last_run_report.json`.
+  cache should have been built by Setup's step 8; check
+  `titles\<name>\compile_cache.txt` ends with a `PSX_SHARD_RESULT` line and
+  `titles\<name>\cache\` is populated. If step 8 failed (its message names
+  the log), run `tools\compile_cache.ps1` once with the game closed, or
+  just play: the runtime still captures and compiles in the background. It
+  reports interpreted vs native dispatch shares in
+  `diagnostics\psx_last_run_report.json`.
 - **`compile_cache.ps1`: "Bundled python not found"** — the embedded Python
   download in step 7 failed (offline?). Re-run `setup_and_build.ps1`, or unzip
   `python-3.12.x-embed-amd64.zip` from python.org into

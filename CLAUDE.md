@@ -125,7 +125,8 @@ REQUIRES the tag name: run without one on 0.3.0 day, its old default moved
 (`repair_tags_0.3.0.cmd`). Also: the GitHub release form must only be
 published AFTER push_update.cmd, or GitHub creates the tag on the old main.
 
-Release checklist: CHANGELOG dated + Known issues → README → `tools/
+Release checklist: CHANGELOG dated + Known issues → `gt2_version.h`
+(the launcher's footer) → README → `tools/
 make_setup_zip.sh` (attach the zip) → release commit on `release` + tag →
 `tools/make_bundle.sh` → John: push_update.cmd → GitHub "Draft a new
 release" for the tag (John attaches the zip, publishes) → check Actions
@@ -185,6 +186,125 @@ advertises a mode this build does not offer. If it is ever taken up, the one
 thing worth knowing from the Vulkan work: the lockstep path needs a CPU-side
 VRAM authority that only the software and OpenGL backends provide, so a
 netplay session on Vulkan silently falls back to software.
+
+## Performance work, 2026-09-04 (all shipped; see docs/PERFORMANCE.md)
+
+- **Launch disc hash** (patch zb): `mod_runtime_commit()` SHA-256'd the whole
+  disc every start for a `disc_sha256` target no GT2 package pins. Now only
+  when a package pins one, and cached by size+mtime in
+  `mods/disc_sha256.cache`. 4.75 s -> 0.50 s to first guest frame in the lab.
+  Found with `gdb -batch -ex "catch syscall read" -ex "ignore 1 400" -ex run
+  -ex bt`.
+- **Install-time native cache**: `tools/gt2_extract_overlays.py` reads
+  `GT2.OVL` (u32 table bytes, then (offset,size) pairs, six gzip streams;
+  all load at 0x80010000; entry 0 == play captures minus Silent's 8 patched
+  words) and emits captures v2 via extract_generic's helpers; Setup step 9
+  compiles them with `compile_overlays.py --flavor 6 --cps`. Lab commands:
+  `python3 tools/gt2_extract_overlays.py --game-toml titles/arcade/game.toml
+  --recompiler psxrecomp/recompiler/build/psxrecomp-game --out
+  /tmp/aot/captures.json`, then the compile line above with that captures
+  file (35 min on the lab's 2 cores; run it detached, the tool timeout kills
+  it otherwise). Race bench 30fps/100%: cold 36.4 Hz/64% interp; AOT only
+  49.5/17%; AOT + one session's play shards 55.0/6%. **Do not feed play
+  executed_pcs as hints**: 1599 fragment shards, 872 MB, and SLOWER
+  (42.4 Hz/30%) - overlapping variants cost every dispatch a hash.
+- **Loading mods scoped to memory-card screens** (patch zc): the
+  `memcard_only` boolean on Fast Loading / CD Speed; the gate is
+  `memcard_io_sector_count()` changing (6-vblank hold). GT2 card traffic:
+  BIOS probe, the boot "Loading Save Data" screen, then nothing through title
+  and attract mode - so the gate is exactly that screen (and save/load).
+  `[[runtime.mod_option_default]]` in game.toml sets a title default for a
+  builtin package's option. Lab: `/tmp/lab_game_toml_extra.sh` re-adds these
+  after a rebuild.
+- **Skip intro**: `gt2.recomp` package, `mods_gt2_recomp.c`; arms the
+  framework's START-injection FMV skip and disarms after 4500 guest vblanks.
+  Promoted as the "Intro movie" featured row.
+- Launcher window opens in 0.4 s; the loop is `SDL_WaitEventTimeout(16)` so
+  it redraws at 60 Hz while idle (a real GPU makes that cheap; low priority).
+- **Lab gotchas:** `pkill -f <pattern>` matches the shell running it when the
+  same command line also launches the game (the exe name appears in it), so
+  the kill and the launch must be separate tool calls; `pkill -x` cannot
+  match the exe name (>15 chars). Xvfb started from a tool call gets reaped;
+  clear `/tmp/.X79-lock` and restart it with setsid. The debug server's
+  `load_transitions` reply is multi-line JSON - read the socket to `]}`.
+
+## Launcher front end (2026-09-04): how it is built
+
+The console-style launcher is three pieces, each generic where it can be:
+
+- **recomp-ui patch 0017** adds `RecompLauncherCGameInfo.console_dashboard`
+  + `dashboard_logo_path` / `dashboard_backdrop_path` / `dashboard_accent` /
+  `dashboard_footer_text` / `save_summary` and the game-agnostic
+  `RecompLauncherCSaveSummary` (hero, stats, bars, badges, tiles, empty
+  state). The UI is one block in `launcher_imgui.cpp` above `draw_ui`
+  (`draw_console_header/dashboard/settings/footer`, `draw_console_save_panel`,
+  `console_menu_item`); `draw_ui` branches at the top so the classic
+  dashboard is untouched. Menu rows are `InvisibleButton`s with
+  `ImGuiButtonFlags_EnableNav`; the layout containers are `NavFlattened`
+  (without that the pad focused the scroll child, not the rows). The model
+  reads both cards' summaries in `lm_summarize_save()` next to
+  `lm_inspect_memcard()`. Design size 1440x960 (`launcher_ng_capi.c`);
+  the platform's fill policy scales the layout to the drawable in both
+  directions, so a maximized/fullscreen window grows the UI. Window state
+  is `launcher_window.ini` in the exe dir (read in `launcher_platform_open_ex`,
+  written in `launcher_platform_close`; `track_restore_rect` keeps the
+  windowed rect while maximized/fullscreen). F11 / Alt+Enter toggle
+  fullscreen (`model.launcher_fullscreen`, synced to the platform each
+  frame). `LNG_FORCE_USABLE_BOUNDS=1280x800` simulates a Deck desktop.
+  Never run the patch-regeneration loop without checking `cd` succeeded:
+  a failed `cd` once committed recomp-ui's whole working tree as "base"
+  (fixed with `git reset --soft 4eda6543 && git reset`).
+- **psxrecomp patch zd** is only the hook: `psx_mod_set_launcher_dashboard()`
+  (mod_plugins.h) + copy into the GameInfo at both build sites.
+- **GT2 side**: `gt2_career.c` (CODEGEN_SETUP_SOURCES, every title) parses
+  the card, verifies the CRC and fills the summary; registers the dashboard
+  from a constructor. `gcc -DGT2_CAREER_TEST -I recomp-ui/src gt2_career.c`
+  builds a checker (`gt2_career <card> <exe dir>`). `gt2_version.h` is the
+  footer text - bump it with each release. `tools/rip_gt2_launcher_art.py`
+  rips logo/mark/backdrop, `lic_*.png`, `map_<course>.png`, `carlogo/<code>.png`
+  and `carinfo.txt` into `assets/img/gt2/` (stdlib only; local_build step
+  7, `GT2_LB_VERSION=8`). Arcade course -> crsmap mapping is the
+  `ARCADE_COURSES` table there (and `kArcadeTracks` in gt2_career.c); the
+  known-uncertain assignments are `test_in2`=Midfield, `parma`=Apricot
+  Hill, `new_parmaS`=Red Rock Valley, `sprint2`=High Speed Ring,
+  `testline`=Deep Forest, `circuit`=Grand Valley, `highway`=SSR5,
+  `shortway`=Clubman - matched by outline shape; fix both tables together
+  if a player reports a wrong map.
+- **Lab**: `/tmp/launcher_shot.sh <tag> [xdotool keys...]` launches
+  `--launcher` under Xvfb :79 and screenshots; `/tmp/rich.mcd` is a
+  synthetic save (CRC recomputed) with a car, licences and progress for
+  screenshots - swap it into `titles/arcade/saves/card1.mcd` and restore
+  the backup after.
+
+## Launcher redesign research (2026-09-04; mockups in D:\...\Claude outputs\launcher-mockup-*.png)
+
+- **Art rippable from the disc** (survey tools + dump in /tmp/gt2art; nothing
+  committed): `arcade/arc_topmenu` is a gzip (no suffix) of 12 16-bpp TIMs -
+  four 512x120 strips stacking into the 512x480 arcade top-menu screen (GT
+  mark, "GRAN TURISMO 2 / THE REAL DRIVING SIMULATOR" wordmark over a night
+  race photo, Polyphony credit) - the true-colour logo source. `arcade/
+  gt_items.tim` = licence badges S/IA/IB/IC/A/B (4bpp, NO CLUT: tint at
+  runtime). `carlogo/<id><v><s>--.tim` = car nameplates, 4bpp+CLUT, <=256x64;
+  car id packs 4 chars (alphabet `-0-9a-z`, 6 bits at 24/18/12/6); v n/r/s/t
+  = normal/RM/other, s l/m = JP plate large/medium, n/o = export plate
+  large/medium (135 cars have export plates). `.carinfoe` (root, "CAR\0",
+  u32 count, {u32 id,u16 str_off,u16 flags}) gives names. `crsmap/*.tim.gz`
+  96x96 course outlines. `gtmenu/commonpic.dat` = 456 full GT-mode screens
+  (GTMP tilemaps; orange #f79400 pills on black is GT2's UI language).
+  `gtmenudat.dat` is pre-rendered menu TEXT, not art. GTFS offsets: low 11
+  bits = pad bytes in the last sector.
+- **Save layout** (offsets from block start, verified on John's card via the
+  CRC; GT2SaveEditor by zyzalfors documents them): lang 512; arcade progress
+  696 (21 bytes, bits easy1/normal2/hard4); days u32 760; races 768; wins
+  772; sum best rankings 776; sum rankings 780; prize u32 788; career
+  progress 792 = 124 bytes of nibbles (0 none, 1-6 finish) for 248 events,
+  100% = 219; licences at S 5657 / IA 7297 / IB 8937 / IC 10577 / A 12217 /
+  B 13857, 10 tests each, stride 164, byte 0 none 1 kid 2 bronze 3 silver
+  4 gold; car count u8 15988; cars from 15992, 164 bytes each, u32 car id at
+  +0; money u32 32392; current car u8 32396 (255 = none); CRC32 of bytes
+  [0,32412) at 32412. Save = one 4-block "GT2 Game File", product code of
+  whichever disc saved it (BASCUS-94455GAME / -94488GAME), shared by both
+  discs. Cards: saves/card1.mcd, card2.mcd, 128 KB raw.
 
 ## Shelved work
 

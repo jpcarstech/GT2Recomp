@@ -92,6 +92,14 @@ off_label = "Original (30 fps)"
 on_label = "60 FPS"
 help = "60 FPS doubles the game's simulation rate; choosing it switches on the CPU overclock it needs. Original (30 fps) is how GT2 shipped, and keeps the overclock if you have it on - with full-detail AI cars and the longer draw distance the game needs it to hold 30 (untick it on the Mods page for the true 1999 feel). Old replays and Rally ghosts don't work at 60."
 
+[[runtime.featured_feature_row]]
+label = "Intro movie"
+package = "gt2.recomp"
+features = ["skip_intro"]
+off_label = "Play"
+on_label = "Skip"
+help = "Skip: the opening movie is skipped at boot exactly as if you pressed START when it began, so the game goes from the disclaimer straight to the memory card screen. The title screen's attract-mode loop of the movie still plays."
+
 # One-click presets on the launcher's Mods page, beside Enable all /
 # Disable all. GT2 ships with everything OFF - the 1999 game out of the box -
 # and these are the two answers most players actually want, without having to
@@ -103,21 +111,43 @@ description = "Turn everything off and play it exactly as it shipped: 30 fps, 4:
 
 [[runtime.feature_preset]]
 label = "Enhanced"
-description = "The best-running setup: widescreen 16:9, geometry correction, longer draw distance and full-detail AI cars, with the CPU overclock (200%) that keeps the game at a solid 30 fps with those on. 60 FPS is one row away (the Frame rate setting) if your PC has the headroom; Fast Loading is on the list below if you want it."
+description = "The best-running setup: widescreen 16:9, geometry correction, longer draw distance and full-detail AI cars, with the CPU overclock (200%) that keeps the game at a solid 30 fps with those on, and the boot 'loading save data' screen at PC speed. 60 FPS is one row away (the Frame rate setting) if your PC has the headroom."
 # Tuned on real hardware for the best frame rate, not the longest feature
 # list: 60 FPS stays OFF here because at 60 the emulated CPU has to do a
 # frame's work in half the time with the overclock up, which on many PCs costs
 # more than it gives; the Frame rate row is one click for those who have
-# the headroom. Fast Loading is deliberately not part of Enhanced either -
-# it changes the feel between races rather than the game itself, so it is
-# a choice a player makes on their own.
+# the headroom. Fast Loading IS part of Enhanced, but only because this
+# title scopes it to memory-card screens (the [[runtime.mod_option_default]]
+# below): GT2's menus stream from the disc continuously, so the unscoped
+# version ran every menu at turbo and threw their animation pacing off. The
+# boot "loading save data" screen is paced by the card's SIO timing and takes
+# as long on a PC as on the console - that is the one load worth removing.
 enable = [
+  "psx.enhancement.fast-loading/fast-loading",
   "psx.enhancement.pgxp/pgxp",
   "gt2.silent-enhancements/aspect",
   "gt2.silent-enhancements/overclock",
   "gt2.silent-enhancements/draw_distance",
   "gt2.silent-enhancements/full_lod_ai",
 ]
+
+# The framework's Fast Loading and CD Speed mods default to accelerating
+# every detected load, which suits games with real loading screens. GT2
+# streams its menus from the disc, so on this title both default to their
+# "Apply only during memcard loading" box ticked: the boot "loading save
+# data" screen and saving/loading run fast, menus keep their pacing. The box
+# stays on the launcher's Mods page for anyone who wants all of it.
+[[runtime.mod_option_default]]
+package = "psx.enhancement.fast-loading"
+feature = "fast-loading"
+option = "memcard_only"
+value = "true"
+
+[[runtime.mod_option_default]]
+package = "psx.enhancement.cd-speed"
+feature = "cd-speed"
+option = "memcard_only"
+value = "true"
 
 [widescreen]
 # Native-wide (default) only presents wide when the game renders extra width —

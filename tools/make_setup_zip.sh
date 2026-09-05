@@ -28,13 +28,15 @@ STEP 2 - Double-click "Setup GT2.cmd"  (30-60 minutes PER DISC, automatic)
   - Leave the black window alone until it prints DONE.
 
 PLAY: double-click "Gran Turismo 2 Recompiled.exe" (make a desktop shortcut
-if you like). The first start opens a settings window - plug in your
-controller, pick your resolution, then open Mods and press "Enhanced"
-(widescreen, geometry correction, draw distance, full-detail AI, CPU
-overclock - the setup that runs best) or "Authentic 1999" (everything
-off), and hit Play. It always opens the disc you used last; change discs
-with the "Disc" row in that settings window, or in the game:
-F1 -> Disc -> Switch disc.
+if you like). It opens a launcher built like a console game's front end
+(made for a gamepad; keyboard and mouse work too) - plug in your
+controller, pick your resolution under Settings, then pick ORIGINAL (the
+1999 game, everything off) or ENHANCED (widescreen, geometry correction,
+draw distance, full-detail AI, faster loading, CPU overclock - the setup
+that runs best) under GRAPHICS at the foot of the menu, and Start game.
+It always opens the disc you used last; "Switch disc" on the menu
+restarts into the other one, and so does F1 -> Disc -> Switch disc in
+the game.
 In game: F1 = settings + disc switch, F7 = save states, F8 = rewind.
 
 KNOWN ISSUES: 60 FPS needs a fast CPU - if it stutters, lower the CPU
@@ -47,8 +49,9 @@ Good to know:
   - Your garage follows you: memory cards are shared between the discs, so
     Arcade's "Load Guest Garage" sees your Simulation garage, like on the
     real console.
-  - The game gets FASTER over your first few sessions (it quietly converts
-    more of itself to PC code while you play and briefly after you quit).
+  - Setup converts the game to PC code up front, so the first launch
+    already runs at full speed. Performance tuning is still in progress
+    (Windows first, then Steam Deck).
   - Re-run "Setup GT2.cmd" (now in the game folder) any time to update, or
     after adding another disc image (only the new disc takes the full time).
   - Folder got messy (older layouts, a second copy of the game)? "Tidy GT2

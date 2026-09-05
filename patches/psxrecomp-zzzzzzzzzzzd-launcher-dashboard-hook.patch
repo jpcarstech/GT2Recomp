@@ -1,0 +1,87 @@
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index f6148f9c..4c7bd7db 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -166,6 +166,32 @@ enum {
+ };
+ int psx_mod_set_frame_interpolation_blend(uint32_t blend_mode);
+ int psx_mod_set_auto_skip_fmv(int enabled);
++
++/*
++ * Console-style launcher front end. A title that wants the "HD re-release"
++ * dashboard - a menu column, its own logo, a save-derived stats panel -
++ * registers this once (a PSX_MOD_CONSTRUCTOR is the natural place); the
++ * runtime hands the fields to the launcher when it opens
++ * (RecompLauncherCGameInfo.console_dashboard and friends - see recomp-ui's
++ * recomp_launcher.h for what each means). Strings are borrowed for the
++ * process lifetime. Never registering keeps the launcher's card dashboard.
++ * The save summary callback reads one memory card into the launcher's
++ * RecompLauncherCSaveSummary; it is called with the exe directory so the
++ * title can find data files its install staged under assets/.
++ */
++struct RecompLauncherCSaveSummary;
++typedef int (*psx_launcher_save_summary_fn)(const char* card_path,
++                                            const char* exe_dir,
++                                            struct RecompLauncherCSaveSummary* out);
++typedef struct PsxLauncherDashboard {
++    int         console_dashboard;   /* 1 = use the console front end */
++    const char* logo_path;           /* relative to assets/, e.g. "img/gt2/logo.png"; NULL = none */
++    const char* backdrop_path;       /* relative to assets/; NULL = none */
++    const char* accent;              /* "#RRGGBB"; NULL = the console theme's accent */
++    const char* footer_text;         /* small text at the footer's right; NULL = none */
++    psx_launcher_save_summary_fn save_summary;   /* NULL = no save panel */
++} PsxLauncherDashboard;
++int psx_mod_set_launcher_dashboard(const PsxLauncherDashboard* dashboard);
+ /*
+  * Draw still artwork behind the game image in OpenGL letterbox/pillarbox
+  * margins. The image path is an owner-selected mod resource; with no enabled
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index d9af7ab0..7faeed0b 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1552,6 +1552,29 @@ extern "C" int psx_mod_set_frame_interpolation_blend(
+     return 1;
+ }
+ 
++/* Console-style launcher front end, registered by a title's own code (see
++ * mod_plugins.h). Copied so the registrant's struct need not outlive the call;
++ * the strings it points at must. */
++static PsxLauncherDashboard g_launcher_dashboard;
++static bool g_launcher_dashboard_set = false;
++extern "C" int psx_mod_set_launcher_dashboard(const PsxLauncherDashboard* dashboard) {
++    if (!dashboard) return 0;
++    g_launcher_dashboard = *dashboard;
++    g_launcher_dashboard_set = true;
++    return 1;
++}
++#if defined(RECOMP_LAUNCHER)
++static void apply_launcher_dashboard_to_game_info(RecompLauncherCGameInfo* gi) {
++    if (!gi || !g_launcher_dashboard_set) return;
++    gi->console_dashboard      = g_launcher_dashboard.console_dashboard;
++    gi->dashboard_logo_path    = g_launcher_dashboard.logo_path;
++    gi->dashboard_backdrop_path = g_launcher_dashboard.backdrop_path;
++    gi->dashboard_accent       = g_launcher_dashboard.accent;
++    gi->dashboard_footer_text  = g_launcher_dashboard.footer_text;
++    gi->save_summary           = g_launcher_dashboard.save_summary;
++}
++#endif
++
+ extern "C" int psx_mod_set_auto_skip_fmv(int enabled) {
+     if (enabled != 0 && enabled != 1) {
+         std::fprintf(stderr,
+@@ -14632,6 +14655,7 @@ int main(int argc, char** argv) {
+             apply_sibling_titles_to_game_info(&gi);
+             apply_featured_rows_to_game_info(&gi);
+             apply_feature_presets_to_game_info(&gi);
++            apply_launcher_dashboard_to_game_info(&gi);
+             if (!g_cheats_page_note_cfg.empty())
+                 gi.cheats_page_note = g_cheats_page_note_cfg.c_str();
+             launcher_boot_timing_mark("host:setup_checks_done");
+@@ -16737,6 +16761,7 @@ soft_return_lobby:
+ #endif
+         apply_sibling_titles_to_game_info(&gi);
+         apply_featured_rows_to_game_info(&gi);
++        apply_launcher_dashboard_to_game_info(&gi);
+ 
+         char rui_out_disc[1024] = {0};
+         recomp_launcher_set_preserve_sdl(1);

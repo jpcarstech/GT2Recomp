@@ -1,0 +1,119 @@
+diff --git a/runtime/src/mod_runtime.cpp b/runtime/src/mod_runtime.cpp
+index 765c0c83..4cea1a84 100644
+--- a/runtime/src/mod_runtime.cpp
++++ b/runtime/src/mod_runtime.cpp
+@@ -1188,13 +1188,112 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
+     return true;
+ }
+ 
++/* Does any INSTALLED package (selected or not - resolve() matches against
++ * every one) pin a target to a disc digest? Only then does the digest decide
++ * anything: target_matches() treats an empty pin as "any disc", and a
++ * feature disc overlay is refused at manifest load without a pin. For every
++ * other install the full-image hash below is pure launch latency. */
++bool any_package_pins_disc_digest(const ModPackageManager& manager) {
++    for (const auto& by_id : manager.packages()) {
++        for (const auto& by_version : by_id.second) {
++            const ModPackage& package = by_version.second;
++            for (const ModTarget& t : package.targets)
++                if (!t.disc_sha256.empty()) return true;
++            for (const ModFeature& f : package.features)
++                for (const ModTarget& t : f.targets)
++                    if (!t.disc_sha256.empty()) return true;
++        }
++    }
++    return false;
++}
++
++/* The disc digest is a property of the image file, and a launch that reads
++ * 700 MB to recompute it is a launch that opens its window 1-8 s late on
++ * every start (the read sits on the main thread before the BIOS loads).
++ * Remember it beside the mods state, keyed by the data file's size and
++ * mtime: a re-dumped or patched image gets rehashed, an untouched one does
++ * not. One line per data path so a multi-disc install keeps them all. */
++std::filesystem::path disc_digest_cache_path(const RuntimeMods& s) {
++    return s.manager.root() / "disc_sha256.cache";
++}
++
++struct DiscFileStamp {
++    std::string path;
++    uint64_t size = 0;
++    int64_t mtime = 0;
++};
++
++bool stamp_disc_file(const std::filesystem::path& disc_path, DiscFileStamp& out) {
++    const DiscPathResolution resolved = resolve_disc_path(disc_path);
++    const std::filesystem::path data = resolved.data.empty() ? disc_path : resolved.data;
++    std::error_code ec;
++    const auto size = std::filesystem::file_size(data, ec);
++    if (ec) return false;
++    const auto mtime = std::filesystem::last_write_time(data, ec);
++    if (ec) return false;
++    out.path = data.generic_string();
++    out.size = (uint64_t)size;
++    out.mtime = (int64_t)mtime.time_since_epoch().count();
++    return true;
++}
++
++bool cached_disc_digest(const RuntimeMods& s, const DiscFileStamp& stamp,
++                        std::string& digest) {
++    std::ifstream in(disc_digest_cache_path(s));
++    std::string line;
++    while (std::getline(in, line)) {
++        /* size \t mtime \t digest \t path */
++        std::istringstream row(line);
++        std::string size_s, mtime_s, digest_s, path_s;
++        if (!std::getline(row, size_s, '\t') || !std::getline(row, mtime_s, '\t') ||
++            !std::getline(row, digest_s, '\t') || !std::getline(row, path_s))
++            continue;
++        if (path_s != stamp.path) continue;
++        if (size_s != std::to_string(stamp.size) ||
++            mtime_s != std::to_string(stamp.mtime))
++            return false;   /* same file, changed on disk: rehash */
++        if (digest_s.size() != 64) return false;
++        digest = digest_s;
++        return true;
++    }
++    return false;
++}
++
++void remember_disc_digest(const RuntimeMods& s, const DiscFileStamp& stamp,
++                          const std::string& digest) {
++    const std::filesystem::path path = disc_digest_cache_path(s);
++    std::vector<std::string> keep;
++    {
++        std::ifstream in(path);
++        std::string line;
++        while (std::getline(in, line)) {
++            const size_t last_tab = line.rfind('\t');
++            if (last_tab == std::string::npos) continue;
++            if (line.substr(last_tab + 1) == stamp.path) continue;   /* replaced below */
++            keep.push_back(line);
++        }
++    }
++    std::ofstream out(path, std::ios::trunc);
++    if (!out) return;
++    for (const std::string& line : keep) out << line << '\n';
++    out << stamp.size << '\t' << stamp.mtime << '\t' << digest << '\t'
++        << stamp.path << '\n';
++}
++
+ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error) {
+     RuntimeMods& s = state();
+     if (!s.initialized) return true;
+     if (disc_path != s.disc_path) {
+-        std::string hash_error;
+         std::string digest;
+-        if (!sha256_file(disc_path, digest, &hash_error)) digest.clear();
++        if (any_package_pins_disc_digest(s.manager)) {
++            DiscFileStamp stamp;
++            const bool stamped = stamp_disc_file(disc_path, stamp);
++            if (!stamped || !cached_disc_digest(s, stamp, digest)) {
++                std::string hash_error;
++                if (!sha256_file(disc_path, digest, &hash_error)) digest.clear();
++                else if (stamped) remember_disc_digest(s, stamp, digest);
++            }
++        }
+         s.disc_path = disc_path;
+         s.disc_sha256 = std::move(digest);
+         mod_set_current_title(s.game_id, s.exe_sha256, s.disc_sha256);

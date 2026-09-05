@@ -1,0 +1,553 @@
+diff --git a/mods/builtin/packages/psx.enhancement.cd-speed/1.0.0/manifest.toml b/mods/builtin/packages/psx.enhancement.cd-speed/1.0.0/manifest.toml
+index 156363b9..55b18aae 100644
+--- a/mods/builtin/packages/psx.enhancement.cd-speed/1.0.0/manifest.toml
++++ b/mods/builtin/packages/psx.enhancement.cd-speed/1.0.0/manifest.toml
+@@ -53,6 +53,15 @@ max = 256
+ step = 1
+ default = 32
+ 
++[[option]]
++feature = "cd-speed"
++id = "memcard_only"
++label = "Apply only during memcard loading"
++description = "Use the faster drive speed only while a memory-card screen is showing (the boot 'loading save data' screen, saving and loading); the rest of the time the drive keeps authentic 1x timing, so menus and races that stream from the disc are exactly as shipped. Untick to run the drive at the chosen speed everywhere."
++group = "Quality of Life"
++type = "boolean"
++default = "false"
++
+ [[plugin]]
+ feature = "cd-speed"
+ id = "psx.cd-speed"
+diff --git a/mods/builtin/packages/psx.enhancement.fast-loading/1.0.0/manifest.toml b/mods/builtin/packages/psx.enhancement.fast-loading/1.0.0/manifest.toml
+index 821be0ac..832be3bc 100644
+--- a/mods/builtin/packages/psx.enhancement.fast-loading/1.0.0/manifest.toml
++++ b/mods/builtin/packages/psx.enhancement.fast-loading/1.0.0/manifest.toml
+@@ -41,6 +41,15 @@ group = "Quality of Life"
+ type = "boolean"
+ default = "false"
+ 
++[[option]]
++feature = "fast-loading"
++id = "memcard_only"
++label = "Apply only during memcard loading"
++description = "Speed up only memory-card screens - the boot 'loading save data' screen and saving/loading. Those are paced by the card's own timing and take as long on a PC as on the console, so they are the one load a fast machine cannot shorten by itself. Everything else, including any menu that streams from the disc, keeps its original pacing. Untick to accelerate every detected load."
++group = "Quality of Life"
++type = "boolean"
++default = "false"
++
+ [[plugin]]
+ feature = "fast-loading"
+ id = "psx.fast-loading"
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 02223747..77c90b6d 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -442,6 +442,22 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+             rt.feature_presets.push_back(std::move(p));
+         }
+     }
++    if (runtime.contains("mod_option_default")) {
++        /* Per-title option defaults for packages the title does not own
++         * (config_loader.h). */
++        const auto rows = toml::find(runtime, "mod_option_default");
++        for (const toml::value& row : rows.as_array()) {
++            RuntimeConfig::ModOptionDefault d;
++            d.package = toml::find<std::string>(row, "package");
++            d.feature = toml::find<std::string>(row, "feature");
++            d.option  = toml::find<std::string>(row, "option");
++            d.value   = toml::find<std::string>(row, "value");
++            if (d.package.empty() || d.feature.empty() || d.option.empty())
++                throw std::runtime_error(
++                    "[[runtime.mod_option_default]] needs package, feature and option");
++            rt.mod_option_defaults.push_back(std::move(d));
++        }
++    }
+     if (runtime.contains("disc_speed")) {
+         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+         rt.has_disc_speed = true;
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index a8d17e41..c119f578 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -240,6 +240,26 @@ struct RuntimeConfig {
+     };
+     std::vector<FeaturePreset> feature_presets;
+ 
++    // mod_option_default: a title's own default for one option of a package
++    // it did not write - typically a framework-owned builtin such as Fast
++    // Loading, whose manifest default has to suit every game. The value
++    // becomes the option's default for this title only; a player's explicit
++    // choice in mods/state.toml still wins. Validated against the option's
++    // declared type when the package is scanned (an unknown package or
++    // option, or a value the type rejects, is reported and ignored).
++    //   [[runtime.mod_option_default]]
++    //   package = "psx.enhancement.fast-loading"
++    //   feature = "fast-loading"
++    //   option  = "scope"
++    //   value   = "memory-card"
++    struct ModOptionDefault {
++        std::string package;
++        std::string feature;
++        std::string option;
++        std::string value;
++    };
++    std::vector<ModOptionDefault> mod_option_defaults;
++
+     // cheats_page_note: keep the launcher's Cheats page offered even when no
+     // cheat applies to the running disc, and show this text there meanwhile.
+     // A multi-disc port's cheats exist for one disc and not another; without
+diff --git a/runtime/include/cdrom.h b/runtime/include/cdrom.h
+index 9a864925..00a2bb79 100644
+--- a/runtime/include/cdrom.h
++++ b/runtime/include/cdrom.h
+@@ -41,6 +41,8 @@ void cdrom_set_speed(int divisor);
+ void cdrom_set_game_speed(int divisor);
+ /* Called by fntrace on first game-range dispatch; switches to game speed. */
+ void cdrom_notify_game_started(void);
++/* CD Speed scope gate: 0 = authentic 1x for now, 1 = configured speed. */
++void cdrom_set_speed_gate(int open);
+ /* LBA of the most recent SetLoc command (-1 if none yet). Used by the DMA
+  * ring buffer to correlate each sector transfer with its disc position. */
+ int  cdrom_get_setloc_lba(void);
+diff --git a/runtime/include/memcard.h b/runtime/include/memcard.h
+index e2e575b8..8624377e 100644
+--- a/runtime/include/memcard.h
++++ b/runtime/include/memcard.h
+@@ -56,6 +56,8 @@ int memcard_format_file(const char* path);
+ 
+ /* Read/write 128-byte sectors */
+ int memcard_read_sector(int card, int sector, uint8_t* buf);
++/* Sectors transferred (reads + writes) since boot; monotonic. */
++uint64_t memcard_io_sector_count(void);
+ int memcard_write_sector(int card, int sector, const uint8_t* buf);
+ 
+ /* Flush pending writes to disk */
+diff --git a/runtime/include/mod_packages.h b/runtime/include/mod_packages.h
+index f3cfdd9e..5049d2db 100644
+--- a/runtime/include/mod_packages.h
++++ b/runtime/include/mod_packages.h
+@@ -344,6 +344,19 @@ public:
+     void set_root(std::filesystem::path mods_root);
+     const std::filesystem::path& root() const { return root_; }
+ 
++    /* A title's own default for one option of a package it did not write
++     * ([[runtime.mod_option_default]] in game.toml). Applied to every
++     * scanned version of the package, after each scan(); a player's saved
++     * choice still overrides it. Unknown ids and type-invalid values are
++     * reported on stderr and skipped, never fatal. */
++    struct OptionDefault {
++        std::string package_id;
++        std::string feature_id;
++        std::string option_id;
++        std::string value;
++    };
++    void set_option_defaults(std::vector<OptionDefault> defaults);
++
+     bool scan(std::string* error = nullptr);
+     bool load_state(std::string* error = nullptr);
+     bool save_state(std::string* error = nullptr) const;
+@@ -399,9 +412,12 @@ public:
+                               std::string* error = nullptr);
+ 
+ private:
++    void apply_option_defaults();
++
+     std::filesystem::path root_;
+     std::map<std::string, std::map<std::string, ModPackage>> packages_;
+     std::map<std::string, ModSelection> selections_;
++    std::vector<OptionDefault> option_defaults_;
+ };
+ 
+ bool mod_register_builtin_resolver(const std::string& id, ModBuiltinResolver resolver);
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index fb24de03..f6148f9c 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -193,6 +193,22 @@ int psx_mod_set_bezel_artwork(const char* path);
+ int psx_mod_set_load_acceleration(uint32_t wall_clock_multiplier,
+                                   uint32_t release_frames);
+ 
++/*
++ * Where that acceleration may engage. PSX_MOD_LOAD_SCOPE_ALL (the default)
++ * is every detected load: sustained CD data streams and memory-card
++ * transfers. PSX_MOD_LOAD_SCOPE_MEMORY_CARD limits it to memory-card
++ * transfers - the boot "loading save data" screen and save/load screens -
++ * for games whose menus stream from CD continuously and would otherwise
++ * run at turbo, throwing off their animation pacing.
++ */
++#define PSX_MOD_LOAD_SCOPE_ALL          0u
++#define PSX_MOD_LOAD_SCOPE_MEMORY_CARD  1u
++int psx_mod_set_load_acceleration_scope(uint32_t scope);
++/* Same scopes for psx_mod_set_disc_speed(): with PSX_MOD_LOAD_SCOPE_MEMORY_CARD
++ * the divisor is live only while a memory-card transfer is in progress and the
++ * drive runs at authentic 1x the rest of the time. */
++int psx_mod_set_disc_speed_scope(uint32_t scope);
++
+ /*
+  * Select guest-visible CD timing for a game-owned loading feature. divisor
+  * divides the emulated sector delay, so it IS the speed multiplier: 1 is
+diff --git a/runtime/include/mod_runtime.h b/runtime/include/mod_runtime.h
+index 20a3b847..9a589192 100644
+--- a/runtime/include/mod_runtime.h
++++ b/runtime/include/mod_runtime.h
+@@ -9,8 +9,15 @@
+ #include "recomp_launcher.h"
+ #endif
+ 
++#include "mod_packages.h"
++#include <vector>
++
+ namespace PSXRecompV4 {
+ 
++/* Title-supplied option defaults for packages it does not own
++ * ([[runtime.mod_option_default]]). Call before mod_runtime_initialize(). */
++void mod_runtime_set_option_defaults(
++    std::vector<ModPackageManager::OptionDefault> defaults);
+ bool mod_runtime_initialize(const std::filesystem::path& root,
+                             const std::string& game_id,
+                             uint32_t game_entry_pc,
+diff --git a/runtime/src/cdrom.c b/runtime/src/cdrom.c
+index dd5c231d..4e919728 100644
+--- a/runtime/src/cdrom.c
++++ b/runtime/src/cdrom.c
+@@ -319,8 +319,22 @@ void cdrom_set_game_speed(int divisor) {
+ }
+ 
+ /* Called by fntrace_record on first game-range dispatch. */
++static int g_game_started = 0;
++static int g_speed_gate_open = 1;
+ void cdrom_notify_game_started(void) {
+-    g_disc_speed_divisor = g_game_divisor;
++    g_game_started = 1;
++    g_disc_speed_divisor = g_speed_gate_open ? g_game_divisor : 1;
++}
++
++/* Scope gate for the configured speed (CD Speed's "apply only during memcard
++ * loading"): while closed the drive runs at authentic 1x even after game
++ * start; opening it re-applies the configured divisor. Driven once per
++ * vblank from the pacing loop, so a change lands between sectors. */
++void cdrom_set_speed_gate(int open) {
++    open = open ? 1 : 0;
++    if (open == g_speed_gate_open) return;
++    g_speed_gate_open = open;
++    if (g_game_started) g_disc_speed_divisor = open ? g_game_divisor : 1;
+ }
+ 
+ int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 88b60db2..d9af7ab0 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -1356,6 +1356,13 @@ static uint32_t      g_mod_native_vblank_fps = 0;
+ /* Activation-time request. -1 means no enabled mod owns load acceleration. */
+ static int           g_mod_load_wall_multiplier = -1;
+ static int           g_mod_load_release_frames = -1;
++/* Where host-paced load acceleration may engage (psx_mod_set_load_acceleration_scope):
++ * 0 = every detected load (CD data streams and memory-card transfers),
++ * 1 = memory-card transfers only. -1 = no mod spoke. */
++static int           g_mod_load_scope = -1;
++/* Same for CD Speed (psx_mod_set_disc_speed_scope): 1 = the divisor applies
++ * only while a memory-card transfer is in progress. */
++static int           g_mod_disc_speed_scope = -1;
+ static int           g_mod_disc_speed_divisor = -1;
+ static int           g_mod_disc_instant_rate = -1;
+ 
+@@ -1589,6 +1596,26 @@ extern "C" int psx_mod_set_load_acceleration(
+     return 1;
+ }
+ 
++extern "C" int psx_mod_set_disc_speed_scope(uint32_t scope) {
++    if (scope > PSX_MOD_LOAD_SCOPE_MEMORY_CARD) {
++        std::fprintf(stderr, "psxrecomp: mod rejected disc speed scope %u\n",
++                     (unsigned)scope);
++        return 0;
++    }
++    g_mod_disc_speed_scope = (int)scope;
++    return 1;
++}
++
++extern "C" int psx_mod_set_load_acceleration_scope(uint32_t scope) {
++    if (scope > PSX_MOD_LOAD_SCOPE_MEMORY_CARD) {
++        std::fprintf(stderr, "psxrecomp: mod rejected load acceleration scope %u\n",
++                     (unsigned)scope);
++        return 0;
++    }
++    g_mod_load_scope = (int)scope;
++    return 1;
++}
++
+ extern "C" int psx_mod_set_disc_speed(
+     uint32_t divisor, uint32_t instant_max_per_frame) {
+     /* Any positive divisor is arithmetically safe: cdrom.c divides the sector
+@@ -2144,6 +2171,25 @@ static int g_turbo_audio_sink_config_enabled = 0;
+ /* Zero multiplier retains the historical uncapped turbo behavior. */
+ static int g_turbo_load_wall_multiplier = 0;
+ static int g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
++static int g_turbo_load_scope = 0;   /* PSX_MOD_LOAD_SCOPE_* */
++static int g_disc_speed_scope = 0;   /* PSX_MOD_LOAD_SCOPE_* */
++/* Memory-card transfer predicate for the turbo gate. A card read or write is
++ * paced by the guest's SIO timing, so a save-data screen takes the same wall
++ * time on every PC - the one load a modern machine cannot shorten on its
++ * own. Sectors flow at a few per vblank while it runs and stop dead when it
++ * ends, so "any sector in the last few vblanks" is the whole detector; the
++ * short hold rides out the inter-sector handshake gaps. Card polling from a
++ * menu is one sector every second or so and never sustains the engage
++ * window, which is what keeps this out of menu animations. */
++#define TURBO_MEMCARD_HOLD_FRAMES 6
++static int memcard_transfer_active_this_vblank(void) {
++    static uint64_t seen = 0;
++    static int hold = 0;
++    const uint64_t now = memcard_io_sector_count();
++    if (now != seen) { seen = now; hold = TURBO_MEMCARD_HOLD_FRAMES; return 1; }
++    if (hold > 0) { hold--; return 1; }
++    return 0;
++}
+ static SDL_AudioDeviceID sdl_audio_device;
+ static int16_t       sdl_audio_buf[2048 * 2];
+ 
+@@ -8468,8 +8514,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+ 
+     /* Turbo-active test shared by the pacing/present gate below. */
+     int turbo_loads_active = 0;
+-    int logical_load_active = fntrace_is_game_started() &&
++    const int cd_load_active = fntrace_is_game_started() &&
+         (cdrom_load_in_progress() || cdrom_savestate_cd_wait_active());
++    const int memcard_load_active = fntrace_is_game_started() &&
++        memcard_transfer_active_this_vblank();
++    int logical_load_active =
++        (g_turbo_load_scope == PSX_MOD_LOAD_SCOPE_ALL && cd_load_active) ||
++        memcard_load_active;
++    /* CD Speed scoped to memory-card screens: the configured divisor is
++     * live only while a card transfer is in progress, 1x otherwise. */
++    if (g_disc_speed_scope == PSX_MOD_LOAD_SCOPE_MEMORY_CARD)
++        cdrom_set_speed_gate(memcard_load_active);
+     int load_run_value = 0;
+     static int load_run = 0;
+     static int release_run = 0;
+@@ -13102,6 +13157,12 @@ int main(int argc, char** argv) {
+                 discover_sibling_titles(argv[0]);
+             g_featured_rows_cfg = gc.runtime.featured_feature_rows;
+             g_feature_presets_cfg = gc.runtime.feature_presets;
++            {
++                std::vector<PSXRecompV4::ModPackageManager::OptionDefault> defaults;
++                for (const auto& d : gc.runtime.mod_option_defaults)
++                    defaults.push_back({d.package, d.feature, d.option, d.value});
++                PSXRecompV4::mod_runtime_set_option_defaults(std::move(defaults));
++            }
+             if (gc.runtime.has_cheats_page_note)
+                 g_cheats_page_note_cfg = gc.runtime.cheats_page_note;
+             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+@@ -15102,11 +15163,16 @@ int main(int argc, char** argv) {
+         policy = ModControllerPresentationPolicy{};
+     g_mod_load_wall_multiplier = -1;
+     g_mod_load_release_frames = -1;
++    g_mod_load_scope = -1;
++    g_mod_disc_speed_scope = -1;
+     g_mod_disc_speed_divisor = -1;
+     g_mod_disc_instant_rate = -1;
+     g_turbo_audio_sink_enabled = g_turbo_audio_sink_config_enabled;
+     g_turbo_load_wall_multiplier = 0;
+     g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
++    g_turbo_load_scope = PSX_MOD_LOAD_SCOPE_ALL;
++    g_disc_speed_scope = PSX_MOD_LOAD_SCOPE_ALL;
++    cdrom_set_speed_gate(1);
+     if (!turbo_loads_offered)
+         g_turbo_loads_enabled = 0;
+     g_frame_interpolation_blend = g_frame_interpolation_blend_default;
+@@ -15120,6 +15186,10 @@ int main(int argc, char** argv) {
+         g_turbo_loads_enabled = 1;
+         g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
+         g_turbo_load_release_frames = g_mod_load_release_frames;
++        if (g_mod_load_scope >= 0) g_turbo_load_scope = g_mod_load_scope;
++        if (g_turbo_load_scope == PSX_MOD_LOAD_SCOPE_MEMORY_CARD)
++            std::fprintf(stdout,
++                "psxrecomp: load acceleration scoped to memory-card transfers\n");
+         /* Fast Loading advances the guest at a host rate greater than real
+          * time. Keep the canonical SPU/CD stream running, but discard the
+          * accelerated presentation-side audio until pacing resumes; otherwise
+@@ -15550,6 +15620,12 @@ session_reboot:
+         else if (disc_speed == "2x") divisor = 2;
+         if (g_mod_disc_speed_divisor >= 0)
+             divisor = g_mod_disc_speed_divisor;
++        if (g_mod_disc_speed_scope >= 0) g_disc_speed_scope = g_mod_disc_speed_scope;
++        if (g_disc_speed_scope == PSX_MOD_LOAD_SCOPE_MEMORY_CARD) {
++            cdrom_set_speed_gate(0);
++            std::fprintf(stdout,
++                "psxrecomp: disc speed scoped to memory-card transfers\n");
++        }
+         /* Store for post-BIOS application; boot always runs at 1x so the
+          * BIOS disc-init sequence sees correct timing. */
+         cdrom_set_game_speed(divisor);
+diff --git a/runtime/src/memcard.c b/runtime/src/memcard.c
+index 9088a3b0..bb97da63 100644
+--- a/runtime/src/memcard.c
++++ b/runtime/src/memcard.c
+@@ -336,11 +336,32 @@ int memcard_summary_path(const char* path, MemcardSummary* out) {
+     return 0;
+ }
+ 
++/* Activity trail for the load-acceleration gate (main.cpp): every sector the
++ * guest actually transfers bumps a counter, and the pacing loop compares it
++ * against the value it saw last vblank. A card that is merely probed for
++ * presence (GETID / a directory-frame read) shows up here too, which is
++ * intended - a game polling for a card in a menu is one or two sectors a
++ * second, while a save-data load is hundreds per second, and the gate keys
++ * on that density, not on the first sector. */
++static uint64_t s_io_sectors;
++static int s_trace = -1;
++
++static void note_io(const char* what, int card, int sector) {
++    s_io_sectors++;
++    if (s_trace < 0) s_trace = getenv("PSX_MEMCARD_TRACE") ? 1 : 0;
++    if (s_trace && (s_io_sectors & 63u) == 1u)
++        fprintf(stderr, "memcard: %s card=%d sector=%d (op #%llu)\n", what, card,
++                sector, (unsigned long long)s_io_sectors);
++}
++
++uint64_t memcard_io_sector_count(void) { return s_io_sectors; }
++
+ int memcard_read_sector(int card, int sector, uint8_t* buf) {
+     if (card < 0 || card >= MAX_CARDS) return -1;
+     if (!cards[card].present) return -1;
+     if (sector < 0 || sector >= MEMCARD_SECTORS) return -1;
+ 
++    note_io("read", card, sector);
+     memcpy(buf, cards[card].data + sector * MEMCARD_SECTOR_SIZE, MEMCARD_SECTOR_SIZE);
+     return 0;
+ }
+@@ -350,6 +371,7 @@ int memcard_write_sector(int card, int sector, const uint8_t* buf) {
+     if (!cards[card].present) return -1;
+     if (sector < 0 || sector >= MEMCARD_SECTORS) return -1;
+ 
++    note_io("write", card, sector);
+     memcpy(cards[card].data + sector * MEMCARD_SECTOR_SIZE, buf, MEMCARD_SECTOR_SIZE);
+     cards[card].dirty = 1;
+     return 0;
+diff --git a/runtime/src/mod_builtin_speed.c b/runtime/src/mod_builtin_speed.c
+index c48dceea..c75f333d 100644
+--- a/runtime/src/mod_builtin_speed.c
++++ b/runtime/src/mod_builtin_speed.c
+@@ -48,9 +48,15 @@ static void builtin_fast_loading_activate(void) {
+             : (unsigned)speed_option_number(PKG_FAST, "fast-loading",
+                                             "multiplier", 4);
+     (void)psx_mod_set_load_acceleration(multiplier, 0u);
++    (void)psx_mod_set_load_acceleration_scope(
++        speed_option_flag(PKG_FAST, "fast-loading", "memcard_only")
++            ? PSX_MOD_LOAD_SCOPE_MEMORY_CARD : PSX_MOD_LOAD_SCOPE_ALL);
+ }
+ 
+ static void builtin_cd_speed_activate(void) {
++    (void)psx_mod_set_disc_speed_scope(
++        speed_option_flag(PKG_CD, "cd-speed", "memcard_only")
++            ? PSX_MOD_LOAD_SCOPE_MEMORY_CARD : PSX_MOD_LOAD_SCOPE_ALL);
+     if (speed_option_flag(PKG_CD, "cd-speed", "instant")) {
+         /* Divisor 0 selects the bounded instant scheduler; only the budget
+          * matters in that mode. */
+diff --git a/runtime/src/mod_packages.cpp b/runtime/src/mod_packages.cpp
+index 995d0519..c1e88502 100644
+--- a/runtime/src/mod_packages.cpp
++++ b/runtime/src/mod_packages.cpp
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <cctype>
+ #include <cstdio>
++#include <cstdlib>
+ #include <fstream>
+ #include <iomanip>
+ #include <limits>
+@@ -2392,9 +2393,66 @@ bool ModPackageManager::scan(std::string* error) {
+         set_error(error, "cannot scan packages: " + ec.message());
+         return false;
+     }
++    apply_option_defaults();
+     return true;
+ }
+ 
++void ModPackageManager::set_option_defaults(std::vector<OptionDefault> defaults) {
++    option_defaults_ = std::move(defaults);
++    apply_option_defaults();
++}
++
++void ModPackageManager::apply_option_defaults() {
++    for (const OptionDefault& d : option_defaults_) {
++        const auto by_id = packages_.find(d.package_id);
++        if (by_id == packages_.end()) {
++            std::fprintf(stderr,
++                "psxrecomp: mod_option_default: no package %s installed\n",
++                d.package_id.c_str());
++            continue;
++        }
++        for (auto& by_version : by_id->second) {
++            ModPackage& package = by_version.second;
++            ModOption* option = nullptr;
++            for (ModOption& o : package.options)
++                if (o.feature_id == d.feature_id && o.id == d.option_id) { option = &o; break; }
++            if (!option) {
++                std::fprintf(stderr,
++                    "psxrecomp: mod_option_default: %s %s has no option %s\n",
++                    d.package_id.c_str(), d.feature_id.c_str(), d.option_id.c_str());
++                continue;
++            }
++            bool ok = false;
++            switch (option->type) {
++            case ModOptionType::Boolean:
++                ok = d.value == "true" || d.value == "false";
++                break;
++            case ModOptionType::Choice:
++                for (const ModChoice& c : option->choices)
++                    if (c.value == d.value) { ok = true; break; }
++                break;
++            case ModOptionType::Integer: {
++                char* end = nullptr;
++                const long long v = std::strtoll(d.value.c_str(), &end, 10);
++                ok = end && *end == '\0' && !d.value.empty() &&
++                     v >= option->min_value && v <= option->max_value;
++                break;
++            }
++            default:
++                break;
++            }
++            if (!ok) {
++                std::fprintf(stderr,
++                    "psxrecomp: mod_option_default: %s/%s/%s rejects value \"%s\"\n",
++                    d.package_id.c_str(), d.feature_id.c_str(), d.option_id.c_str(),
++                    d.value.c_str());
++                continue;
++            }
++            option->default_value = d.value;
++        }
++    }
++}
++
+ bool ModPackageManager::load_state(std::string* error) {
+     selections_.clear();
+     const fs::path path = root_ / "state.toml";
+diff --git a/runtime/src/mod_runtime.cpp b/runtime/src/mod_runtime.cpp
+index 4cea1a84..bda2e11a 100644
+--- a/runtime/src/mod_runtime.cpp
++++ b/runtime/src/mod_runtime.cpp
+@@ -1121,6 +1121,16 @@ RecompLauncherCModProvider provider = {
+ 
+ } // namespace
+ 
++static std::vector<ModPackageManager::OptionDefault>& pending_option_defaults() {
++    static std::vector<ModPackageManager::OptionDefault> value;
++    return value;
++}
++
++void mod_runtime_set_option_defaults(
++    std::vector<ModPackageManager::OptionDefault> defaults) {
++    pending_option_defaults() = std::move(defaults);
++}
++
+ bool mod_runtime_initialize(const std::filesystem::path& root,
+                             const std::string& game_id,
+                             uint32_t game_entry_pc,
+@@ -1146,6 +1156,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
+     s.disc_enabled = false;
+     s.disc_guard_failed = false;
+     s.manager.set_root(root);
++    s.manager.set_option_defaults(pending_option_defaults());
+     s.game_id = game_id;
+     /* Publish the title identity for the per-feature target gate
+      * (is_feature_enabled). Refreshed below once the digests are computed. */

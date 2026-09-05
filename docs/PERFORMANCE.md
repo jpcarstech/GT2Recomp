@@ -83,3 +83,45 @@ captured yet, which shrinks with play.
   (`perf` is not available in the container). Shards for the lab cache are
   compiled by hand from the build's `overlay_captures.json` with
   `psxrecomp/tools/compile_overlays.py` (see CLAUDE.md).
+
+# The first launch is now the fast one (2026-09-04)
+
+Everything above assumed a warm native cache. A fresh install did not have
+one: GT2's menu and race code lives in overlays (`GT2.OVL`) that the static
+recompile of the boot EXE never sees, so the runtime interpreted it and
+captured what ran, and a background compiler turned the captures into
+native shards over the following sessions. A new player's first hour was
+therefore the slowest the port would ever be - on both presets - and the
+README had to say "the game gets faster over your first few sessions".
+
+Measured with `tools/lab_race_bench.sh` (the same 1500 guest frames of the
+same race, 30 fps, 100%, lab box):
+
+| Cache at first launch | Host Hz | Interpreter share |
+|---|---|---|
+| none (what a fresh install had) | 36.4 | 64% |
+| the runtime's own play captures after a few sessions (42 shards) | 46.6 | 33% |
+| **built at Setup from the disc, no play** (135 shards) | **49.5** | **17%** |
+| Setup-built plus one session's captures | 55.0 | 6% |
+
+`tools/gt2_extract_overlays.py` reads `GT2.OVL` from the disc - a table of
+six gzip streams, every one loaded at `0x80010000` (a jal-target vote on
+each entry agrees, and entry 0 matches the runtime's play captures byte for
+byte apart from the eight words Silent's patches rewrite) - and hands each
+decompressed image to the recompiler's own function discovery, exactly as
+the framework's generic extractor does for a loose PS-X EXE. Setup then runs
+`compile_overlays.py` on the result into `titles\<name>\cache\`. The
+remaining 17% is mostly the functions the enhancement patches rewrite (their
+bytes differ from the disc, so the disc-built shards fail the CRC gate and
+the interpreter takes them) plus whatever the static walk could not prove;
+the runtime's additive captures still cover those after the first session,
+which is the last row.
+
+Two things that did not work, recorded so nobody retries them: feeding the
+play captures' executed-PC lists into the static build as hints made
+`compile_overlays.py` emit 1599 interior-fragment shards (872 MB) and the
+race ran *slower* - 42.4 Hz, 30% interpreted - because every dispatch then
+hashes live RAM against hundreds of overlapping variants; and the whole-image
+shards for three of the six overlays fail the generated-C audit on
+"unsupported instructions" where discovery walked into data, so the cache is
+built from per-function fragments, which is what the table measures.

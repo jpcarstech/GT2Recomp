@@ -1,5 +1,151 @@
 # Changelog
 
+## 0.5.0 — a launcher built like the game's, the first launch runs native (2026-09-05)
+
+### A launcher that looks like the game
+- **The launcher is a console front end now.** The game's own logo in the
+  header (with the disc you are on, the other disc installed, and the disc
+  verdict at the right), a menu of dark tiles on the left - *Start game*,
+  *Switch disc* (naming the disc it switches to), *Settings*, *Mods*
+  (naming the preset in effect, or *Custom*), *Cheats*, *Quit* - and your
+  GT mode career on the right in dark cards over a faint GT mark, read
+  from the memory card every time the launcher opens: the car you are
+  driving with its nameplate, credits, prize money, days, races and wins,
+  average finish, the career-completion bar (won and entered events out of
+  the 219 that count), the six licence badges tinted by the metal you hold
+  them in, and under *Arcade mode* the 21 tracks with a dot per difficulty
+  won on each (Easy, Normal, Hard - the wins that unlock the next track),
+  with the count per difficulty at the right and the track and its wins on
+  hover. A
+  *Card 1 / Card 2* switch (L1/R1 on a pad, Q/E on the keyboard) shows the
+  other card; a card with no GT2 save says so, and a fresh install still
+  reads as a finished page. The whole thing drives with a pad, the
+  keyboard or the mouse alike: the cursor starts on *Start game*, B/Esc
+  backs out of any page.
+- **Every picture on it comes off your disc at install.** Setup rips the
+  GT mark and wordmark from the game's top menu, the licence badges, the
+  course maps and one nameplate per car (plus the car-name table) into
+  `titles/<disc>/assets/img/gt2/` (`tools/rip_gt2_launcher_art.py`). None
+  of it is in this repository or its releases; a disc it cannot read
+  leaves the launcher with text where the pictures would be.
+- **The launcher fills its window.** Maximize it or drag it larger and the
+  page grows with it; before, a big window kept the page at design size in
+  the top-left corner. A **Launcher window: Windowed / Fullscreen** row at
+  the top of Settings > Display (F11 or Alt+Enter too) runs it borderless
+  fullscreen, and the size, position and fullscreen state you leave it in
+  come back next launch (`launcher_window.ini` beside the exe; safe to
+  delete). The remembered geometry is tied to the desktop it was saved on:
+  after a resolution or monitor change the window is sized for the new
+  screen again (only the maximized / fullscreen choice carries over), and
+  a remembered size is never larger than the screen.
+- **Settings are a section list**: Display, Audio, Controllers, Memory
+  cards, Disc & BIOS, Hotkeys, one in view at a time, the sections as the
+  same dark tiles as the main menu. Display and Audio are rows in a card -
+  the setting on the left, its value in a pill on the right - that a pad
+  drives like a console: ▶ from the section list steps onto the rows, ▲▼
+  pick a row, ◀▶ change its value, ○ goes back to the list, and the row
+  under the cursor explains itself under the card; the cursor stops at
+  the first and last row instead of wandering off the page. The disc
+  verdict, the player cards and the memory-card slots that used to sit
+  beside the box art live in those sections now; nothing was removed.
+  **Disc & BIOS is rows now** - the same facts and controls the upstream
+  card carries (which disc when another is installed, the verdict with
+  serial, region and ISO header, which image the disc boots from, the
+  BIOS and a way back to OpenBIOS when a build lets you pick one; the
+  image selection of a multi-image title), with the box art beside them
+  and confirm opening the file picker.
+- **Fullscreen has no window edge.** The launcher page drew ImGui's own
+  one-pixel window border, which showed as a grey line at the sides of a
+  fullscreen launcher; it is off.
+- **One switch per thing.** ORIGINAL / ENHANCED is one pair of pills -
+  under *Graphics* at the foot of the main menu, in the title of Settings
+  > Display and of every Mods page - and means one thing: the picture
+  settings *and* the enhancement set together (the Mods tile on the main
+  menu reads Original / Enhanced / Custom). The pills take the pad as
+  well as the mouse: ▼ from *Quit* lands on the main-menu pair, ▲ from
+  the top row of a page lands on its title pair, ◀▶ pick and Enter or A
+  applies, ▼ returns to the rows. *Frame
+  rate* and *Intro movie* are set in Settings > Display and no longer
+  listed a second time on the Mods page. The launcher's own window and
+  whether it opens at all moved to a Settings > Launcher section, so
+  "Fullscreen" on the Display page is the game's and the footer checkbox
+  is gone. **Mods and
+  Cheats are built the same way**: the groups (Performance, Quality of
+  life, Visual; the cheat groups) down the left, the group in view as a
+  list of ON/OFF rows - Enter or A flips one - with what the highlighted
+  row does, who made it and its options in a card underneath; Original /
+  Enhanced, Enable all, Disable all, Install and search sit above the
+  rows. Every page has its own Back row (and B/Esc), so there is no Back
+  button in the header.
+- The classic card dashboard is untouched for anything that does not ask
+  for this one (framework patch zd, launcher patch 0017; the GT2 half is
+  `gt2_career.c`, built into every exe).
+
+### The first launch is the fast one
+- **Setup now builds the whole native-code cache from your disc**, so a
+  fresh install runs native from its first launch instead of interpreting
+  the menu and race code until the background compiler had caught up over
+  the first sessions - which was the slowest the port ever ran, on both
+  presets, and exactly what a new player saw first. GT2 keeps that code in
+  `GT2.OVL`, six gzip-packed overlays every one of which loads at
+  `0x80010000`; `tools/gt2_extract_overlays.py` unpacks them straight from
+  the disc and hands them to the recompiler's own function discovery, then
+  Setup compiles every shard (about ten minutes per disc, skipped when already built).
+  Measured on the lab's race benchmark at Original settings: 36 Hz with 64%
+  of the time interpreting on a fresh install before, 49.5 Hz and 17% now
+  with no play at all, 55 Hz and 6% after one session (the remainder is
+  mostly the functions the enhancement patches rewrite). Details and the
+  two approaches that did not work are in `docs/PERFORMANCE.md`. The old
+  "gets faster over your first few sessions" note is gone from the README.
+
+### Startup and loading
+- **Clicking Play no longer reads the whole disc first** (framework patch
+  zb). Every launch computed a SHA-256 of the 700 MB disc image on the main
+  thread before the window opened, so a mod package could pin itself to a
+  disc digest - and no GT2 package does. The digest is now computed only when
+  an installed package actually pins one, and remembered by file size and
+  date when it is. Process start to the first guest frame on the lab
+  machine: 4.75 s to 0.50 s; on a hard drive it was worse.
+- **Fast Loading and CD Speed can be told to speed up only the memory card
+  screens** (framework patch zc): an *Apply only during memcard loading* box
+  in each mod's options on the Mods page, ticked by default on GT2. GT2's
+  menus stream from the disc continuously, so the mods' load detector fired
+  in every menu and ran the animations at turbo - which is why Fast Loading
+  was left out of the Enhanced preset. The boot *Loading Save Data* screen
+  is the load worth removing: it is paced by the memory card's own serial
+  timing and takes the same wall time on a modern PC as on the console.
+  With the box ticked the acceleration engages while the guest is
+  transferring card sectors and nowhere else - traced through a whole boot,
+  the title screen and attract mode - and the card screen dropped from 19 s
+  to 7 s on the lab machine (a real PC finishes it in a second or two).
+  Fast Loading is now part of the Enhanced preset on those terms.
+- **Skip intro movie**: an *Intro movie* row (Play / Skip) in Settings >
+  Display, off by default. Skip presses START for you the moment the
+  opening starts and stands down after about a minute of game time, so the
+  title screen's attract-mode loop of the movie, and anything else the game
+  plays as video, are untouched. The boot then runs disclaimer > memory card
+  screen > title without a key pressed. Lives in a new `gt2.recomp` mod
+  package (GT2Recomp's own conveniences, distinct from Silent's patches).
+
+### Known issues
+- **Performance testing and tuning are in progress.** 0.5.0 is a Windows
+  release: the first-launch native cache, the 60 FPS work and the launcher
+  were measured on the lab machine and one Windows PC, and the remaining
+  performance problems are being worked through on Windows first. Other
+  platforms come after that, the Steam Deck specifically - nothing here
+  has been tried on a Deck, and [`docs/STEAM_DECK.md`](docs/STEAM_DECK.md)
+  still describes the 0.4.0 Proton setup. The 0.4.0 notes on 60 FPS being
+  CPU-bound, and on Vulkan and edge blending, all still apply.
+- **The launcher is new and will keep changing.** It is designed for a
+  gamepad first (keyboard and mouse work throughout); layout, wording and
+  the odd page will be tweaked over the next releases as people use it.
+  If a row cannot be reached with a pad, or a page looks wrong at your
+  window size, a screenshot in an issue is the fastest fix.
+- **The launcher's pictures come off your disc at Setup.** An install made
+  before 0.5.0 gets them when you re-run `Setup GT2.cmd`; a disc image the
+  ripper cannot read leaves text where the pictures would be. The version
+  in the launcher's footer says which build you are on.
+
 ## 0.4.0 — Vulkan renderer, a launcher that fits any screen, a calmer F1 menu (2026-09-04)
 
 ### Graphics

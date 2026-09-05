@@ -17,7 +17,7 @@ set -euo pipefail
 # GitHub checkout (a release being prepared, a stale clone) downgraded itself
 # to the older script on the first run and then failed in that script's terms,
 # with no exe and no hint that the newer script had ever been there.
-GT2_LB_VERSION=5
+GT2_LB_VERSION=9
 GAME_DIR="${1:?usage: local_build.sh <game folder> [source checkout]}"
 GITHUB_URL="${GT2RECOMP_GIT_URL:-https://github.com/jpcarstech/GT2Recomp.git}"
 
@@ -34,7 +34,7 @@ else
     SRC="$GAME_DIR/GT2Recomp-src"
 fi
 
-echo "== 1/8 source =="
+echo "== 1/9 source =="
 if [ ! -e "$SRC/.git" ]; then
     if [ -f "$GAME_DIR/gt2recomp.bundle" ]; then
         git clone "$GAME_DIR/gt2recomp.bundle" "$SRC"
@@ -96,7 +96,7 @@ if [ ! -d "$SRC/titles" ]; then
     exit 1
 fi
 
-echo "== 2/8 framework patches =="
+echo "== 2/9 framework patches =="
 cd "$SRC/psxrecomp"
 git checkout -q . 2>/dev/null || true
 # Patches that ADD files (the ported texture-filter shaders, a tool) leave
@@ -147,13 +147,13 @@ if [ "$_patch_fail" != "0" ]; then
 fi
 cd "$SRC"
 
-echo "== 3/8 recompiler tool =="
+echo "== 3/9 recompiler tool =="
 cmake -S psxrecomp/recompiler -B psxrecomp/recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build psxrecomp/recompiler/build --target psxrecomp-game -j
 RECOMPILER="$SRC/psxrecomp/recompiler/build/psxrecomp-game"
 [ -x "$RECOMPILER" ] || RECOMPILER="$RECOMPILER.exe"
 
-echo "== 4/8 discs =="
+echo "== 4/9 discs =="
 # Find every disc image in the game folder and work out which GT2 disc each
 # one is, from its CONTENT (boot serial + data-track size) - file names do
 # not matter. Every disc found becomes its own build under titles\<name>\.
@@ -224,7 +224,7 @@ if [ "${#TITLES[@]}" = "0" ]; then
 fi
 echo "  building: ${TITLES[*]}"
 
-echo "== 5/8 BIOS backends =="
+echo "== 5/9 BIOS backends =="
 for _b in "$GAME_DIR/scph1001.bin" "$GAME_DIR/bios/SCPH1001.BIN" "$GAME_DIR/bios/scph1001.bin"; do
     if [ -f "$_b" ]; then cp -f "$_b" psxrecomp/bios/SCPH1001.BIN; break; fi
 done
@@ -292,7 +292,7 @@ _build_progress() {
            "$label" "$(_hms $((SECONDS - start)))"
 }
 
-echo "== 6/8 building your discs - the long step (30-60 min each) =="
+echo "== 6/9 building your discs - the long step (30-60 min each) =="
 _disc_no=0
 for _t in "${TITLES[@]}"; do
     TDIR="$SRC/titles/$_t"
@@ -348,7 +348,7 @@ for _t in "${TITLES[@]}"; do
         | _build_progress "$TDIR/build.log" "$_step"
 done
 
-echo "== 7/8 install into game folder =="
+echo "== 7/9 install into game folder =="
 # The enhancement tree is mods\ - upstream's name for it. Earlier GT2Recomp
 # releases called the same folder patches\; carry it across whole (packages
 # AND state.toml, i.e. what the player has ticked) before anything below
@@ -396,6 +396,14 @@ for _t in "${TITLES[@]}"; do
     else
         echo "  $_t: no launcher art (could not read the title screen from the disc)"
     fi
+    # The redesigned launcher's GT2 pieces - logo, licence badges, course
+    # maps, car nameplates and names - come off the same disc. Without them
+    # the launcher falls back to text; nothing of Polyphony's ships with us.
+    if "$PY" "$SRC/tools/rip_gt2_launcher_art.py" "${DISC_BIN[$_t]}" "$D/assets/img/gt2" --quiet >/dev/null 2>&1; then
+        echo "  $_t: menu artwork ripped from the disc (logo, badges, course maps, nameplates)"
+    else
+        echo "  $_t: no menu artwork (could not read GT2.VOL from the disc)"
+    fi
     # Runtime config. Never overwrite a player's tuned copy; leave the fresh
     # one beside it instead. __DISC_CUE__ becomes the player's own cue name.
     _cue_base=$(basename "${DISC_CUE[$_t]}")
@@ -413,6 +421,7 @@ for _t in "${TITLES[@]}"; do
         if "$PY" "$SRC/tools/merge_runtime_config.py" \
                 --replace runtime.feature_preset \
                 --replace runtime.featured_feature_row \
+                --replace runtime.mod_option_default \
                 --force-key runtime.mods_dir \
                 --force-key runtime.cheats_page_note \
                 "$D/game.toml.fresh" "$D/game.toml"; then
@@ -494,7 +503,7 @@ if [ "${GT2_DEV_TOOLS:-}" = "1" ] && [ -d "$SRC/tools-win/dev" ]; then
     cp -f "$SRC"/tools-win/dev/*.ps1 "$GAME_DIR/tools/"
 fi
 
-echo "== 8/8 overlay_toolchain (background native-code compiler; MUST match this build) =="
+echo "== 8/9 overlay_toolchain (background native-code compiler; MUST match this build) =="
 # The runtime include headers define the overlay cache namespace, so the
 # toolchain is regenerated from THIS tree every build. The embedded Python and
 # TinyCC payloads are downloaded once (python.org / tinycc) and reused. One
@@ -504,6 +513,9 @@ mkdir -p "$TK" "$TK/bios"
 cp -f  psxrecomp/recompiler/build/psxrecomp-game.exe "$TK/psxrecomp-game.exe" 2>/dev/null || \
 cp -f  psxrecomp/recompiler/build/psxrecomp-game "$TK/psxrecomp-game"
 cp -f  psxrecomp/tools/compile_overlays.py "$TK/compile_overlays.py"
+cp -f  psxrecomp/tools/extract_overlays.py "$TK/extract_overlays.py"
+mkdir -p "$TK/aot_overlay_spike"
+cp -f  psxrecomp/tools/aot_overlay_spike/extract_generic.py "$TK/aot_overlay_spike/extract_generic.py"
 rm -rf "$TK/include"
 cp -r  psxrecomp/runtime/include "$TK/include"
 cp -f psxrecomp/bios/SCPH1001.toml psxrecomp/bios/OpenBIOS.toml "$TK/bios/"
@@ -529,6 +541,58 @@ if [ ! -f "$TK/tcc/tcc.exe" ]; then
         echo "  (TinyCC download failed - gcc from MSYS2 is used when it is on PATH; play_gt2.ps1 adds it)"
     fi
 fi
+
+# ---- 9/9 native-code cache, built up front ----------------------------------
+# The game's menu and race code lives in overlays (GT2.OVL) that the static
+# recompile does not cover. Before this step a fresh install interpreted that
+# code until the background compiler had captured and compiled it over the
+# first sessions - the slowest the port would ever run was a new player's
+# first hour. tools/gt2_extract_overlays.py reads GT2.OVL straight from the
+# disc and compile_overlays.py builds every shard now, into the same cache
+# the runtime keeps growing, so the first launch already runs native. The
+# runtime's own captures still add anything the static walk missed (the
+# handful of functions the enhancement patches rewrite, for one).
+# Re-runs are cheap: shards already built are skipped.
+echo "== 9/9 native-code cache (compiled up front so the first launch runs native) =="
+_ovl_rec="$TK/psxrecomp-game.exe"; [ -f "$_ovl_rec" ] || _ovl_rec="$TK/psxrecomp-game"
+_ovl_cc=gcc; command -v gcc >/dev/null 2>&1 || _ovl_cc=tcc
+for _t in "${TITLES[@]}"; do
+    D="$GAME_DIR/titles/$_t"
+    _aot="$D/overlay_captures.aot.json"
+    if "$PY" "$SRC/tools/gt2_extract_overlays.py" --game-toml "$D/game.toml" \
+            --recompiler "$_ovl_rec" --out "$_aot" --tmp "$D/aot_tmp" > "$D/aot_extract.txt" 2>&1; then
+        rm -rf "$D/aot_tmp"
+        echo "  $_t: $(tail -1 "$D/aot_extract.txt")"
+        echo "  $_t: compiling (about 10 minutes per disc with gcc; log: titles/$_t/compile_cache.txt)"
+        ( cd "$D" && PSX_OVERLAY_CACHE_DIR="$D/cache" PSX_OVERLAY_CAPTURES="$_aot" \
+            PSX_OVERLAY_FLAVOR=6 PSX_OVERLAY_LIVE_AUTOCOMPILE=1 \
+            "$PY" "$TK/compile_overlays.py" --captures "$_aot" --game-toml "$D/game.toml" \
+                --recompiler "$_ovl_rec" --runtime-include "$TK/include" --out-dir "$D/cache" \
+                --compiler "$_ovl_cc" --tcc "$TK/tcc/tcc.exe" --flavor 6 --cps > "$D/compile_cache.txt" 2>&1 ) || true
+        # compile_overlays.py exits non-zero whenever ANY shard failed, and the
+        # whole-image shard of three of GT2's six overlays always fails its
+        # generated-C audit (discovery walks into data); the per-function
+        # fragments that replace them are what the cache is made of. So judge
+        # by the result line, not the exit code.
+        # A rerun on an already-built cache builds nothing (ok=0) and skips
+        # everything as cached - that is the good outcome, not a failure; the
+        # shard dlls on disk are the proof either way.
+        _res=$(grep -o 'PSX_SHARD_RESULT.*' "$D/compile_cache.txt" | tail -1)
+        _ok=$(printf '%s' "$_res" | sed -n 's/.*ok=\([0-9]*\).*/\1/p')
+        _failed=$(printf '%s' "$_res" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')
+        _dlls=$(find "$D/cache" -name '*.dll' 2>/dev/null | wc -l | tr -d ' ')
+        if [ -n "$_ok" ] && [ "$_ok" -gt 0 ]; then
+            echo "  $_t: native cache built - $_ok shard(s) this run, $_dlls on disk (${_failed:-0} whole-overlay fallback(s), expected)"
+        elif [ -n "$_ok" ] && [ "${_dlls:-0}" -gt 0 ] && [ "${_failed:-0}" -le 3 ]; then
+            echo "  $_t: native cache up to date - $_dlls shard(s) on disk, nothing to rebuild"
+        else
+            echo "  $_t: *** native cache build failed (see titles/$_t/compile_cache.txt); the game still runs, compiling in the background as before" >&2
+        fi
+    else
+        rm -rf "$D/aot_tmp"
+        echo "  $_t: *** could not read GT2.OVL from the disc (see titles/$_t/aot_extract.txt); the cache fills in while you play instead" >&2
+    fi
+done
 echo
 echo "DONE. Installed discs: ${TITLES[*]}"
 echo "Double-click 'Gran Turismo 2 Recompiled.exe' to play - it opens the disc"

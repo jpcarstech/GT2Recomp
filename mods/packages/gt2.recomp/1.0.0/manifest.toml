@@ -1,0 +1,26 @@
+format_version = 5
+id = "gt2.recomp"
+version = "1.0.0"
+name = "GT2Recomp"
+author = "GT2Recomp"
+description = "Conveniences this port adds on top of the game - things a modern re-release would offer that were never a GameShark code."
+license = "MIT (GT2Recomp)"
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SCUS-94488"
+
+[[target]]
+game_id = "SCUS-94455"
+
+[[feature]]
+id = "skip_intro"
+name = "Skip intro movie"
+description = "Skips the opening movie at boot the same way you would - by pressing START the moment it begins - so the game goes straight from the disclaimer to the memory card screen. Only the boot intro is skipped: the movie still plays when the title screen loops it in attract mode, and nothing else the game shows as video is touched."
+group = "Quality of Life"
+default_enabled = false
+
+[[plugin]]
+feature = "skip_intro"
+id = "gt2.skip-intro"

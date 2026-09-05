@@ -7,6 +7,20 @@ and beyond, widescreen, 60 FPS, save states and rewind, DuckStation-grade
 PGXP geometry correction, OpenGL or Vulkan. **No game data lives in this
 repository or its downloads.**
 
+## Why
+
+The model for this project is *Metal Gear Solid* in the Master Collection:
+the original game, intact, and next to it the same game with the picture
+and quality-of-life improvements a modern machine allows - so you can play
+either, and see the difference. Here that is one switch, **Original /
+Enhanced**, on the launcher's main menu. Original is the 1999 game as the
+PlayStation drew it, every enhancement off. Enhanced is the same disc at
+your monitor's resolution and aspect, with corrected geometry, a longer
+draw distance, full-detail AI cars, faster loading and a CPU overclock -
+the setup that plays best. Each of those stays individually switchable
+underneath, and nothing about the game itself is changed: it is your disc,
+recompiled, not a remake.
+
 ## Install
 
 **You need:** a Windows 10/11 PC (64-bit) and your own GT2 disc dumps as
@@ -33,13 +47,25 @@ prefer the real thing).
 ## Play
 
 Double-click **`Gran Turismo 2 Recompiled.exe`** (make a desktop shortcut if
-you like). It opens the disc you used last; the settings window's **Disc**
-row switches discs, and so does **F1 → Disc → Switch disc** while playing.
-The first start opens the settings window — plug in your controller, pick
-your resolution, then open **Mods** and press **Enhanced** (widescreen,
-geometry correction, longer draw distance, full-detail AI cars, CPU overclock
-— the setup that runs best) or **Original** (everything off), then hit
-Play. Every enhancement stays individually switchable underneath. Out of the
+you like). It opens a launcher built like a console game's front end: the
+GT2 mark from your disc up top, a menu on the left — **Start game**,
+**Switch disc**, **Settings**, **Mods**, **Cheats**, **Quit** — and your GT
+mode career on the right, read from the memory card every time it opens
+(current car and nameplate, credits, days, races and wins, career
+completion, licences, arcade tracks cleared; L1/R1 or Q/E flips between
+the two cards). It works with a pad, the keyboard or the mouse, fills
+whatever size you make the window (F11 for fullscreen; it remembers where
+you left it). It opens
+the disc you used last; **Switch disc** restarts into the other one, and so
+does **F1 → Disc → Switch disc** while playing.
+The first start: plug in your controller, pick your resolution under
+Settings, then pick **Original** or **Enhanced** under *Graphics* at the
+foot of the menu (Enhanced: widescreen, geometry correction, longer draw
+distance, full-detail AI cars, faster loading, CPU overclock — the setup
+that runs best; Original: everything off, the 1999 game), then **Start
+game**. The launcher is built for a gamepad first — ▲▼ move, ◀▶ change a
+value, ✕ confirms, ○ backs out — and it is new, so expect it to keep
+changing for a few releases. Every enhancement stays individually switchable underneath. Out of the
 box everything is off: you get the 1999 game, and each enhancement is yours
 to turn on. The **Cheats** page lists the codes verified for the disc you
 are on — track and car unlocks on the Arcade disc, money, licences and
@@ -49,25 +75,37 @@ Your garage follows you across discs: memory cards are shared, so Arcade's
 "Load Guest Garage" reads your Simulation garage exactly like on the real
 console.
 
-Settings > Display opens on the few rows most people want — the two picture
-presets, window size, fullscreen, supersampling and texture filtering. The
-rest of the renderer's controls, *Renderer* among them, are behind **Show
-advanced settings** at the bottom of that panel.
+Settings is a list of sections — Display, Audio, Controllers, Memory
+cards, Disc & BIOS, Hotkeys. Display opens on the few rows most people
+want — the two picture presets, window size, fullscreen, supersampling and
+texture filtering. The rest of the renderer's controls, *Renderer* among
+them, are behind **Show advanced settings** at the bottom of that panel.
 
 In game: **F1** settings + disc switch · **F7** save states · **F8** rewind ·
 **Tab** turbo · **Alt+Enter** fullscreen · **Esc Esc** quit.
 
-Good to know: the game gets *faster* over your first few sessions — it
-quietly converts more of itself to native PC code while you play and for a
-little while after you quit.
+Good to know: Setup converts the game's code to native PC code up front, so
+the first launch already runs at full speed; the small remainder (mainly the
+code the enhancement patches rewrite) is converted quietly during your first
+session and for a little while after you quit.
 
 Have a [GT2 Combined Disc](https://github.com/CookiePLMonster/GT2-Combined-Disc)
 image from the fan project? Drop it in the folder too — it builds as a third
 switchable disc with its own extras. It's optional; the two plain discs
 cover everything else.
 
-## Known issues (0.4.0)
+## Known issues (0.5.0)
 
+- **Performance work is in progress, on Windows first.** The remaining
+  performance problems (60 FPS is CPU-bound, below) are being worked
+  through on Windows; other platforms follow, the **Steam Deck**
+  specifically — nothing in 0.5.0 has been tried on a Deck yet, and
+  [`docs/STEAM_DECK.md`](docs/STEAM_DECK.md) still describes the 0.4.0
+  Proton setup.
+- **The launcher is new.** Gamepad-first, keyboard and mouse throughout;
+  layout, wording and pages will be tweaked over the next releases. A
+  screenshot of anything that looks wrong or cannot be reached with a pad
+  is the fastest fix.
 - **60 FPS is CPU-heavy.** At 60 the emulated PlayStation does a frame's
   work every VBlank at up to 3.25× its real clock, and on many PCs that is
   more emulation work than one core delivers — the frame rate sags in
@@ -91,9 +129,6 @@ cover everything else.
   another code that works on v1.1, open an issue.
 - **Savestates made on 0.2.0 do not load** on 0.3.0 (the native-code cache
   format changed; states carry its tag). Memory cards and replays are fine.
-- The first sessions after a build run slower (the game is still converting
-  itself to native code), and the boot "Loading Save Data" screen takes a
-  while.
 - Old 30 FPS replays and Rally ghosts don't play back correctly at 60 FPS.
 - **Vulkan has not been tried on a real Steam Deck.** The new renderer was
   verified against OpenGL frame for frame on a Linux lab machine with a

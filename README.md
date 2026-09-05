@@ -23,7 +23,7 @@ recompiled, not a remake.
 
 ## Install
 
-**You need:** a Windows 10/11 PC (64-bit) and your own GT2 disc dumps as
+**You need:** a Windows 10/11 PC (64-bit) and your own NTSC-U v1.1 GT2 disc dumps as
 `.bin` files — the **Arcade disc**, the **Simulation disc**, or both (both
 recommended; you switch discs in the game). Any file names work.
 
